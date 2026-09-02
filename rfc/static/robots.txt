@@ -1,0 +1,24 @@
+# Default policy: the entire public site is available for crawling, search,
+# AI training, and input to generative AI systems.
+User-agent: *
+Allow: /
+Disallow:
+Content-Signal: ai-train=yes, search=yes, ai-input=yes
+
+# AI crawlers are explicitly allowed to access and use the entire public site.
+User-agent: OAI-SearchBot
+User-agent: Claude-SearchBot
+User-agent: GPTBot
+User-agent: ChatGPT-User
+User-agent: Claude-Web
+User-agent: ClaudeBot
+User-agent: Claude-User
+User-agent: Google-Extended
+User-agent: Amazonbot
+User-agent: anthropic-ai
+User-agent: Bytespider
+User-agent: CCBot
+User-agent: Applebot-Extended
+Allow: /
+Disallow:
+Content-Signal: ai-train=yes, search=yes, ai-input=yes

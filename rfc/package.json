@@ -1,21 +1,24 @@
 {
 	"name": "rfc",
 	"version": "1.0.0",
+	"imports": {
+		"#rfc.txt": "./tree-fucker.txt",
+		"#pkg": "./package.json"
+	},
 	"scripts": {
-		"build:site": "bun ./build-site.ts",
-		"check:anchors": "bun ./check-anchors.ts",
-		"generate": "bun run --sequential render:tree-fucker check:anchors",
-		"render:tree-fucker": "bun ./render-tree-fucker.ts",
-		"site": "bun run --sequential generate build:site",
+		"build:site": "bun ./src/build-site.ts",
+		"postbuild:site": "bun --silent check:anchors",
+		"check:anchors": "bun ./src/check-anchors.ts",
+		"site": "bun run --sequential build:site check:anchors",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
-		"@types/bun": "latest",
-		"typescript": "^7"
+		"@types/bun": "catalog:site",
+		"typescript": "catalog:site",
+		"vite-svg-to-ico": "catalog:site"
 	},
-	"packageManager": "bun@1.4.0",
 	"devEngines": {
-		"packageManager": [{ "name": "bun", "version": ">=1.4" }],
-		"runtime": [{ "name": "bun", "version": ">=1.4" }]
+		"packageManager": { "name": "bun", "version": ">=1.4" },
+		"runtime": { "name": "bun", "version": ">=1.4" }
 	}
 }

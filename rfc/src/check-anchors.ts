@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import html from './render-tree-fucker.ts';
+import html from './render.ts';
 
 const ids = new Map<string, number>();
 const targets = new Set<string>();
