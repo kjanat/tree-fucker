@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::core::{Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats};
+use crate::core::{
+    Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, WorkerLoss,
+};
 use crate::error::Error;
 use crate::fs::{FileSystem, WatcherEvent};
 use crate::ids::{CommandId, JobId, TimerId, WatchId, WatchRequestId};
@@ -159,6 +161,24 @@ impl Harness {
         };
         self.jobs.remove(index);
         self.feed(Input::JobCompleted { job: id, result });
+        true
+    }
+
+    pub fn lose_job(&mut self, id: JobId) -> bool {
+        let Some(index) = self.jobs.iter().position(|j| j.id == id) else {
+            return false;
+        };
+        self.jobs.remove(index);
+        self.feed(Input::WorkerLost(WorkerLoss::Job(id)));
+        true
+    }
+
+    pub fn lose_registration(&mut self, request: WatchRequestId) -> bool {
+        let Some(index) = self.registrations.iter().position(|(r, _, _)| *r == request) else {
+            return false;
+        };
+        self.registrations.remove(index);
+        self.feed(Input::WorkerLost(WorkerLoss::WatchRegistration(request)));
         true
     }
 

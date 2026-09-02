@@ -1,11 +1,11 @@
 use super::types::*;
-use super::{Coordinator, JobOperation, JobResult, JobSpec, Output};
+use super::{Coordinator, JobOperation, JobResult, JobSpec, Output, WorkerLoss};
 use crate::config::WatchRegistrationFailure;
 use crate::entry::{EntryKind, LoadState, Shape};
 use crate::error::Error;
 use crate::fs::FsError;
 use crate::ids::*;
-use crate::update::{Operation, WatcherHealth};
+use crate::update::{ErrorCause, Operation, WatcherHealth};
 
 impl Coordinator {
     pub(super) fn on_job_completed(&mut self, id: JobId, result: JobResult) {
@@ -45,9 +45,15 @@ impl Coordinator {
                 self.last_listing_children = Some(listing.entries.len());
                 match self.commit_listing(&job, listing) {
                     Ok(()) => self.finish_job(id, JobOutcome::Accepted),
-                    Err(()) => {
+                    Err(rejection) => {
                         self.listing_failures += 1;
-                        self.finish_job(id, JobOutcome::LimitExceeded)
+                        let outcome = match rejection {
+                            ListingRejection::LimitExceeded => JobOutcome::LimitExceeded,
+                            ListingRejection::MalformedNames => {
+                                JobOutcome::Failed(FsError::Transient("listing has an unusable child name".into()))
+                            }
+                        };
+                        self.finish_job(id, outcome)
                     }
                 }
             }
@@ -114,6 +120,31 @@ impl Coordinator {
             (ReadNeed::Metadata, _, JobResult::Metadata(Err(err))) => self.finish_job(id, JobOutcome::Failed(err)),
             (_, _, _) => {
                 self.finish_job(id, JobOutcome::Failed(FsError::Transient("unexpected job result kind".into())))
+            }
+        }
+    }
+
+    pub(super) fn on_worker_lost(&mut self, loss: WorkerLoss) {
+        match loss {
+            WorkerLoss::Job(id) => self.on_job_lost(id),
+            WorkerLoss::WatchRegistration(request) => self.on_watch_registered(request, Err(ErrorCause::WorkerLost)),
+        }
+    }
+
+    fn on_job_lost(&mut self, id: JobId) {
+        let Some(job) = self.jobs.get(&id).cloned() else {
+            return;
+        };
+        if !matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
+            return;
+        }
+        self.lost_workers += 1;
+        match job.entry {
+            Some(_) => self.finish_job(id, JobOutcome::WorkerLost),
+            None => {
+                self.push_error(crate::path::RelativePath::root(), Operation::RootProbe, ErrorCause::WorkerLost);
+                self.finish_job(id, JobOutcome::Cancelled);
+                self.schedule_probe(true);
             }
         }
     }
@@ -247,7 +278,8 @@ impl Coordinator {
             | JobOutcome::LimitExceeded
             | JobOutcome::WatcherRegistrationFailed
             | JobOutcome::Stale
-            | JobOutcome::Cancelled => {
+            | JobOutcome::Cancelled
+            | JobOutcome::WorkerLost => {
                 if job.designated {
                     self.set_obligation(entry, ObligationState::Unsatisfied);
                 }
@@ -298,7 +330,7 @@ impl Coordinator {
                     self.finish_command(cmd, Err(Error::WatcherRegistrationFailed));
                 }
             }
-            JobOutcome::Stale | JobOutcome::Cancelled => {}
+            JobOutcome::Stale | JobOutcome::Cancelled | JobOutcome::WorkerLost => {}
         }
     }
 
@@ -392,15 +424,43 @@ impl Coordinator {
                     barriers: Vec::new(),
                 });
             }
+            JobOutcome::WorkerLost => {
+                self.push_error(
+                    job.path.clone(),
+                    if job.need == ReadNeed::Listing { Operation::Listing } else { Operation::Metadata },
+                    ErrorCause::WorkerLost,
+                );
+                let Some(current) = represented else { return };
+                if !Self::still_required(&current, job.need) {
+                    return;
+                }
+                let attempts =
+                    self.entry_state(entry).and_then(|s| s.retry.as_ref()).map(|r| r.attempts + 1).unwrap_or(1);
+                let due = Some(self.now + self.backoff(attempts));
+                let mut reasons = job.reasons;
+                reasons.baseline = false;
+                reasons.priority = false;
+                let mut barriers = job.barriers.clone();
+                let state = self.entry_state_mut(entry);
+                if let Some(existing) = state.retry.take() {
+                    reasons.merge(existing.reasons);
+                    for barrier in existing.barriers {
+                        if !barriers.contains(&barrier) {
+                            barriers.push(barrier);
+                        }
+                    }
+                }
+                state.retry = Some(RetryRecord {
+                    phase: if job.need == ReadNeed::Listing { RetryPhase::Listing } else { RetryPhase::Metadata },
+                    attempts,
+                    due,
+                    reasons,
+                    barriers,
+                });
+            }
             JobOutcome::Stale | JobOutcome::Cancelled => {
                 let Some(current) = represented else { return };
-                let still_required = match job.need {
-                    ReadNeed::Listing => {
-                        matches!(current.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading))
-                    }
-                    ReadNeed::Metadata => true,
-                };
-                if !still_required {
+                if !Self::still_required(&current, job.need) {
                     return;
                 }
                 let mut reasons = job.reasons;
@@ -420,7 +480,14 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn on_watch_registered(&mut self, request: WatchRequestId, result: Result<WatchId, FsError>) {
+    fn still_required(current: &crate::entry::Entry, need: ReadNeed) -> bool {
+        match need {
+            ReadNeed::Listing => matches!(current.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
+            ReadNeed::Metadata => true,
+        }
+    }
+
+    pub(super) fn on_watch_registered(&mut self, request: WatchRequestId, result: Result<WatchId, ErrorCause>) {
         let Some(target) = self.registrations.remove(&request) else {
             return;
         };

@@ -125,6 +125,7 @@ pub enum ErrorCause {
     InvalidName(std::ffi::OsString),
     DuplicateName(std::ffi::OsString),
     WatcherLost(String),
+    WorkerLost,
 }
 
 impl fmt::Display for ErrorCause {
@@ -135,6 +136,7 @@ impl fmt::Display for ErrorCause {
             ErrorCause::InvalidName(n) => write!(f, "unrepresentable name {n:?}"),
             ErrorCause::DuplicateName(n) => write!(f, "duplicate name {n:?}"),
             ErrorCause::WatcherLost(m) => write!(f, "watcher lost: {m}"),
+            ErrorCause::WorkerLost => f.write_str("filesystem worker lost"),
         }
     }
 }

@@ -149,7 +149,8 @@ pub struct Guards {
     pub incarnation: RootIncarnation,
     pub entry_generation: EntryGeneration,
     pub load_generation: Option<LoadGeneration>,
-    pub policy_fence: PolicyRevision,
+    pub policy_revision: PolicyRevision,
+    pub policy_fence: PolicyFence,
     pub parent_context: Option<ContextGeneration>,
     pub child_state: Option<ChildStateGeneration>,
     pub parent_child_state: Option<ChildStateGeneration>,
@@ -395,6 +396,12 @@ impl RootState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingRejection {
+    MalformedNames,
+    LimitExceeded,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobOutcome {
     Accepted,
@@ -404,6 +411,7 @@ pub enum JobOutcome {
     WatcherRegistrationFailed,
     Stale,
     Cancelled,
+    WorkerLost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

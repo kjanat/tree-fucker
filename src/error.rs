@@ -19,6 +19,7 @@ pub enum Error {
     Shutdown,
     TreeTerminated,
     WatcherRegistrationFailed,
+    WorkerLost,
     InitialScanDegraded(BTreeSet<RelativePath>),
     Io(FsError),
 }
@@ -39,6 +40,7 @@ impl fmt::Display for Error {
             Error::Shutdown => f.write_str("tree is shut down"),
             Error::TreeTerminated => f.write_str("tree terminated"),
             Error::WatcherRegistrationFailed => f.write_str("watcher registration failed"),
+            Error::WorkerLost => f.write_str("filesystem worker lost"),
             Error::InitialScanDegraded(paths) => {
                 write!(f, "initial scan degraded for {} paths", paths.len())
             }

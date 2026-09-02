@@ -40,6 +40,7 @@ counter_type!(ReconciliationGeneration);
 counter_type!(LoadGeneration);
 counter_type!(EntryGeneration);
 counter_type!(PolicyRevision);
+counter_type!(PolicyFence);
 counter_type!(ContextGeneration);
 counter_type!(ChildStateGeneration);
 counter_type!(StateGeneration);

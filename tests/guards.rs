@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tree_fucker::core::{Command, JobResult};
 use tree_fucker::testing::{FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{RoundResult, UpdateEvent};
-use tree_fucker::{EntryKind, FileSystem, FsError, LoadAll, LoadState, RelativePath, WatcherKind};
+use tree_fucker::{
+    EntryKind, FileSystem, FsError, LoadAll, LoadState, PathPredicate, RelativePath, ScanDecision, WatcherKind,
+};
 
 fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
@@ -24,6 +26,68 @@ fn scanned(fs: &Arc<FakeFileSystem>) -> Harness {
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
     h.run_until_idle();
     h
+}
+
+fn load_everything() -> Arc<PathPredicate<impl Fn(&RelativePath, EntryKind) -> ScanDecision + Send + Sync>> {
+    Arc::new(PathPredicate::new(|_p: &RelativePath, _k| ScanDecision::Eligible { initially_loaded: true }))
+}
+
+#[test]
+fn policy_revision_bump_stales_the_in_flight_listing_which_is_listed_again() {
+    let fs = populated();
+    let policy = load_everything();
+    let mut h = Harness::open_default(fs.clone(), policy.clone());
+    h.run_until_idle();
+    fs.add_silently("c/late", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("c")]));
+    let job = h.pending_job_for("c").expect("c listing in flight");
+    policy.bump_revision();
+    h.complete_job(job.id);
+    assert_eq!(h.stats().stale_results, 1);
+    assert!(!h.paths().contains(&"c/late".to_string()));
+    assert_eq!(h.result(t), None);
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(h.paths().contains(&"c/late".to_string()));
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "c"), 3);
+}
+
+#[test]
+fn policy_revision_bump_stales_the_designated_round_listing_and_degrades_the_round() {
+    let fs = populated();
+    let policy = load_everything();
+    let mut h = Harness::open_default(fs.clone(), policy.clone());
+    h.run_until_idle();
+    h.fire_timer_only();
+    let c_job = h.pending_job_for("c").expect("c job");
+    policy.bump_revision();
+    h.complete_job(c_job.id);
+    assert_eq!(h.stats().stale_results, 1);
+    h.complete_all_jobs();
+    assert!(matches!(
+        h.health().reconciliation.last_round,
+        Some(RoundResult::Degraded { ref unsatisfied }) if unsatisfied.contains(&path("c"))
+    ));
+    h.run_until_idle();
+    h.run_round();
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+}
+
+#[test]
+fn policy_invalidation_fences_in_flight_work_without_a_revision_change() {
+    let fs = populated();
+    let mut h = scanned(&fs);
+    fs.add_silently("c/late", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("c")]));
+    let job = h.pending_job_for("c").expect("c listing in flight");
+    let inv = h.command(Command::InvalidatePolicy(vec![path("")]));
+    h.complete_job(job.id);
+    assert_eq!(h.stats().stale_results, 1);
+    assert!(!h.paths().contains(&"c/late".to_string()));
+    h.run_until_idle();
+    assert_eq!(h.result(inv), Some(Ok(())));
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(h.paths().contains(&"c/late".to_string()));
 }
 
 #[test]

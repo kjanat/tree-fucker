@@ -37,11 +37,18 @@ struct Watch {
     sink: Arc<dyn WatcherSink>,
 }
 
+struct InjectedChild {
+    dir: RelativePath,
+    entry: DirEntry,
+}
+
 struct Inner {
     nodes: BTreeMap<RelativePath, EntryInfo>,
     root_present: bool,
     caps: FsCapabilities,
     failures: Vec<Failure>,
+    panics: Vec<(RelativePath, FakeOp)>,
+    injected: Vec<InjectedChild>,
     watches: HashMap<WatchId, Watch>,
     next_watch: u64,
     next_inode: u64,
@@ -97,6 +104,8 @@ impl FakeFileSystem {
                 root_present: true,
                 caps,
                 failures: Vec::new(),
+                panics: Vec::new(),
+                injected: Vec::new(),
                 watches: HashMap::new(),
                 next_watch: 1,
                 next_inode: 2,
@@ -243,6 +252,14 @@ impl FakeFileSystem {
         }
     }
 
+    pub fn clear_identity(&self, p: &str) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        if let Some(info) = inner.nodes.get_mut(&path) {
+            info.identity = None;
+        }
+    }
+
     pub fn set_mtime(&self, p: &str, mtime: SystemTime) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -322,6 +339,49 @@ impl FakeFileSystem {
 
     pub fn clear_failures(&self) {
         lock(&self.inner).failures.clear();
+    }
+
+    pub fn panic_once(&self, p: &str, op: FakeOp) {
+        let path = Self::path(p);
+        lock(&self.inner).panics.push((path, op));
+    }
+
+    fn take_panic(inner: &mut Inner, path: &RelativePath, op: FakeOp) -> bool {
+        match inner.panics.iter().position(|(p, o)| p == path && *o == op) {
+            Some(index) => {
+                inner.panics.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn inject_child(&self, dir: &str, name: impl Into<std::ffi::OsString>, kind: EntryKind) {
+        let dir = Self::path(dir);
+        let mut inner = lock(&self.inner);
+        let now = Self::tick(&mut inner);
+        let inode = inner.next_inode;
+        inner.next_inode += 1;
+        inner.injected.push(InjectedChild {
+            dir,
+            entry: DirEntry {
+                name: name.into(),
+                info: EntryInfo {
+                    kind,
+                    metadata: Metadata {
+                        modified: Some(now),
+                        created: Some(now),
+                        size: Some(0),
+                        permissions: Some(0o644),
+                    },
+                    identity: Some(FileIdentity { device: 1, inode }),
+                },
+            },
+        });
+    }
+
+    pub fn clear_injected_children(&self) {
+        lock(&self.inner).injected.clear();
     }
 
     pub fn drop_events(&self, drop: bool) {
@@ -462,6 +522,10 @@ impl FileSystem for FakeFileSystem {
     fn metadata(&self, _root: &Path, path: &RelativePath) -> Result<EntryInfo, FsError> {
         let mut inner = lock(&self.inner);
         inner.ops.push((FakeOp::Metadata, path.clone()));
+        if Self::take_panic(&mut inner, path, FakeOp::Metadata) {
+            drop(inner);
+            panic!("injected metadata panic for {path}");
+        }
         if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Metadata) {
             return Err(err);
         }
@@ -471,6 +535,10 @@ impl FileSystem for FakeFileSystem {
     fn read_dir(&self, _root: &Path, path: &RelativePath) -> Result<DirectoryListing, FsError> {
         let mut inner = lock(&self.inner);
         inner.ops.push((FakeOp::ReadDir, path.clone()));
+        if Self::take_panic(&mut inner, path, FakeOp::ReadDir) {
+            drop(inner);
+            panic!("injected listing panic for {path}");
+        }
         if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::ReadDir) {
             return Err(err);
         }
@@ -478,12 +546,13 @@ impl FileSystem for FakeFileSystem {
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let entries = inner
+        let mut entries: Vec<DirEntry> = inner
             .nodes
             .iter()
             .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
             .filter_map(|(k, info)| Some(DirEntry { name: k.file_name()?.to_os_string(), info: *info }))
             .collect();
+        entries.extend(inner.injected.iter().filter(|c| c.dir == *path).map(|c| c.entry.clone()));
         Ok(DirectoryListing { directory, entries })
     }
 
@@ -496,6 +565,10 @@ impl FileSystem for FakeFileSystem {
     ) -> Result<WatchId, FsError> {
         let mut inner = lock(&self.inner);
         inner.ops.push((FakeOp::Watch, path.clone()));
+        if Self::take_panic(&mut inner, path, FakeOp::Watch) {
+            drop(inner);
+            panic!("injected watch panic for {path}");
+        }
         if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Watch) {
             return Err(err);
         }

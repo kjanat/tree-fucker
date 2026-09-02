@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::sync::Arc;
 
 use super::types::*;
@@ -18,6 +17,18 @@ pub(super) struct Observed<'a> {
     pub info: EntryInfo,
 }
 
+enum IdentityMatch {
+    Unavailable,
+    Same,
+    Different,
+}
+
+enum ChildBinding {
+    Retained,
+    Renamed,
+    Replaced,
+}
+
 #[derive(Default)]
 pub(super) struct Effects {
     pub new_loading: Vec<(EntryId, RelativePath, Reasons)>,
@@ -30,7 +41,11 @@ pub(super) struct Effects {
 }
 
 impl Coordinator {
-    pub(super) fn commit_listing(&mut self, job: &ActiveJob, listing: DirectoryListing) -> Result<(), ()> {
+    pub(super) fn commit_listing(
+        &mut self,
+        job: &ActiveJob,
+        listing: DirectoryListing,
+    ) -> Result<(), ListingRejection> {
         let Some(dir_id) = job.entry else {
             return Ok(());
         };
@@ -41,23 +56,30 @@ impl Coordinator {
         let case = self.caps.case;
         let dir_key = self.snapshot.key(&dir.path);
         let mut seen: HashSet<PathKey> = HashSet::new();
-        let mut children: Vec<(OsString, PathKey, EntryInfo)> = Vec::with_capacity(listing.entries.len());
+        let mut children: Vec<(RelativePath, PathKey, EntryInfo)> = Vec::with_capacity(listing.entries.len());
+        let mut malformed: Vec<ErrorCause> = Vec::new();
         for DirEntry { name, info } in &listing.entries {
-            let key = match dir_key.child(name, case) {
-                Ok(key) => key,
-                Err(_) => {
-                    self.push_error(dir.path.clone(), Operation::Listing, ErrorCause::InvalidName(name.clone()));
+            let (path, key) = match (dir.path.join(name), dir_key.child(name, case)) {
+                (Ok(path), Ok(key)) => (path, key),
+                _ => {
+                    malformed.push(ErrorCause::InvalidName(name.clone()));
                     continue;
                 }
             };
             if !seen.insert(key.clone()) {
-                self.push_error(dir.path.clone(), Operation::Listing, ErrorCause::DuplicateName(name.clone()));
+                malformed.push(ErrorCause::DuplicateName(name.clone()));
                 continue;
             }
-            children.push((name.clone(), key, *info));
+            children.push((path, key, *info));
+        }
+        if !malformed.is_empty() {
+            for cause in malformed {
+                self.push_error(dir.path.clone(), Operation::Listing, cause);
+            }
+            return Err(ListingRejection::MalformedNames);
         }
         if children.len() > self.config.entries_per_directory {
-            return Err(());
+            return Err(ListingRejection::LimitExceeded);
         }
         let mut builder = self.snapshot.builder();
         let mut effects = Effects::default();
@@ -86,23 +108,24 @@ impl Coordinator {
         let existing: HashMap<PathKey, Arc<Entry>> =
             builder.children(dir_id).into_iter().map(|e| (e.path.key(case), e)).collect();
         let mut seen_ids: HashSet<EntryId> = HashSet::new();
-        for (name, key, info) in children {
-            let Ok(path) = dir.path.join(&name) else {
-                continue;
-            };
+        for (path, key, info) in children {
             match existing.get(&key) {
                 Some(old) => {
                     seen_ids.insert(old.id);
-                    let replaced = self.caps.stable_identity
-                        && old.identity.is_some()
-                        && info.identity.is_some()
-                        && old.identity != info.identity;
-                    if replaced {
-                        effects.removed.extend(builder.remove_subtree(old.id));
-                        self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
-                    } else {
-                        let observed = Observed { path: &path, info };
-                        self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
+                    match self.bind_child(old, &path, &info) {
+                        ChildBinding::Replaced => {
+                            effects.removed.extend(builder.remove_subtree(old.id));
+                            self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
+                        }
+                        ChildBinding::Renamed => {
+                            let _ = builder.rename_subtree(old.id, path.clone());
+                            let observed = Observed { path: &path, info };
+                            self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
+                        }
+                        ChildBinding::Retained => {
+                            let observed = Observed { path: &path, info };
+                            self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
+                        }
                     }
                 }
                 None => self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit),
@@ -117,10 +140,30 @@ impl Coordinator {
             self.reevaluate_descendants(&mut builder, &mut effects, dir_id, &ctx, false, inherit);
         }
         if builder.len() > self.config.represented_entries {
-            return Err(());
+            return Err(ListingRejection::LimitExceeded);
         }
         self.commit(builder, effects, Some(job));
         Ok(())
+    }
+
+    fn identity_match(&self, old: &Entry, info: &EntryInfo) -> IdentityMatch {
+        if !self.caps.stable_identity {
+            return IdentityMatch::Unavailable;
+        }
+        match (old.identity, info.identity) {
+            (Some(previous), Some(observed)) if previous == observed => IdentityMatch::Same,
+            (Some(_), Some(_)) => IdentityMatch::Different,
+            _ => IdentityMatch::Unavailable,
+        }
+    }
+
+    fn bind_child(&self, old: &Entry, path: &RelativePath, info: &EntryInfo) -> ChildBinding {
+        match (old.path == *path, self.identity_match(old, info)) {
+            (_, IdentityMatch::Different) => ChildBinding::Replaced,
+            (true, _) => ChildBinding::Retained,
+            (false, IdentityMatch::Same) => ChildBinding::Renamed,
+            (false, IdentityMatch::Unavailable) => ChildBinding::Replaced,
+        }
     }
 
     fn insert_new(
@@ -166,12 +209,10 @@ impl Coordinator {
     ) {
         let Observed { path, info } = observed;
         let metadata = info.metadata.project(self.config.metadata_fields);
+        let current = Entry { path: path.clone(), metadata, identity: info.identity, ..old.clone() };
         if old.kind() != info.kind {
-            self.change_kind(builder, effects, old, info, ctx, inherit);
+            self.change_kind(builder, effects, &current, info, ctx, inherit);
             return;
-        }
-        if old.path != *path {
-            let _ = builder.rename_subtree(old.id, path.clone());
         }
         let metadata_changed = old.metadata != metadata || old.identity != info.identity;
         if metadata_changed {
@@ -181,7 +222,6 @@ impl Coordinator {
             });
         }
         let decision = self.policy.classify(ctx, path, &info);
-        let current = Entry { metadata, identity: info.identity, ..old.clone() };
         self.apply_decision(builder, effects, &current, decision, inherit);
     }
 

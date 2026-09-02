@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use tree_fucker::core::Command;
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{InitialScanState, RootAvailability, RoundResult, UpdateEvent};
+use tree_fucker::update::{
+    ErrorCause, InitialScanState, Operation, RecoverableError, RootAvailability, RoundResult, UpdateEvent,
+};
 use tree_fucker::{
     Config, EntryKind, Error, FsError, LoadAll, LoadDepth, LoadState, PathChange, RelativePath, WatcherKind,
 };
@@ -269,6 +271,92 @@ fn entries_per_directory_limit_degrades_without_truncating() {
 }
 
 #[test]
+fn invalid_child_name_rejects_the_whole_listing_and_degrades_the_round() {
+    let fs = populated(WatcherKind::None);
+    fs.create_file("a/f3", 30);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert!(h.paths().contains(&"a/f3".to_string()));
+    h.take_events();
+    fs.remove_silently("a/f3");
+    fs.inject_child("a", "..", EntryKind::File);
+    h.run_round();
+    assert!(h.paths().contains(&"a/f3".to_string()));
+    assert!(h.paths().contains(&"a/b".to_string()));
+    assert!(h.paths().contains(&"a/f2".to_string()));
+    let removals: Vec<&PathChange> = h
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Delta(update) => Some(&update.changes),
+            _ => None,
+        })
+        .flatten()
+        .filter(|c| matches!(c, PathChange::Removed { .. }))
+        .collect();
+    assert!(removals.is_empty(), "{removals:?}");
+    let invalid: Vec<&RecoverableError> = h
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Delta(update) => Some(&update.errors),
+            UpdateEvent::Health { errors, .. } => Some(errors),
+            _ => None,
+        })
+        .flatten()
+        .filter(|e| matches!(e.error, ErrorCause::InvalidName(_)))
+        .collect();
+    assert_eq!(invalid.len(), 1);
+    assert_eq!(invalid[0].path, path("a"));
+    assert_eq!(invalid[0].operation, Operation::Listing);
+    assert_eq!(
+        h.health().reconciliation.last_round,
+        Some(RoundResult::Degraded { unsatisfied: [path("a")].into_iter().collect() })
+    );
+    assert!(h.health().reconciliation.degraded_paths.is_empty());
+    fs.clear_injected_children();
+    h.run_round();
+    assert!(!h.paths().contains(&"a/f3".to_string()));
+    h.run_round();
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+}
+
+#[test]
+fn duplicate_child_name_rejects_the_whole_listing_and_degrades_the_round() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    h.take_events();
+    fs.remove_silently("a/f2");
+    fs.inject_child("a", "b", EntryKind::File);
+    h.run_round();
+    assert!(h.paths().contains(&"a/f2".to_string()));
+    assert_eq!(h.entry("a/b").map(|e| e.kind()), Some(EntryKind::Directory));
+    let duplicate: Vec<&RecoverableError> = h
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Delta(update) => Some(&update.errors),
+            UpdateEvent::Health { errors, .. } => Some(errors),
+            _ => None,
+        })
+        .flatten()
+        .filter(|e| matches!(e.error, ErrorCause::DuplicateName(_)))
+        .collect();
+    assert_eq!(duplicate.len(), 1);
+    assert_eq!(duplicate[0].path, path("a"));
+    assert_eq!(
+        h.health().reconciliation.last_round,
+        Some(RoundResult::Degraded { unsatisfied: [path("a")].into_iter().collect() })
+    );
+    fs.clear_injected_children();
+    h.run_round();
+    assert!(!h.paths().contains(&"a/f2".to_string()));
+    h.run_round();
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+}
+
+#[test]
 fn shutdown_publishes_terminal_and_rejects_later_commands() {
     let fs = populated(WatcherKind::Recursive);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
@@ -324,4 +412,99 @@ fn invalid_config_is_rejected() {
     let fs = populated(WatcherKind::None);
     let config = Config { batch_size: 1, ..Default::default() };
     assert!(matches!(Harness::open(fs, Arc::new(LoadAll), config), Err(Error::InvalidConfig(_))));
+}
+
+#[test]
+fn lost_designated_worker_degrades_round_keeps_snapshot_and_retries_with_backoff() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    h.take_events();
+    h.fire_timer_only();
+    let a_job = h.pending_job_for("a").expect("a job");
+    assert!(h.lose_job(a_job.id));
+    assert!(!h.lose_job(a_job.id));
+    let lost: Vec<&RecoverableError> = h
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Health { errors, .. } => Some(errors),
+            _ => None,
+        })
+        .flatten()
+        .filter(|e| e.error == ErrorCause::WorkerLost)
+        .collect();
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].path, path("a"));
+    assert_eq!(lost[0].operation, Operation::Listing);
+    assert_eq!(h.stats().lost_workers, 1);
+    assert!(h.pending_job_for("a").is_none());
+    h.complete_all_jobs();
+    assert_eq!(
+        h.health().reconciliation.last_round,
+        Some(RoundResult::Degraded { unsatisfied: [path("a")].into_iter().collect() })
+    );
+    assert!(h.health().reconciliation.degraded_paths.is_empty());
+    assert!(h.paths().contains(&"a/b/f1".to_string()));
+    assert!(h.pending_jobs().is_empty());
+    let before = fs.count_ops(FakeOp::ReadDir, "a");
+    let due = h.timer().map(|(_, at)| at).expect("retry timer armed");
+    assert!(due > h.now());
+    h.advance(Duration::from_secs(60));
+    assert!(fs.count_ops(FakeOp::ReadDir, "a") > before);
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+}
+
+#[test]
+fn lost_worker_keeps_the_refresh_barrier_and_completes_it_on_retry() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    fs.add_silently("c/late", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("c")]));
+    let job = h.pending_job_for("c").expect("c listing");
+    assert!(h.lose_job(job.id));
+    assert_eq!(h.result(t), None);
+    h.advance(Duration::from_secs(60));
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(h.paths().contains(&"c/late".to_string()));
+}
+
+#[test]
+fn lost_initial_scan_worker_keeps_the_obligation_pending_and_recovers() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    let root_job = h.pending_job_for("").expect("root listing");
+    let t = h.command(Command::InitialScanComplete);
+    assert!(h.lose_job(root_job.id));
+    assert!(matches!(h.health().initial_scan, InitialScanState::Running { .. }));
+    assert_eq!(h.result(t), None);
+    assert!(h.pending_jobs().is_empty());
+    h.advance(Duration::from_secs(60));
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.paths().len(), 7);
+    assert!(matches!(h.health().initial_scan, InitialScanState::Complete { .. }));
+}
+
+#[test]
+fn lost_root_probe_worker_schedules_another_probe() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    fs.remove_root();
+    h.fire_timer();
+    assert!(h.snapshot().is_empty());
+    fs.restore_root();
+    h.advance(Duration::from_secs(1));
+    let probe = loop {
+        if let Some(job) = h.pending_job_for("") {
+            break job;
+        }
+        assert!(h.fire_timer_only(), "probe never dispatched");
+    };
+    assert!(h.lose_job(probe.id));
+    assert!(!h.snapshot().is_empty() || h.pending_jobs().is_empty());
+    h.advance(Duration::from_secs(600));
+    assert!(h.paths().contains(&".".to_string()));
+    assert!(matches!(h.health().root, tree_fucker::update::RootAvailability::Available { .. }));
 }

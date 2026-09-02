@@ -4,10 +4,16 @@ use std::time::{Duration, Instant};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+pub trait TaskHandle: Send + Sync + 'static {
+    fn cancel(&self);
+}
+
+pub type BoxTaskHandle = Box<dyn TaskHandle>;
+
 pub trait Runtime: Send + Sync + 'static {
     fn now(&self) -> Instant;
     fn spawn(&self, future: BoxFuture<'static, ()>);
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>);
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxTaskHandle;
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()>;
 }
 
@@ -28,6 +34,16 @@ impl TokioRuntime {
 }
 
 #[cfg(feature = "tokio")]
+struct TokioTask(tokio::task::JoinHandle<()>);
+
+#[cfg(feature = "tokio")]
+impl TaskHandle for TokioTask {
+    fn cancel(&self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl Runtime for TokioRuntime {
     fn now(&self) -> Instant {
         Instant::now()
@@ -37,8 +53,8 @@ impl Runtime for TokioRuntime {
         self.handle.spawn(future);
     }
 
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(work);
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxTaskHandle {
+        Box::new(TokioTask(self.handle.spawn_blocking(work)))
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {

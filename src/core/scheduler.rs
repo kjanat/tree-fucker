@@ -383,6 +383,7 @@ impl Coordinator {
                 incarnation: self.root.incarnation(),
                 entry_generation: EntryGeneration::new(0),
                 load_generation: None,
+                policy_revision: self.policy.revision(),
                 policy_fence: self.policy_fence,
                 parent_context: None,
                 child_state: None,
@@ -405,6 +406,16 @@ impl Coordinator {
         } else {
             JobPhase::Queued
         };
+        let mut barriers = request.barriers;
+        if let Some(entry_id) = entry
+            && let Some(record) = self.entries.get(&entry_id).and_then(|s| s.retry.as_ref())
+        {
+            for barrier in &record.barriers {
+                if !barriers.contains(barrier) {
+                    barriers.push(*barrier);
+                }
+            }
+        }
         let job = ActiveJob {
             id,
             entry,
@@ -415,7 +426,7 @@ impl Coordinator {
             dispatch,
             recon,
             reasons,
-            barriers: request.barriers,
+            barriers,
             designated,
             started: None,
             expected_unavailable,
@@ -467,6 +478,7 @@ impl Coordinator {
             incarnation: self.root.incarnation(),
             entry_generation: e.map(|e| e.generation).unwrap_or_default(),
             load_generation: state.and_then(|s| s.dir.as_ref()).map(|d| d.load_generation),
+            policy_revision: self.policy.revision(),
             policy_fence: self.policy_fence,
             parent_context: parent.and_then(|p| self.dir_state(p)).map(|d| d.context_generation),
             child_state: if need == ReadNeed::Listing {

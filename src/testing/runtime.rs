@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -8,19 +9,45 @@ use std::time::{Duration, Instant};
 use futures_channel::oneshot;
 use futures_util::task::{ArcWake, waker_ref};
 
-use crate::runtime::{BoxFuture, Runtime};
+use crate::runtime::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle};
+
+struct BlockingWork {
+    work: Box<dyn FnOnce() + Send + 'static>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct BlockingHandle {
+    cancelled: Arc<AtomicBool>,
+    requests: Arc<AtomicU64>,
+}
+
+impl TaskHandle for BlockingHandle {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.requests.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct DiscardedHandle;
+
+impl TaskHandle for DiscardedHandle {
+    fn cancel(&self) {}
+}
 
 struct Inner {
     base: Instant,
     offset: Duration,
     tasks: VecDeque<BoxFuture<'static, ()>>,
-    blocking: VecDeque<Box<dyn FnOnce() + Send + 'static>>,
+    blocking: VecDeque<BlockingWork>,
     timers: Vec<(Duration, oneshot::Sender<()>)>,
+    discard_blocking: bool,
 }
 
 pub struct DeterministicRuntime {
     inner: Mutex<Inner>,
     woken: Arc<Flag>,
+    cancel_requests: Arc<AtomicU64>,
+    caught_panics: AtomicU64,
 }
 
 struct Flag(AtomicBool);
@@ -53,8 +80,11 @@ impl DeterministicRuntime {
                 tasks: VecDeque::new(),
                 blocking: VecDeque::new(),
                 timers: Vec::new(),
+                discard_blocking: false,
             }),
             woken: Arc::new(Flag(AtomicBool::new(false))),
+            cancel_requests: Arc::new(AtomicU64::new(0)),
+            caught_panics: AtomicU64::new(0),
         }
     }
 
@@ -62,12 +92,29 @@ impl DeterministicRuntime {
         lock(&self.inner).offset
     }
 
+    pub fn discard_blocking(&self, discard: bool) {
+        lock(&self.inner).discard_blocking = discard;
+    }
+
+    pub fn cancel_requests(&self) -> u64 {
+        self.cancel_requests.load(Ordering::SeqCst)
+    }
+
+    pub fn caught_panics(&self) -> u64 {
+        self.caught_panics.load(Ordering::SeqCst)
+    }
+
     pub fn run_until_stalled(&self) {
         loop {
-            let blocking: Vec<Box<dyn FnOnce() + Send + 'static>> = lock(&self.inner).blocking.drain(..).collect();
+            let blocking: Vec<BlockingWork> = lock(&self.inner).blocking.drain(..).collect();
             let ran_blocking = !blocking.is_empty();
-            for work in blocking {
-                work();
+            for BlockingWork { work, cancelled } in blocking {
+                if cancelled.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if catch_unwind(AssertUnwindSafe(work)).is_err() {
+                    self.caught_panics.fetch_add(1, Ordering::SeqCst);
+                }
             }
             self.woken.0.store(false, Ordering::SeqCst);
             let tasks: Vec<BoxFuture<'static, ()>> = lock(&self.inner).tasks.drain(..).collect();
@@ -155,9 +202,16 @@ impl Runtime for DeterministicRuntime {
         self.woken.0.store(true, Ordering::SeqCst);
     }
 
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) {
-        lock(&self.inner).blocking.push_back(work);
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxTaskHandle {
+        let mut inner = lock(&self.inner);
+        if inner.discard_blocking {
+            drop(work);
+            return Box::new(DiscardedHandle);
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        inner.blocking.push_back(BlockingWork { work, cancelled: cancelled.clone() });
         self.woken.0.store(true, Ordering::SeqCst);
+        Box::new(BlockingHandle { cancelled, requests: self.cancel_requests.clone() })
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {

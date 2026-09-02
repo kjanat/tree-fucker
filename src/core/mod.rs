@@ -55,12 +55,19 @@ pub enum JobResult {
     Metadata(Result<EntryInfo, FsError>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorkerLoss {
+    Job(JobId),
+    WatchRegistration(WatchRequestId),
+}
+
 #[derive(Clone, Debug)]
 pub enum Input {
     Command { id: CommandId, command: Command },
     Watcher(WatcherEvent),
     JobCompleted { job: JobId, result: JobResult },
     WatchRegistered { request: WatchRequestId, result: Result<WatchId, FsError> },
+    WorkerLost(WorkerLoss),
     Timer(TimerId),
 }
 
@@ -96,6 +103,7 @@ pub struct Stats {
     pub listings: u64,
     pub listing_failures: u64,
     pub stale_results: u64,
+    pub lost_workers: u64,
     pub last_listing_duration: Option<Duration>,
     pub last_listing_children: Option<usize>,
     pub degraded_paths: BTreeSet<RelativePath>,
@@ -132,7 +140,7 @@ pub struct Coordinator {
     last_round_result: Option<crate::update::RoundResult>,
     commands: HashMap<CommandId, PendingCommand>,
     priority: PrioritySet,
-    policy_fence: PolicyRevision,
+    policy_fence: PolicyFence,
     class_rotation: usize,
     watcher_health: WatcherHealth,
     watcher_restart_due: Option<MonotonicTime>,
@@ -153,6 +161,7 @@ pub struct Coordinator {
     listings: u64,
     listing_failures: u64,
     stale_results: u64,
+    lost_workers: u64,
     last_listing_duration: Option<Duration>,
     last_listing_children: Option<usize>,
 }
@@ -202,7 +211,7 @@ impl Coordinator {
             last_round_result: None,
             commands: HashMap::new(),
             priority: PrioritySet::default(),
-            policy_fence: PolicyRevision::new(0),
+            policy_fence: PolicyFence::new(0),
             class_rotation: 0,
             watcher_health: if caps.watcher.is_present() {
                 WatcherHealth::Healthy { backend: caps.watcher }
@@ -227,6 +236,7 @@ impl Coordinator {
             listings: 0,
             listing_failures: 0,
             stale_results: 0,
+            lost_workers: 0,
             last_listing_duration: None,
             last_listing_children: None,
         };
@@ -286,7 +296,10 @@ impl Coordinator {
             Input::Command { id, command } => self.on_command(id, command),
             Input::Watcher(event) => self.on_watcher(event),
             Input::JobCompleted { job, result } => self.on_job_completed(job, result),
-            Input::WatchRegistered { request, result } => self.on_watch_registered(request, result),
+            Input::WatchRegistered { request, result } => {
+                self.on_watch_registered(request, result.map_err(ErrorCause::Fs))
+            }
+            Input::WorkerLost(loss) => self.on_worker_lost(loss),
             Input::Timer(id) => self.on_timer(id),
         }
         self.after_input();
@@ -319,6 +332,7 @@ impl Coordinator {
             listings: self.listings,
             listing_failures: self.listing_failures,
             stale_results: self.stale_results,
+            lost_workers: self.lost_workers,
             last_listing_duration: self.last_listing_duration,
             last_listing_children: self.last_listing_children,
             degraded_paths: self.degraded_paths(),

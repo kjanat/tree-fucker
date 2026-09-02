@@ -6,9 +6,9 @@ use tree_fucker::core::Command;
 use tree_fucker::fs::{DirectoryListing, EntryInfo, FsCapabilities};
 use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{InitialScanState, RoundResult, WatcherHealth};
+use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RoundResult, UpdateEvent, WatcherHealth};
 use tree_fucker::{
-    CaseSensitivity, Config, EntryKind, Error, FsError, LoadAll, LoadState, PathPredicate, PolicyRevision,
+    CaseSensitivity, Config, EntryKind, Error, FsError, LoadAll, LoadState, PathChange, PathPredicate, PolicyRevision,
     RelativePath, WatchRegistrationFailure, WatcherKind,
 };
 
@@ -289,6 +289,126 @@ fn case_insensitive_filesystem_folds_lookups() {
     assert_eq!(h.entry("docs/readme.md").map(|e| e.path.to_string()), Some("Docs/README.md".into()));
 }
 
+fn case_insensitive_fs(stable_identity: bool) -> Arc<FakeFileSystem> {
+    Arc::new(FakeFileSystem::with_capabilities(FsCapabilities {
+        case: CaseSensitivity::Insensitive,
+        stable_identity,
+        watcher: WatcherKind::None,
+    }))
+}
+
+fn published_changes(h: &Harness) -> Vec<PathChange> {
+    h.events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Delta(update) => Some(update.changes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn case_only_rename_with_matching_identity_keeps_the_entry_id() {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("Docs");
+    fs.create_file("Docs/Readme.MD", 1);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let old = h.entry("Docs/Readme.MD").expect("file").id;
+    h.take_events();
+    fs.rename("Docs/Readme.MD", "Docs/README.md");
+    let t = h.command(Command::Refresh(vec![path("Docs")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let entry = h.entry("docs/readme.md").expect("renamed file");
+    assert_eq!(entry.id, old);
+    assert_eq!(entry.path.to_string(), "Docs/README.md");
+    let changes = published_changes(&h);
+    assert!(changes.iter().any(|c| matches!(c, PathChange::Renamed { id, .. } if *id == old)), "{changes:?}");
+    assert!(!changes.iter().any(|c| matches!(c, PathChange::Removed { .. } | PathChange::Added { .. })), "{changes:?}");
+}
+
+#[test]
+fn case_only_rename_without_stable_identity_replaces_the_entry() {
+    let fs = case_insensitive_fs(false);
+    fs.mkdir("Docs");
+    fs.create_file("Docs/Readme.MD", 1);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let old = h.entry("Docs/Readme.MD").expect("file").id;
+    h.take_events();
+    fs.rename("Docs/Readme.MD", "Docs/README.md");
+    let t = h.command(Command::Refresh(vec![path("Docs")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let entry = h.entry("docs/readme.md").expect("replaced file");
+    assert_ne!(entry.id, old);
+    assert_eq!(entry.path.to_string(), "Docs/README.md");
+    let deltas: Vec<&UpdateEvent> = h.events().iter().filter(|e| matches!(e, UpdateEvent::Delta(_))).collect();
+    assert_eq!(deltas.len(), 1);
+    let UpdateEvent::Delta(update) = deltas[0] else { panic!("delta") };
+    let changes = &update.changes;
+    assert!(!changes.iter().any(|c| matches!(c, PathChange::Renamed { .. })), "{changes:?}");
+    let removed = changes.iter().position(|c| matches!(c, PathChange::Removed { id, .. } if *id == old));
+    let added = changes.iter().position(|c| matches!(c, PathChange::Added { id, .. } if *id == entry.id));
+    assert!(removed.is_some() && added.is_some(), "{changes:?}");
+    assert!(removed < added, "{changes:?}");
+}
+
+#[test]
+fn case_only_rename_with_a_different_identity_replaces_the_subtree() {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("Docs");
+    fs.mkdir("Docs/Sub");
+    fs.create_file("Docs/Sub/inner", 1);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let old_dir = h.entry("Docs/Sub").expect("directory").id;
+    let old_inner = h.entry("Docs/Sub/inner").expect("file").id;
+    h.take_events();
+    fs.remove_silently("Docs/Sub");
+    fs.add_silently("Docs/sub", EntryKind::Directory);
+    fs.add_silently("Docs/sub/inner", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("Docs")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let dir = h.entry("docs/sub").expect("directory");
+    assert_ne!(dir.id, old_dir);
+    assert_eq!(dir.path.to_string(), "Docs/sub");
+    let inner = h.entry("docs/sub/inner").expect("file");
+    assert_ne!(inner.id, old_inner);
+    let changes = published_changes(&h);
+    assert!(!changes.iter().any(|c| matches!(c, PathChange::Renamed { .. })), "{changes:?}");
+    assert!(changes.iter().any(|c| matches!(c, PathChange::Removed { id, .. } if *id == old_dir)), "{changes:?}");
+    assert!(changes.iter().any(|c| matches!(c, PathChange::Removed { id, .. } if *id == old_inner)), "{changes:?}");
+    assert!(changes.iter().any(|c| matches!(c, PathChange::Added { id, .. } if *id == dir.id)), "{changes:?}");
+}
+
+#[test]
+fn case_only_rename_without_an_observed_identity_replaces_the_entry() {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("Docs");
+    fs.create_file("Docs/Readme.MD", 1);
+    fs.clear_identity("Docs/Readme.MD");
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let old = h.entry("Docs/Readme.MD").expect("file");
+    assert_eq!(old.identity, None);
+    let old = old.id;
+    h.take_events();
+    fs.rename("Docs/Readme.MD", "Docs/README.md");
+    let t = h.command(Command::Refresh(vec![path("Docs")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let entry = h.entry("docs/readme.md").expect("replaced file");
+    assert_ne!(entry.id, old);
+    let changes = published_changes(&h);
+    assert!(!changes.iter().any(|c| matches!(c, PathChange::Renamed { .. })), "{changes:?}");
+    assert!(changes.iter().any(|c| matches!(c, PathChange::Removed { id, .. } if *id == old)), "{changes:?}");
+    assert!(changes.iter().any(|c| matches!(c, PathChange::Added { id, .. } if *id == entry.id)), "{changes:?}");
+}
+
 #[test]
 fn replaced_entry_with_new_identity_gets_new_entry_id() {
     let fs = populated(WatcherKind::None);
@@ -378,4 +498,50 @@ fn removal_during_in_flight_listing_never_resurrects() {
     h.run_until_idle();
     assert!(!h.paths().contains(&"a/b".to_string()));
     assert!(!h.paths().contains(&"a".to_string()));
+}
+
+#[test]
+fn malformed_listing_fails_the_refresh_and_keeps_the_previous_children() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    fs.remove_silently("a/f2");
+    fs.inject_child("a", "", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+    assert!(matches!(h.result(t), Some(Err(Error::Io(FsError::Transient(_))))));
+    assert!(h.paths().contains(&"a/f2".to_string()));
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), 2);
+    fs.clear_injected_children();
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(!h.paths().contains(&"a/f2".to_string()));
+}
+
+#[test]
+fn lost_registration_worker_is_reported_and_the_listing_proceeds_without_a_watch() {
+    let fs = populated(WatcherKind::NonRecursive);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.auto_register = false;
+    let root_job = h.pending_job_for("").expect("root listing");
+    h.complete_job(root_job.id);
+    let (request, _, _) =
+        h.pending_registrations().into_iter().find(|(_, p, _)| *p == path("c")).expect("c registration");
+    assert!(h.lose_registration(request));
+    assert!(!h.lose_registration(request));
+    assert!(matches!(h.health().watcher, WatcherHealth::Degraded { .. }));
+    let reported = h.events().iter().any(|e| match e {
+        UpdateEvent::Health { errors, .. } | UpdateEvent::Reset { errors, .. } => errors.iter().any(|e| {
+            e.path == path("c") && e.operation == Operation::WatchRegistration && e.error == ErrorCause::WorkerLost
+        }),
+        UpdateEvent::Delta(u) => u.errors.iter().any(|e| e.error == ErrorCause::WorkerLost),
+        UpdateEvent::Terminal { .. } => false,
+    });
+    assert!(reported);
+    h.auto_register = true;
+    h.run_until_idle();
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "c"), 1);
+    assert_eq!(h.entry("c").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert_eq!(fs.watch_count(), 3);
 }

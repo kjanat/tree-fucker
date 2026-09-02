@@ -11,13 +11,13 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::config::{Config, LagMode};
-use crate::core::{Command, Coordinator, Input, JobOperation, JobResult, MonotonicTime, Output, Stats};
+use crate::core::{Command, Coordinator, Input, JobOperation, JobResult, MonotonicTime, Output, Stats, WorkerLoss};
 use crate::error::{Error, Result};
-use crate::fs::{FileSystem, WatcherEvent, WatcherSink};
-use crate::ids::CommandId;
+use crate::fs::{FileSystem, FsError, WatcherEvent, WatcherSink};
+use crate::ids::{CommandId, JobId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
-use crate::runtime::Runtime;
+use crate::runtime::{BoxTaskHandle, Runtime};
 use crate::snapshot::Snapshot;
 use crate::update::{Health, RecoverableError, StreamError, UpdateEvent};
 
@@ -167,6 +167,31 @@ impl WatcherSink for Sink {
     }
 }
 
+struct WorkerGuard {
+    loss: WorkerLoss,
+    tx: Option<mpsc::UnboundedSender<Message>>,
+}
+
+impl WorkerGuard {
+    fn new(loss: WorkerLoss, tx: mpsc::UnboundedSender<Message>) -> WorkerGuard {
+        WorkerGuard { loss, tx: Some(tx) }
+    }
+
+    fn finish(mut self, input: Input) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.unbounded_send(Message::Input(input));
+        }
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.unbounded_send(Message::Input(Input::WorkerLost(self.loss)));
+        }
+    }
+}
+
 struct Actor {
     coordinator: Coordinator,
     rx: mpsc::UnboundedReceiver<Message>,
@@ -176,6 +201,7 @@ struct Actor {
     runtime: Arc<dyn Runtime>,
     root: Arc<PathBuf>,
     base: Instant,
+    workers: HashMap<JobId, BoxTaskHandle>,
 }
 
 impl Actor {
@@ -184,6 +210,12 @@ impl Actor {
     }
 
     fn handle(&mut self, input: Input) -> bool {
+        match &input {
+            Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => {
+                self.workers.remove(job);
+            }
+            _ => {}
+        }
         let now = self.now();
         let outputs = self.coordinator.handle(input, now);
         self.execute(outputs)
@@ -212,29 +244,35 @@ impl Actor {
                 Output::StartJob(spec) => {
                     let fs = self.fs.clone();
                     let root = self.root.clone();
-                    let tx = self.shared.tx.clone();
-                    self.runtime.spawn_blocking(Box::new(move || {
+                    let job = spec.id;
+                    let guard = WorkerGuard::new(WorkerLoss::Job(job), self.shared.tx.clone());
+                    let handle = self.runtime.spawn_blocking(Box::new(move || {
                         let result = match spec.operation {
                             JobOperation::Listing => JobResult::Listing(fs.read_dir(&root, &spec.path)),
                             JobOperation::Metadata => JobResult::Metadata(fs.metadata(&root, &spec.path)),
                         };
-                        let _ = tx.unbounded_send(Message::Input(Input::JobCompleted { job: spec.id, result }));
+                        guard.finish(Input::JobCompleted { job, result });
                     }));
+                    self.workers.insert(job, handle);
                 }
-                Output::CancelJob(_) => {}
+                Output::CancelJob(id) => {
+                    if let Some(handle) = self.workers.remove(&id) {
+                        handle.cancel();
+                    }
+                }
                 Output::RegisterWatch { request, path, recursive } => {
                     let fs = self.fs.clone();
                     let root = self.root.clone();
-                    let tx = self.shared.tx.clone();
                     let sink: Arc<dyn WatcherSink> = self.sink.clone();
-                    self.runtime.spawn_blocking(Box::new(move || {
+                    let guard = WorkerGuard::new(WorkerLoss::WatchRegistration(request), self.shared.tx.clone());
+                    let _ = self.runtime.spawn_blocking(Box::new(move || {
                         let result = fs.watch(&root, &path, recursive, sink);
-                        let _ = tx.unbounded_send(Message::Input(Input::WatchRegistered { request, result }));
+                        guard.finish(Input::WatchRegistered { request, result });
                     }));
                 }
                 Output::Unwatch(id) => {
                     let fs = self.fs.clone();
-                    self.runtime.spawn_blocking(Box::new(move || fs.unwatch(id)));
+                    let _ = self.runtime.spawn_blocking(Box::new(move || fs.unwatch(id)));
                 }
                 Output::Publish(event) => {
                     match &event {
@@ -343,6 +381,7 @@ impl Tree {
             runtime: runtime.clone(),
             root,
             base,
+            workers: HashMap::new(),
         };
         actor.execute(initial);
         while actor.coordinator.open_gate().is_none() {
@@ -366,14 +405,18 @@ impl Tree {
     }
 }
 
-async fn blocking<T: Send + 'static>(runtime: &Arc<dyn Runtime>, work: impl FnOnce() -> T + Send + 'static) -> T {
+async fn blocking<T: Send + 'static>(
+    runtime: &Arc<dyn Runtime>,
+    work: impl FnOnce() -> std::result::Result<T, FsError> + Send + 'static,
+) -> Result<T> {
     let (tx, rx) = oneshot::channel();
-    runtime.spawn_blocking(Box::new(move || {
+    let _ = runtime.spawn_blocking(Box::new(move || {
         let _ = tx.send(work());
     }));
     match rx.await {
-        Ok(value) => value,
-        Err(_) => panic!("blocking work was dropped by the runtime"),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(Error::from(err)),
+        Err(_) => Err(Error::WorkerLost),
     }
 }
 
