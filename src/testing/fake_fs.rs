@@ -1,0 +1,514 @@
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use crate::entry::{EntryKind, FileIdentity, Metadata};
+use crate::fs::{
+    DirEntry, DirectoryListing, EntryInfo, FileSystem, FsCapabilities, FsError, HintKind, WatcherEvent, WatcherKind,
+    WatcherSink,
+};
+use crate::ids::WatchId;
+use crate::path::{CaseSensitivity, RelativePath};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FakeOp {
+    Metadata,
+    ReadDir,
+    Watch,
+}
+
+#[derive(Clone, Debug)]
+pub enum FailureMode {
+    Once(FsError),
+    Times(u32, FsError),
+    Always(FsError),
+}
+
+struct Failure {
+    path: RelativePath,
+    op: FakeOp,
+    mode: FailureMode,
+}
+
+struct Watch {
+    path: RelativePath,
+    recursive: bool,
+    sink: Arc<dyn WatcherSink>,
+}
+
+struct Inner {
+    nodes: BTreeMap<RelativePath, EntryInfo>,
+    root_present: bool,
+    caps: FsCapabilities,
+    failures: Vec<Failure>,
+    watches: HashMap<WatchId, Watch>,
+    next_watch: u64,
+    next_inode: u64,
+    clock: SystemTime,
+    drop_events: bool,
+    paused: bool,
+    paused_queue: VecDeque<(WatchId, WatcherEvent)>,
+    ops: Vec<(FakeOp, RelativePath)>,
+    root_kind: EntryKind,
+}
+
+pub struct FakeFileSystem {
+    root: PathBuf,
+    inner: Mutex<Inner>,
+}
+
+fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+    match inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl FakeFileSystem {
+    pub fn new(watcher: WatcherKind) -> FakeFileSystem {
+        FakeFileSystem::with_capabilities(FsCapabilities {
+            case: CaseSensitivity::Sensitive,
+            stable_identity: true,
+            watcher,
+        })
+    }
+
+    pub fn with_capabilities(caps: FsCapabilities) -> FakeFileSystem {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            RelativePath::root(),
+            EntryInfo {
+                kind: EntryKind::Directory,
+                metadata: Metadata {
+                    modified: Some(base),
+                    created: Some(base),
+                    size: Some(0),
+                    permissions: Some(0o755),
+                },
+                identity: Some(FileIdentity { device: 1, inode: 1 }),
+            },
+        );
+        FakeFileSystem {
+            root: PathBuf::from("/fake"),
+            inner: Mutex::new(Inner {
+                nodes,
+                root_present: true,
+                caps,
+                failures: Vec::new(),
+                watches: HashMap::new(),
+                next_watch: 1,
+                next_inode: 2,
+                clock: base,
+                drop_events: false,
+                paused: false,
+                paused_queue: VecDeque::new(),
+                ops: Vec::new(),
+                root_kind: EntryKind::Directory,
+            }),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn path(p: &str) -> RelativePath {
+        RelativePath::parse(p).expect("valid test path")
+    }
+
+    fn tick(inner: &mut Inner) -> SystemTime {
+        inner.clock += Duration::from_secs(1);
+        inner.clock
+    }
+
+    fn touch_parent(inner: &mut Inner, path: &RelativePath) {
+        let Some(parent) = path.parent() else { return };
+        let now = Self::tick(inner);
+        if let Some(info) = inner.nodes.get_mut(&parent) {
+            info.metadata.modified = Some(now);
+        }
+    }
+
+    pub fn mkdir(&self, p: &str) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let now = Self::tick(&mut inner);
+        let inode = inner.next_inode;
+        inner.next_inode += 1;
+        inner.nodes.insert(
+            path.clone(),
+            EntryInfo {
+                kind: EntryKind::Directory,
+                metadata: Metadata { modified: Some(now), created: Some(now), size: Some(0), permissions: Some(0o755) },
+                identity: Some(FileIdentity { device: 1, inode }),
+            },
+        );
+        Self::touch_parent(&mut inner, &path);
+        Self::emit(&mut inner, vec![path], HintKind::Create);
+    }
+
+    pub fn create_file(&self, p: &str, size: u64) {
+        self.create_kind(p, EntryKind::File, size);
+    }
+
+    pub fn create_symlink(&self, p: &str) {
+        self.create_kind(p, EntryKind::Symlink, 0);
+    }
+
+    pub fn create_kind(&self, p: &str, kind: EntryKind, size: u64) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let now = Self::tick(&mut inner);
+        let inode = inner.next_inode;
+        inner.next_inode += 1;
+        inner.nodes.insert(
+            path.clone(),
+            EntryInfo {
+                kind,
+                metadata: Metadata {
+                    modified: Some(now),
+                    created: Some(now),
+                    size: Some(size),
+                    permissions: Some(0o644),
+                },
+                identity: Some(FileIdentity { device: 1, inode }),
+            },
+        );
+        Self::touch_parent(&mut inner, &path);
+        Self::emit(&mut inner, vec![path], HintKind::Create);
+    }
+
+    pub fn remove(&self, p: &str) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let keys: Vec<RelativePath> = inner.nodes.keys().filter(|k| k.starts_with(&path)).cloned().collect();
+        for key in keys {
+            inner.nodes.remove(&key);
+        }
+        Self::touch_parent(&mut inner, &path);
+        Self::emit(&mut inner, vec![path], HintKind::Remove);
+    }
+
+    pub fn rename(&self, from: &str, to: &str) {
+        let from = Self::path(from);
+        let to = Self::path(to);
+        let mut inner = lock(&self.inner);
+        let moved: Vec<(RelativePath, EntryInfo)> =
+            inner.nodes.iter().filter(|(k, _)| k.starts_with(&from)).map(|(k, v)| (k.clone(), *v)).collect();
+        for (key, _) in &moved {
+            inner.nodes.remove(key);
+        }
+        for (key, info) in moved {
+            if let Some(rebased) = key.rebase(&from, &to) {
+                inner.nodes.insert(rebased, info);
+            }
+        }
+        Self::touch_parent(&mut inner, &from);
+        Self::touch_parent(&mut inner, &to);
+        Self::emit(&mut inner, vec![from, to], HintKind::Rename);
+    }
+
+    pub fn set_size_silently(&self, p: &str, size: u64) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        if let Some(info) = inner.nodes.get_mut(&path) {
+            info.metadata.size = Some(size);
+        }
+    }
+
+    pub fn add_silently(&self, p: &str, kind: EntryKind) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let now = inner.clock;
+        let inode = inner.next_inode;
+        inner.next_inode += 1;
+        inner.nodes.insert(
+            path,
+            EntryInfo {
+                kind,
+                metadata: Metadata { modified: Some(now), created: Some(now), size: Some(0), permissions: Some(0o644) },
+                identity: Some(FileIdentity { device: 1, inode }),
+            },
+        );
+    }
+
+    pub fn remove_silently(&self, p: &str) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let keys: Vec<RelativePath> = inner.nodes.keys().filter(|k| k.starts_with(&path)).cloned().collect();
+        for key in keys {
+            inner.nodes.remove(&key);
+        }
+    }
+
+    pub fn set_mtime(&self, p: &str, mtime: SystemTime) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        if let Some(info) = inner.nodes.get_mut(&path) {
+            info.metadata.modified = Some(mtime);
+        }
+    }
+
+    pub fn mtime(&self, p: &str) -> Option<SystemTime> {
+        let path = Self::path(p);
+        lock(&self.inner).nodes.get(&path).and_then(|i| i.metadata.modified)
+    }
+
+    pub fn touch(&self, p: &str) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let now = Self::tick(&mut inner);
+        if let Some(info) = inner.nodes.get_mut(&path) {
+            info.metadata.modified = Some(now);
+        }
+        Self::emit(&mut inner, vec![path], HintKind::Modify);
+    }
+
+    pub fn replace_with_kind(&self, p: &str, kind: EntryKind) {
+        let path = Self::path(p);
+        let mut inner = lock(&self.inner);
+        let keys: Vec<RelativePath> =
+            inner.nodes.keys().filter(|k| k.starts_with(&path) && **k != path).cloned().collect();
+        for key in keys {
+            inner.nodes.remove(&key);
+        }
+        let now = Self::tick(&mut inner);
+        let inode = inner.next_inode;
+        inner.next_inode += 1;
+        inner.nodes.insert(
+            path.clone(),
+            EntryInfo {
+                kind,
+                metadata: Metadata { modified: Some(now), created: Some(now), size: Some(0), permissions: Some(0o644) },
+                identity: Some(FileIdentity { device: 1, inode }),
+            },
+        );
+        Self::emit(&mut inner, vec![path], HintKind::Unknown);
+    }
+
+    pub fn remove_root(&self) {
+        let mut inner = lock(&self.inner);
+        inner.root_present = false;
+        Self::emit(&mut inner, vec![RelativePath::root()], HintKind::Remove);
+    }
+
+    pub fn restore_root(&self) {
+        let mut inner = lock(&self.inner);
+        inner.root_present = true;
+        inner.nodes.retain(|k, _| k.is_root());
+        let now = Self::tick(&mut inner);
+        let inode = inner.next_inode;
+        inner.next_inode += 1;
+        if let Some(root) = inner.nodes.get_mut(&RelativePath::root()) {
+            root.identity = Some(FileIdentity { device: 1, inode });
+            root.metadata.modified = Some(now);
+        }
+    }
+
+    pub fn set_root_kind(&self, kind: EntryKind) {
+        let mut inner = lock(&self.inner);
+        inner.root_kind = kind;
+        if let Some(root) = inner.nodes.get_mut(&RelativePath::root()) {
+            root.kind = kind;
+        }
+    }
+
+    pub fn fail(&self, p: &str, op: FakeOp, mode: FailureMode) {
+        let path = Self::path(p);
+        lock(&self.inner).failures.push(Failure { path, op, mode });
+    }
+
+    pub fn clear_failures(&self) {
+        lock(&self.inner).failures.clear();
+    }
+
+    pub fn drop_events(&self, drop: bool) {
+        lock(&self.inner).drop_events = drop;
+    }
+
+    pub fn pause_events(&self) {
+        lock(&self.inner).paused = true;
+    }
+
+    pub fn resume_events(&self) {
+        let mut inner = lock(&self.inner);
+        inner.paused = false;
+        let queued: Vec<(WatchId, WatcherEvent)> = inner.paused_queue.drain(..).collect();
+        for (watch, event) in queued {
+            if let Some(w) = inner.watches.get(&watch) {
+                w.sink.deliver(event);
+            }
+        }
+    }
+
+    pub fn emit_overflow(&self) {
+        let inner = lock(&self.inner);
+        for watch in inner.watches.values() {
+            watch.sink.deliver(WatcherEvent::Overflow);
+        }
+    }
+
+    pub fn emit_watcher_failure(&self, message: &str) {
+        let mut inner = lock(&self.inner);
+        let watches: Vec<Arc<dyn WatcherSink>> = inner.watches.drain().map(|(_, w)| w.sink).collect();
+        for sink in watches {
+            sink.deliver(WatcherEvent::Failed { message: message.to_string() });
+        }
+    }
+
+    pub fn watch_count(&self) -> usize {
+        lock(&self.inner).watches.len()
+    }
+
+    pub fn ops(&self) -> Vec<(FakeOp, RelativePath)> {
+        lock(&self.inner).ops.clone()
+    }
+
+    pub fn clear_ops(&self) {
+        lock(&self.inner).ops.clear();
+    }
+
+    pub fn count_ops(&self, op: FakeOp, p: &str) -> usize {
+        let path = Self::path(p);
+        lock(&self.inner).ops.iter().filter(|(o, k)| *o == op && *k == path).count()
+    }
+
+    pub fn contains(&self, p: &str) -> bool {
+        lock(&self.inner).nodes.contains_key(&Self::path(p))
+    }
+
+    fn emit(inner: &mut Inner, paths: Vec<RelativePath>, kind: HintKind) {
+        if inner.drop_events {
+            return;
+        }
+        let targets: Vec<(WatchId, Arc<dyn WatcherSink>)> = inner
+            .watches
+            .iter()
+            .filter(|(_, w)| {
+                paths.iter().any(|p| {
+                    if w.recursive {
+                        p.starts_with(&w.path)
+                    } else {
+                        *p == w.path || p.parent().map(|parent| parent == w.path).unwrap_or(false)
+                    }
+                })
+            })
+            .map(|(id, w)| (*id, w.sink.clone()))
+            .collect();
+        for (id, sink) in targets {
+            let event = WatcherEvent::Hint { paths: paths.clone(), kind };
+            if inner.paused {
+                inner.paused_queue.push_back((id, event));
+            } else {
+                sink.deliver(event);
+            }
+        }
+    }
+
+    fn take_failure(inner: &mut Inner, path: &RelativePath, op: FakeOp) -> Option<FsError> {
+        let index = inner.failures.iter().position(|f| f.path == *path && f.op == op)?;
+        let error = match &mut inner.failures[index].mode {
+            FailureMode::Always(err) => err.clone(),
+            FailureMode::Once(err) => {
+                let err = err.clone();
+                inner.failures.remove(index);
+                err
+            }
+            FailureMode::Times(n, err) => {
+                let err = err.clone();
+                *n -= 1;
+                if *n == 0 {
+                    inner.failures.remove(index);
+                }
+                err
+            }
+        };
+        Some(error)
+    }
+
+    fn lookup(inner: &Inner, path: &RelativePath) -> Result<EntryInfo, FsError> {
+        if !inner.root_present {
+            return Err(FsError::NotFound);
+        }
+        if path.is_root() {
+            let mut info = inner.nodes.get(path).copied().ok_or(FsError::NotFound)?;
+            info.kind = inner.root_kind;
+            return Ok(info);
+        }
+        let mut cursor = path.parent();
+        while let Some(candidate) = cursor {
+            match inner.nodes.get(&candidate) {
+                Some(info) if info.kind == EntryKind::Directory => {}
+                Some(_) => return Err(FsError::NotDirectory),
+                None => return Err(FsError::NotFound),
+            }
+            cursor = candidate.parent();
+        }
+        inner.nodes.get(path).copied().ok_or(FsError::NotFound)
+    }
+}
+
+impl FileSystem for FakeFileSystem {
+    fn capabilities(&self) -> FsCapabilities {
+        lock(&self.inner).caps
+    }
+
+    fn canonicalize(&self, root: &Path) -> Result<PathBuf, FsError> {
+        Ok(root.to_path_buf())
+    }
+
+    fn metadata(&self, _root: &Path, path: &RelativePath) -> Result<EntryInfo, FsError> {
+        let mut inner = lock(&self.inner);
+        inner.ops.push((FakeOp::Metadata, path.clone()));
+        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Metadata) {
+            return Err(err);
+        }
+        Self::lookup(&inner, path)
+    }
+
+    fn read_dir(&self, _root: &Path, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+        let mut inner = lock(&self.inner);
+        inner.ops.push((FakeOp::ReadDir, path.clone()));
+        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::ReadDir) {
+            return Err(err);
+        }
+        let directory = Self::lookup(&inner, path)?;
+        if directory.kind != EntryKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let entries = inner
+            .nodes
+            .iter()
+            .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
+            .filter_map(|(k, info)| Some(DirEntry { name: k.file_name()?.to_os_string(), info: *info }))
+            .collect();
+        Ok(DirectoryListing { directory, entries })
+    }
+
+    fn watch(
+        &self,
+        _root: &Path,
+        path: &RelativePath,
+        recursive: bool,
+        sink: Arc<dyn WatcherSink>,
+    ) -> Result<WatchId, FsError> {
+        let mut inner = lock(&self.inner);
+        inner.ops.push((FakeOp::Watch, path.clone()));
+        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Watch) {
+            return Err(err);
+        }
+        if !inner.caps.watcher.is_present() {
+            return Err(FsError::Unsupported("no watcher".into()));
+        }
+        let id = WatchId::new(inner.next_watch);
+        inner.next_watch += 1;
+        inner.watches.insert(id, Watch { path: path.clone(), recursive, sink });
+        Ok(id)
+    }
+
+    fn unwatch(&self, watch: WatchId) {
+        lock(&self.inner).watches.remove(&watch);
+    }
+}

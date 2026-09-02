@@ -1,0 +1,609 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
+use super::types::*;
+use super::{Coordinator, JobOperation, JobSpec, Output};
+use crate::entry::{LoadState, Shape};
+use crate::ids::*;
+use crate::update::{RoundResult, ShutdownState};
+
+impl Coordinator {
+    pub(super) fn maybe_dispatch(&mut self) {
+        if self.shutdown != ShutdownState::Running || self.batch.is_some() {
+            return;
+        }
+        let periodic = self.baseline_due;
+        self.materialize_retries();
+        if periodic {
+            self.ensure_round();
+            self.materialize_priority();
+        }
+        let baseline_ready = periodic && self.round.as_ref().map(|r| !r.wrapped()).unwrap_or(false);
+        let expedited = self.ready_expedited();
+        let expedited_ready = !expedited.is_empty() || self.probe_ready();
+        let b = self.config.batch_size;
+        let reservation = self.config.baseline_reservation();
+        let (baseline_slots, expedited_slots) = match (baseline_ready, expedited_ready) {
+            (true, true) => (reservation, b - reservation),
+            (true, false) => (b, 0),
+            (false, true) => (0, b),
+            (false, false) => (0, 0),
+        };
+        let mut members: HashSet<JobId> = HashSet::new();
+        if baseline_slots > 0 {
+            self.admit_baseline(baseline_slots, &mut members);
+        }
+        if expedited_slots > 0 {
+            self.admit_expedited(expedited_slots, expedited, &mut members);
+        }
+        if periodic {
+            self.baseline_due = false;
+        }
+        if members.is_empty() {
+            if periodic {
+                self.complete_periodic(Duration::ZERO);
+            }
+            return;
+        }
+        self.batch = Some(Batch { members, periodic, started: self.now });
+    }
+
+    fn probe_ready(&self) -> bool {
+        self.probe_job.is_none()
+            && self.root_probe.as_ref().map(|p| p.not_before.map(|t| t <= self.now).unwrap_or(true)).unwrap_or(false)
+    }
+
+    fn ready_expedited(&self) -> Vec<EntryId> {
+        let mut ready: Vec<(crate::path::PathKey, EntryId)> = self
+            .pending
+            .iter()
+            .filter(|(id, request)| {
+                !self.active_by_entry.contains_key(id)
+                    && request.not_before.map(|t| t <= self.now).unwrap_or(true)
+                    && self.snapshot.contains_id(**id)
+            })
+            .map(|(id, request)| (self.snapshot.key(&request.path), *id))
+            .collect();
+        ready.sort();
+        ready.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn materialize_retries(&mut self) {
+        let now = self.now;
+        let due: Vec<EntryId> = self
+            .entries
+            .iter()
+            .filter(|(_, state)| state.retry.as_ref().and_then(|r| r.due).map(|t| t <= now).unwrap_or(false))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            let Some(entry) = self.snapshot.get_by_id(id).cloned() else {
+                if let Some(state) = self.entries.get_mut(&id) {
+                    state.retry = None;
+                }
+                continue;
+            };
+            let Some(record) = self.entries.get_mut(&id).and_then(|s| s.retry.as_mut()) else {
+                continue;
+            };
+            record.due = None;
+            let mut reasons = record.reasons;
+            reasons.retry = true;
+            let need = match record.phase {
+                RetryPhase::Metadata => ReadNeed::Metadata,
+                RetryPhase::Listing | RetryPhase::WatchRegistrationThenListing => ReadNeed::Listing,
+            };
+            if record.phase == RetryPhase::WatchRegistrationThenListing {
+                reasons.control = true;
+            }
+            let barriers = record.barriers.clone();
+            let still_required = match need {
+                ReadNeed::Listing => matches!(entry.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
+                ReadNeed::Metadata => true,
+            };
+            if !still_required {
+                if let Some(state) = self.entries.get_mut(&id) {
+                    state.retry = None;
+                }
+                continue;
+            }
+            if reasons.initial_scan
+                && let Some((_, state)) = self.initial_scan.obligations.get_mut(&id)
+                && *state == ScanObligation::Unsatisfied
+            {
+                *state = ScanObligation::Pending;
+            }
+            self.request(id, entry.path.clone(), need, reasons, barriers);
+        }
+    }
+
+    fn materialize_priority(&mut self) {
+        if self.priority.keys.is_empty() {
+            return;
+        }
+        let loaded: Vec<(crate::path::PathKey, EntryId)> = self
+            .priority
+            .keys
+            .iter()
+            .filter_map(|key| self.snapshot.get_key(key).filter(|e| e.is_loaded()).map(|e| (key.clone(), e.id)))
+            .collect();
+        if loaded.is_empty() {
+            return;
+        }
+        let start = self.priority.cursor % loaded.len();
+        let take = self.config.batch_size.min(loaded.len());
+        for offset in 0..take {
+            let (_, id) = &loaded[(start + offset) % loaded.len()];
+            if self.active_by_entry.contains_key(id) {
+                continue;
+            }
+            let path = match self.snapshot.get_by_id(*id) {
+                Some(e) => e.path.clone(),
+                None => continue,
+            };
+            self.request(*id, path, ReadNeed::Listing, Reasons::priority(), Vec::new());
+        }
+        self.priority.cursor = (start + take) % loaded.len();
+    }
+
+    fn ensure_round(&mut self) {
+        if self.round.is_some() {
+            return;
+        }
+        let RootState::Available { .. } = self.root else {
+            return;
+        };
+        let mut loaded: Vec<(crate::path::PathKey, EntryId, RelativePathOwned)> =
+            self.snapshot.loaded_directories().map(|e| (self.snapshot.key(&e.path), e.id, e.path.clone())).collect();
+        loaded.sort_by(|a, b| a.0.cmp(&b.0));
+        if loaded.is_empty() {
+            if self.last_round_result != Some(RoundResult::Successful) {
+                self.last_round_result = Some(RoundResult::Successful);
+            }
+            self.last_round = Some((self.now, Duration::ZERO));
+            return;
+        }
+        let generation = self.recon_seq.next().max(self.min_recon);
+        self.recon_seq = generation;
+        let barrier = self.next_seq();
+        let mut obligations = Vec::with_capacity(loaded.len());
+        let mut index = std::collections::HashMap::new();
+        for (i, (_, id, path)) in loaded.into_iter().enumerate() {
+            let load_generation = self.dir_state(id).map(|d| d.load_generation).unwrap_or_default();
+            obligations.push(Obligation { entry: id, load_generation, path, state: ObligationState::Pending });
+            index.insert(id, i);
+        }
+        self.round = Some(Round { generation, barrier, obligations, index, cursor: 0, started: self.now });
+    }
+
+    fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) {
+        let mut remaining = slots;
+        loop {
+            if remaining == 0 {
+                break;
+            }
+            let Some(round) = self.round.as_ref() else {
+                break;
+            };
+            if round.wrapped() {
+                break;
+            }
+            let cursor = round.cursor;
+            let obligation = round.obligations[cursor].clone();
+            let generation = round.generation;
+            let barrier = round.barrier;
+            if obligation.state != ObligationState::Pending {
+                self.advance_cursor();
+                continue;
+            }
+            let dir_ok = self
+                .dir_state(obligation.entry)
+                .map(|d| d.load_generation == obligation.load_generation)
+                .unwrap_or(false)
+                && self.snapshot.get_by_id(obligation.entry).map(|e| e.is_loaded()).unwrap_or(false);
+            if !dir_ok {
+                self.set_obligation(obligation.entry, ObligationState::Removed);
+                self.advance_cursor();
+                continue;
+            }
+            if let Some(job_id) = self.active_by_entry.get(&obligation.entry).copied() {
+                let designatable = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|j| {
+                        j.dispatch > barrier
+                            && j.need == ReadNeed::Listing
+                            && j.guards.load_generation == Some(obligation.load_generation)
+                    })
+                    .unwrap_or(false);
+                if designatable {
+                    if let Some(job) = self.jobs.get_mut(&job_id) {
+                        job.designated = true;
+                        job.recon = Some(generation);
+                        job.reasons.baseline = true;
+                    }
+                    self.set_obligation(obligation.entry, ObligationState::Designated(job_id));
+                } else {
+                    let path = obligation.path.clone();
+                    self.request_with(
+                        obligation.entry,
+                        PendingRequest {
+                            path,
+                            need: ReadNeed::Listing,
+                            reasons: Reasons::default(),
+                            barriers: Vec::new(),
+                            designate_for_round: Some(generation),
+                            not_before: None,
+                        },
+                    );
+                }
+                self.advance_cursor();
+                continue;
+            }
+            let mut request = self.pending.remove(&obligation.entry).unwrap_or(PendingRequest {
+                path: obligation.path.clone(),
+                need: ReadNeed::Listing,
+                reasons: Reasons::default(),
+                barriers: Vec::new(),
+                designate_for_round: None,
+                not_before: None,
+            });
+            request.need = ReadNeed::Listing;
+            request.reasons.baseline = true;
+            request.designate_for_round = Some(generation);
+            request.not_before = None;
+            let job_id = self.admit(Some(obligation.entry), request);
+            members.insert(job_id);
+            remaining -= 1;
+            self.advance_cursor();
+        }
+    }
+
+    fn advance_cursor(&mut self) {
+        if let Some(round) = self.round.as_mut() {
+            round.cursor += 1;
+        }
+    }
+
+    pub(super) fn set_obligation(&mut self, entry: EntryId, state: ObligationState) {
+        if let Some(round) = self.round.as_mut()
+            && let Some(obligation) = round.obligation_mut(entry)
+            && !obligation.state.is_terminal()
+        {
+            obligation.state = state;
+        }
+    }
+
+    fn admit_expedited(&mut self, slots: usize, ready: Vec<EntryId>, members: &mut HashSet<JobId>) {
+        let mut by_class: [Vec<EntryId>; 5] = Default::default();
+        for id in ready {
+            if members.iter().any(|j| self.jobs.get(j).map(|job| job.entry == Some(id)).unwrap_or(false)) {
+                continue;
+            }
+            let Some(request) = self.pending.get(&id) else {
+                continue;
+            };
+            let class = request.reasons.expedited_class();
+            let slot = EXPEDITED_CLASSES.iter().position(|c| *c == class).unwrap_or(0);
+            by_class[slot].push(id);
+        }
+        let mut probe_pending = self.probe_ready();
+        let weights = [
+            self.config.class_weights.control,
+            self.config.class_weights.refresh,
+            self.config.class_weights.watcher,
+            self.config.class_weights.retry,
+            self.config.class_weights.priority,
+        ];
+        let mut counts: [usize; 5] = [0; 5];
+        for (i, list) in by_class.iter().enumerate() {
+            counts[i] = list.len();
+        }
+        if probe_pending {
+            counts[0] += 1;
+        }
+        let weight_sum: u64 = (0..5).filter(|i| counts[*i] > 0).map(|i| u64::from(weights[i])).sum();
+        if weight_sum == 0 {
+            return;
+        }
+        let mut quota: [usize; 5] = [0; 5];
+        let mut assigned = 0usize;
+        for i in 0..5 {
+            if counts[i] == 0 {
+                continue;
+            }
+            let share = (slots as u64 * u64::from(weights[i]) / weight_sum) as usize;
+            quota[i] = share.min(counts[i]);
+            assigned += quota[i];
+        }
+        let mut leftover = slots.saturating_sub(assigned);
+        let rotation = self.class_rotation;
+        let mut progress = true;
+        while leftover > 0 && progress {
+            progress = false;
+            for step in 0..5 {
+                let i = (rotation + step) % 5;
+                if quota[i] < counts[i] && leftover > 0 {
+                    quota[i] += 1;
+                    leftover -= 1;
+                    progress = true;
+                }
+            }
+        }
+        self.class_rotation = (rotation + 1) % 5;
+        for i in 0..5 {
+            let mut take = quota[i];
+            if i == 0
+                && probe_pending
+                && take > 0
+                && let Some(probe) = self.root_probe.take()
+            {
+                let job_id = self.admit(None, probe);
+                members.insert(job_id);
+                take -= 1;
+                probe_pending = false;
+            }
+            for id in by_class[i].iter().take(take) {
+                let Some(request) = self.pending.remove(id) else {
+                    continue;
+                };
+                let job_id = self.admit(Some(*id), request);
+                members.insert(job_id);
+            }
+        }
+    }
+
+    fn admit(&mut self, entry: Option<EntryId>, request: PendingRequest) -> JobId {
+        let id = self.next_job_id();
+        let dispatch = self.next_seq();
+        let mut reasons = request.reasons;
+        let mut designated = false;
+        let mut recon = None;
+        if let (Some(entry_id), Some(round)) = (entry, self.round.as_ref())
+            && request.need == ReadNeed::Listing
+            && dispatch > round.barrier
+            && let Some(obligation) = round.index.get(&entry_id).and_then(|i| round.obligations.get(*i))
+        {
+            let load_ok =
+                self.dir_state(entry_id).map(|d| d.load_generation == obligation.load_generation).unwrap_or(false);
+            if load_ok && matches!(obligation.state, ObligationState::Pending | ObligationState::Designated(_)) {
+                recon = Some(round.generation);
+                if request.designate_for_round == Some(round.generation) && obligation.state == ObligationState::Pending
+                {
+                    designated = true;
+                }
+            }
+        }
+        if designated {
+            reasons.baseline = true;
+        }
+        let guards = match entry {
+            Some(entry_id) => self.capture_guards(entry_id, request.need),
+            None => Guards {
+                incarnation: self.root.incarnation(),
+                entry_generation: EntryGeneration::new(0),
+                load_generation: None,
+                policy_fence: self.policy_fence,
+                parent_context: None,
+                child_state: None,
+                parent_child_state: None,
+                entry_state: StateGeneration::new(0),
+                change_epoch: ChangeEpoch::new(0),
+            },
+        };
+        let expected_unavailable = match (entry, self.root) {
+            (None, RootState::Unavailable { last }) => Some(last),
+            _ => None,
+        };
+        let needs_registration = entry.map(|e| self.needs_registration(e, request.need)).unwrap_or(false);
+        let phase = if needs_registration {
+            let req = self.next_watch_request();
+            self.registrations.insert(req, RegistrationTarget::Job(id));
+            let recursive = !self.caps.watcher.is_per_directory();
+            self.outputs.push(Output::RegisterWatch { request: req, path: request.path.clone(), recursive });
+            JobPhase::Registering(req)
+        } else {
+            JobPhase::Queued
+        };
+        let job = ActiveJob {
+            id,
+            entry,
+            path: request.path,
+            need: request.need,
+            phase,
+            guards,
+            dispatch,
+            recon,
+            reasons,
+            barriers: request.barriers,
+            designated,
+            started: None,
+            expected_unavailable,
+        };
+        if let Some(entry_id) = entry {
+            self.active_by_entry.insert(entry_id, id);
+            self.entry_state_mut(entry_id).latest_dispatch = Some(dispatch);
+            if designated {
+                self.set_obligation(entry_id, ObligationState::Designated(id));
+            }
+        } else {
+            self.probe_job = Some(id);
+        }
+        if phase == JobPhase::Queued {
+            self.queue_order.push_back(id);
+        }
+        self.jobs.insert(id, job);
+        id
+    }
+
+    fn needs_registration(&self, entry: EntryId, need: ReadNeed) -> bool {
+        if need != ReadNeed::Listing || !self.caps.watcher.is_present() {
+            return false;
+        }
+        let Some(e) = self.snapshot.get_by_id(entry) else {
+            return false;
+        };
+        if e.shape != Shape::Directory(LoadState::Loading) {
+            return false;
+        }
+        let is_root = e.path.is_root();
+        if !self.caps.watcher.is_per_directory() && !is_root {
+            return false;
+        }
+        match self.dir_state(entry).map(|d| d.watch) {
+            Some(WatchState::NotRegistered) => true,
+            Some(WatchState::Failed) => {
+                self.config.watch_registration_failure == crate::config::WatchRegistrationFailure::RequireWatcher
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn capture_guards(&self, entry: EntryId, need: ReadNeed) -> Guards {
+        let e = self.snapshot.get_by_id(entry);
+        let parent = self.parent_of(entry);
+        let state = self.entries.get(&entry);
+        Guards {
+            incarnation: self.root.incarnation(),
+            entry_generation: e.map(|e| e.generation).unwrap_or_default(),
+            load_generation: state.and_then(|s| s.dir.as_ref()).map(|d| d.load_generation),
+            policy_fence: self.policy_fence,
+            parent_context: parent.and_then(|p| self.dir_state(p)).map(|d| d.context_generation),
+            child_state: if need == ReadNeed::Listing {
+                state.and_then(|s| s.dir.as_ref()).map(|d| d.child_state)
+            } else {
+                None
+            },
+            parent_child_state: parent.and_then(|p| self.dir_state(p)).map(|d| d.child_state),
+            entry_state: state.map(|s| s.state_generation).unwrap_or_default(),
+            change_epoch: state.map(|s| s.change_epoch).unwrap_or_default(),
+        }
+    }
+
+    pub(super) fn guards_valid(&self, job: &ActiveJob) -> bool {
+        if job.guards.incarnation != self.root.incarnation() {
+            return false;
+        }
+        match job.entry {
+            Some(entry) => {
+                if !self.snapshot.contains_id(entry) {
+                    return false;
+                }
+                let current = self.capture_guards(entry, job.need);
+                current == job.guards && self.entries.get(&entry).and_then(|s| s.latest_dispatch) == Some(job.dispatch)
+            }
+            None => match self.root {
+                RootState::Unavailable { last } => job.expected_unavailable == Some(last),
+                RootState::Available { .. } => false,
+            },
+        }
+    }
+
+    pub(super) fn start_queued(&mut self) {
+        if self.shutdown != ShutdownState::Running {
+            return;
+        }
+        loop {
+            let in_flight =
+                self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Running | JobPhase::Confirming)).count();
+            if in_flight >= self.config.max_in_flight {
+                break;
+            }
+            let Some(id) = self.queue_order.pop_front() else {
+                break;
+            };
+            let Some(job) = self.jobs.get(&id) else {
+                continue;
+            };
+            if job.phase != JobPhase::Queued {
+                continue;
+            }
+            if !self.guards_valid(job) {
+                self.finish_job(id, JobOutcome::Cancelled);
+                continue;
+            }
+            let spec = JobSpec {
+                id,
+                path: job.path.clone(),
+                operation: match job.need {
+                    ReadNeed::Listing => JobOperation::Listing,
+                    ReadNeed::Metadata => JobOperation::Metadata,
+                },
+            };
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.phase = JobPhase::Running;
+                job.started = Some(self.now);
+            }
+            self.outputs.push(Output::StartJob(spec));
+        }
+    }
+
+    pub(super) fn job_terminal(&mut self, id: JobId) {
+        let Some(batch) = self.batch.as_mut() else {
+            return;
+        };
+        batch.members.remove(&id);
+        if batch.members.is_empty() {
+            let periodic = batch.periodic;
+            let started = batch.started;
+            self.batch = None;
+            if periodic {
+                let duration = self.now.since(started);
+                self.complete_periodic(duration);
+            }
+        }
+    }
+
+    fn complete_periodic(&mut self, duration: Duration) {
+        let target = match self.config.fixed_interval {
+            Some(interval) => interval,
+            None => {
+                let scaled = duration.as_secs_f64() / self.config.target_duty_cycle;
+                let scaled = Duration::try_from_secs_f64(scaled).unwrap_or(self.config.maximum_period);
+                scaled.clamp(self.config.minimum_period, self.config.maximum_period)
+            }
+        };
+        let delay = target.saturating_sub(duration);
+        self.periodic_due = self.now + delay;
+    }
+
+    pub(super) fn check_round_end(&mut self) {
+        let Some(round) = self.round.as_ref() else {
+            return;
+        };
+        if !round.wrapped() || !round.all_terminal() {
+            return;
+        }
+        let unsatisfied: std::collections::BTreeSet<RelativePathOwned> = round
+            .obligations
+            .iter()
+            .filter(|o| o.state == ObligationState::Unsatisfied)
+            .map(|o| o.path.clone())
+            .collect();
+        let generation = round.generation;
+        let started = round.started;
+        for obligation in &round.obligations {
+            if obligation.state == ObligationState::Accepted
+                && let Some(dir) = self.entries.get_mut(&obligation.entry).and_then(|s| s.dir.as_mut())
+            {
+                dir.last_covered = Some(dir.last_covered.map(|g| g.max(generation)).unwrap_or(generation));
+            }
+        }
+        self.last_round = Some((started, self.now.since(started)));
+        self.last_round_result =
+            Some(if unsatisfied.is_empty() { RoundResult::Successful } else { RoundResult::Degraded { unsatisfied } });
+        self.round = None;
+    }
+
+    pub(super) fn cancel_job(&mut self, id: JobId) {
+        let Some(job) = self.jobs.get(&id) else {
+            return;
+        };
+        if matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
+            self.outputs.push(Output::CancelJob(id));
+        }
+        self.finish_job(id, JobOutcome::Cancelled);
+    }
+}
+
+type RelativePathOwned = crate::path::RelativePath;
