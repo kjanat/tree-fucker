@@ -1,47 +1,30 @@
+---
 name: Pages
-
 on:
   push:
     branches: [master]
-    paths:
-      - rfc/**
-      - .github/workflows/pages.yml
+    paths: [rfc/**, .github/workflows/pages.yml]
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: false
+permissions: { contents: read, pages: write, id-token: write }
+defaults: { run: { working-directory: rfc } }
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-
+      - parallel:
+          - uses: oven-sh/setup-bun@v2
+          - uses: kjanat/dprint-check@v3
+            with: { install-only: true }
       - run: bun install --frozen-lockfile
-
-      - name: Build site
-        run: bun run site
-        working-directory: rfc
-
-      - uses: actions/configure-pages@v6
-
+      - run: bun run site
       - uses: actions/upload-pages-artifact@v5
-        with:
-          path: rfc/site
+        with: { path: rfc/_site }
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+    runs-on: ubuntu-26.04
+    concurrency: { group: pages-deploy, cancel-in-progress: false }
+    environment: { name: github-pages, url: "${{ steps.deployment.outputs.page_url }}" }
+    steps: [{ id: deployment, uses: actions/deploy-pages@v5 }]
