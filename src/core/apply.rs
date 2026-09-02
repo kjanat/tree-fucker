@@ -544,6 +544,18 @@ impl Coordinator {
                     dir.child_state = dir.child_state.next();
                 }
             }
+            let owner_paths: Vec<RelativePath> = match change {
+                PathChange::Renamed { old_path, new_path, .. } => {
+                    old_path.parent().into_iter().chain(new_path.parent()).collect()
+                }
+                other => other.path().parent().into_iter().collect(),
+            };
+            for owner_path in owner_paths {
+                if let Some(owner) = self.snapshot.get(&owner_path).map(|p| p.id) {
+                    let state = self.entry_state_mut(owner);
+                    state.state_generation = state.state_generation.next();
+                }
+            }
             if !matches!(change, PathChange::Added { .. } | PathChange::Removed { .. }) {
                 let state = self.entry_state_mut(change.id());
                 state.state_generation = state.state_generation.next();
