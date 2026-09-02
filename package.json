@@ -1,0 +1,10 @@
+{
+	"name": "workspace",
+	"version": "0.0.0",
+	"private": true,
+	"workspaces": ["rfc"],
+	"devEngines": {
+		"packageManager": [{ "name": "bun", "version": ">=1.4" }],
+		"runtime": [{ "name": "bun", "version": ">=1.4" }]
+	}
+}

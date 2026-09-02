@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -7,11 +7,11 @@ import { join } from 'node:path';
 import treeFucker from './tree-fucker.txt' with { type: 'text' };
 
 const outputPath = join(import.meta.dirname, 'tree-fucker.html');
-const source = treeFucker.replaceAll('\r\n', '\n');
+const source = (treeFucker as string).replaceAll('\r\n', '\n');
 const lines = source.split('\n');
 
 let bodyStart = 0;
-while (bodyStart < lines.length && lines[bodyStart].trim() !== '') bodyStart += 1;
+while (bodyStart < lines.length && lines[bodyStart]?.trim() !== '') bodyStart += 1;
 
 const metadata = Object.fromEntries(
 	lines.slice(0, bodyStart).map((line) => {
@@ -27,10 +27,10 @@ for (const field of ['RFC', 'Status', 'Date', 'Author', 'Organization', 'Email',
 
 const blocks = [];
 for (let index = bodyStart; index < lines.length;) {
-	while (index < lines.length && lines[index].trim() === '') index += 1;
+	while (index < lines.length && lines[index]?.trim() === '') index += 1;
 	if (index >= lines.length) break;
 	const block = [];
-	while (index < lines.length && lines[index].trim() !== '') {
+	while (index < lines.length && lines[index]?.trim() !== '') {
 		block.push(lines[index]);
 		index += 1;
 	}
@@ -883,5 +883,9 @@ const html = `<!doctype html>
 </html>
 `;
 
-writeFileSync(outputPath, html);
-execFileSync('dprint', ['fmt', outputPath], { stdio: 'inherit' });
+if (import.meta.main) {
+	writeFileSync(outputPath, html);
+	execFileSync('dprint', ['fmt', outputPath], { stdio: 'inherit' });
+}
+
+export default html;

@@ -1,0 +1,13 @@
+{
+	"name": "rfc",
+	"version": "1.0.0",
+	"scripts": {
+		"generate": "bun ./render-tree-fucker.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"typescript": "^7"
+	},
+	"packageManager": "bun@1.4.0"
+}

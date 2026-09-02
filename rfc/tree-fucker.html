@@ -939,7 +939,7 @@
 						</li>
 					</ol>
 				</details>
-				<article data-source-sha256="feaff334398af43e237716a62a1e4284b4953b64eb7e33a9fb008f6c96c4d565">
+				<article data-source-sha256="3cf70ebf9011b8e9b129806ae7b3d3df10513461081fee04118ab5002b20d8e1">
 					<section class="rfc-section abstract" data-section="abstract">
 						<h2 id="abstract">
 							<a href="#abstract"><span class="section-number"
@@ -1121,6 +1121,18 @@
 									reconciliation round starts. Filesystem jobs receive dispatch
 									generations from the same sequence. A job is post-barrier only
 									when its dispatch generation is greater than the barrier.
+								</dd>
+							</div>
+							<div>
+								<dt>Publication domain</dt>
+								<dd>
+									The state one job may publish for its target: the target's
+									binding and path, kind, configured metadata, load state, and
+									the immediate-child projection a listing of that target
+									reconciles. Each domain is versioned by a target-state
+									generation. A directory's immediate-child name-to-EntryId
+									mapping is versioned separately by its child-binding
+									generation.
 								</dd>
 							</div>
 							<div>
@@ -2478,7 +2490,8 @@ sources.</code></pre>
 							<li>load generation</li>
 							<li>policy revision</li>
 							<li>policy-context generation</li>
-							<li>applicable child-state generations</li>
+							<li>target-state generation</li>
+							<li>containing-directory child-binding generation</li>
 							<li>change epoch</li>
 							<li>dispatch generation</li>
 							<li>reconciliation generation</li>
@@ -2519,11 +2532,27 @@ sources.</code></pre>
 								</dd>
 							</div>
 							<div>
-								<dt>child-state generation</dt>
+								<dt>target-state generation</dt>
 								<dd>
-									belongs to a directory and changes whenever a committed update
-									changes immediate-child membership, path, kind, configured
-									metadata, or load state;
+									belongs to an entry and versions its publication domain: its
+									binding and path, kind, configured metadata, load state, and
+									the immediate-child projection a listing of it reconciles. It
+									<strong class="normative">MUST</strong> advance atomically
+									whenever any of these change, including when a committed
+									update changes the path, kind, configured metadata, or load
+									state of an immediate child;
+								</dd>
+							</div>
+							<div>
+								<dt>child-binding generation</dt>
+								<dd>
+									belongs to a directory and versions its immediate-child
+									name-to-EntryId mapping. It <strong class="normative"
+									>MUST</strong> advance on addition, removal, replacement, or
+									rename of an immediate child. A change only to an existing
+									child's metadata, kind, load state, or descendants <strong
+										class="normative"
+									>MUST NOT</strong> advance it;
 								</dd>
 							</div>
 							<div>
@@ -2558,25 +2587,51 @@ sources.</code></pre>
 							epoch guards the actual metadata or listing target. A dispatch
 							generation becomes stale only when a later job for that target is
 							dispatched or the target is invalidated; unrelated coordinator
-							sequence values do not stale it.
+							sequence values do not stale it. A later dispatch for a sibling
+							never stales a job.
 						</p>
 						<p>
-							A directory listing <strong class="normative">MUST</strong>
-							capture its target directory's child-state generation. Every job
-							that can mutate a represented entry <strong class="normative"
-							>MUST</strong> capture that entry's containing-directory
-							child-state generation. A listing that can update its target's own
-							metadata therefore captures both generations when the target is
-							not the root. An atomic rename captures both affected parents.
-							Commit <strong class="normative">MUST</strong> atomically validate
-							every captured child-state generation and increment each mutation
-							domain it changes.
+							Every represented-entry job <strong class="normative"
+							>MUST</strong> capture its target's target-state generation. A
+							non-root job <strong class="normative">MUST</strong> also capture
+							its containing directory's child-binding generation. A result
+							spanning multiple publication domains <strong class="normative"
+							>MUST</strong> guard every such domain. An atomic rename <strong
+								class="normative"
+							>MUST</strong> guard both affected parents and advance the
+							target-state generation of every moved binding. Validation,
+							snapshot application, and generation advancement <strong
+								class="normative"
+							>MUST</strong> be atomic. An accepted result <strong
+								class="normative"
+							>MUST</strong> be applied against the coordinator's current
+							snapshot; it <strong class="normative">MUST NOT</strong> replace
+							that snapshot with a dispatch-time snapshot.
+						</p>
+						<p>
+							A sibling's commit therefore does not stale a job. A change to
+							sibling B advances B's target-state generation and the parent's
+							target-state generation, neither of which a job for sibling A
+							captures. A parent listing in flight is staled instead, which
+							prevents an older parent read from overwriting a newer child
+							publication. A commit that adds, removes, replaces, or renames an
+							immediate child advances the parent's child-binding generation and
+							stales every in-flight job for that directory's children.
 						</p>
 						<p>
 							A completed result with any stale applicable publication guard
 							<strong class="normative">MUST</strong> be discarded in full. The
 							current path is queued again when its state still requires the
 							read.
+						</p>
+						<p>
+							Publication guards apply to non-Fatal outcomes. Once a Fatal
+							completion is correlated with an admitted job, it <strong
+								class="normative"
+							>MUST</strong> be handled before publication-guard validation. It
+							<strong class="normative">MUST</strong> publish terminal health
+							and terminate the tree even when the job's publication guards are
+							stale. No snapshot payload from that result may commit.
 						</p>
 						<p>
 							Reconciliation generation is a coverage tag, not a publication
@@ -2890,6 +2945,11 @@ sources.</code></pre>
 						<p>
 							Filesystem adapters classify non-success outcomes as NotFound,
 							NotDirectory, PermissionDenied, Transient, Unsupported, or Fatal.
+							Fatal is reserved for failures that make continued operation of
+							the tree unsafe, such as adapter corruption or loss of the
+							backend. A path-scoped failure <strong class="normative"
+							>MUST</strong> be classified as NotFound, NotDirectory,
+							PermissionDenied, Transient, or Unsupported.
 						</p>
 						<p>
 							Retryable work outcomes are Transient, PermissionDenied,
@@ -2957,7 +3017,12 @@ sources.</code></pre>
 							degradation cause.
 						</p>
 						<p>
-							Fatal errors terminate the tree after publishing terminal health.
+							Fatal errors terminate the tree after publishing terminal health,
+							regardless of the publication-guard state of the job that reported
+							them (Section&nbsp;<a
+								class="section-reference"
+								href="#section-11-4-filesystem-jobs"
+							>11.4</a>).
 						</p>
 						<p>
 							Retry work uses the common weighted scheduler. It <strong
@@ -3380,6 +3445,17 @@ B be the configured batch size.</code></pre>
 							<li>at most one snapshot-producing job per EntryId is active</li>
 							<li>no stale publication guard can commit</li>
 							<li>
+								a sibling's commit never stales an unrelated sibling's job
+							</li>
+							<li>
+								an older parent listing never overwrites a newer committed child
+							</li>
+							<li>publication</li>
+							<li>
+								a Fatal completion terminates the tree even when its guards are
+								stale
+							</li>
+							<li>
 								a stale coverage tag can commit but cannot satisfy newer
 								coverage
 							</li>
@@ -3621,7 +3697,8 @@ B be the configured batch size.</code></pre>
 							</li>
 							<li value="6">
 								reject stale job results after root-incarnation, entry, load,
-								policy, change, or dispatch generation changes;
+								policy, target-state, child-binding, change, or dispatch
+								generation changes;
 							</li>
 							<li value="7">
 								avoid exposing file contents through updates or diagnostics; and
