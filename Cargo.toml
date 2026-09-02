@@ -3,6 +3,13 @@ name    = "tree-fucker"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+[workspace.lints]
+cargo   = { implicit_features = "warn" }
+clippy  = {}
+rust    = {}
+rustdoc = { all = "deny" }
+
 [dependencies]
 futures-channel = "0.3.34"
 futures-core    = "0.3.34"
@@ -19,3 +26,6 @@ futures-executor = "0.3.34"
 
 [features]
 tokio = ["dep:tokio"]
+
+[lints]
+workspace = true
