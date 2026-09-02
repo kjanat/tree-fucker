@@ -8,4 +8,27 @@ tw   = "test --workspace"
 twa  = "test --workspace --all-targets --all-features"
 
 [unstable]
-cargo-lints = true
+gc                = true
+cargo-lints       = true
+trim-paths        = true
+profile-rustflags = true
+sbom              = true
+build-analysis    = true
+hint-msrv         = true
+min-publish-age   = true
+
+[build.analysis]
+enabled = true
+
+[cache.global-clean]
+max-src-age    = "1 month"
+max-crate-age  = "3 months"
+max-index-age  = "3 months"
+max-git-co-age = "1 month"
+max-git-db-age = "3 months"
+
+[profile.release]
+trim-paths = true
+
+[registry]
+global-min-publish-age = "7 days"

@@ -145,6 +145,11 @@ impl Coordinator {
     }
 
     fn on_probe_result(&mut self, job: ActiveJob, result: JobResult) {
+        if let JobResult::Metadata(Err(FsError::Fatal(message))) = result {
+            self.finish_job(job.id, JobOutcome::Cancelled);
+            self.terminate(FsError::Fatal(message));
+            return;
+        }
         if !self.guards_valid(&job) {
             self.finish_job(job.id, JobOutcome::Stale);
             return;
@@ -153,10 +158,6 @@ impl Coordinator {
             JobResult::Metadata(Ok(info)) if info.kind == EntryKind::Directory => {
                 self.finish_job(job.id, JobOutcome::Accepted);
                 self.root_recovered(info);
-            }
-            JobResult::Metadata(Err(FsError::Fatal(m))) => {
-                self.finish_job(job.id, JobOutcome::Accepted);
-                self.terminate(FsError::Fatal(m));
             }
             JobResult::Metadata(Ok(_)) | JobResult::Metadata(Err(FsError::NotFound | FsError::NotDirectory)) => {
                 self.finish_job(job.id, JobOutcome::Accepted);

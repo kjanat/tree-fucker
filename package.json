@@ -3,6 +3,7 @@
 	"version": "0.0.0",
 	"private": true,
 	"workspaces": ["rfc"],
+	"packageManager": "bun@1.4.0",
 	"devEngines": {
 		"packageManager": [{ "name": "bun", "version": ">=1.4" }],
 		"runtime": [{ "name": "bun", "version": ">=1.4" }]

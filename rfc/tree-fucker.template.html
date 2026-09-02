@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta
+			name="description"
+			content="A technical RFC for a bounded, watcher-independent filesystem tree synchronizer."
+		>
+		<meta name="author" data-fill="author-name">
+		<title data-fill="title"></title>
+		<link rel="icon" href="favicon.svg" type="image/svg+xml">
+		<link rel="icon" href="favicon.ico" sizes="48x48 32x32 16x16">
+		<link rel="apple-touch-icon" href="apple-touch-icon.png">
+		<link rel="author" data-fill="author-url">
+		<link rel="preconnect" href="https://fonts.googleapis.com">
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+		<link
+			href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap"
+			rel="stylesheet"
+		>
+		<link rel="stylesheet" href="tree-fucker.css">
+	</head>
+	<body>
+		<a class="skip-link" href="#document">Skip to RFC</a>
+		<div class="progress" aria-hidden="true"></div>
+		<div class="layout">
+			<nav class="rail" aria-label="RFC sections">
+				<p class="rail-label">Baseline cursor</p>
+				<ol data-fill="toc"></ol>
+			</nav>
+			<main class="document" id="document">
+				<header class="hero">
+					<p class="eyebrow">Technical RFC · Filesystem synchronization</p>
+					<h1 data-fill="rfc"></h1>
+					<p class="dek">
+						Watcher events reduce latency. Reconciliation establishes truth.
+					</p>
+					<div class="meta">
+						<span class="status" data-fill="status"></span>
+						<time data-fill="date"></time>
+						<a class="source-link" href="tree-fucker.txt">Plain-text RFC</a>
+					</div>
+					<dl class="authorship">
+						<div>
+							<dt>Author</dt>
+							<dd><a rel="author" data-fill="author"></a></dd>
+						</div>
+						<div>
+							<dt>Organization</dt>
+							<dd data-fill="organization"></dd>
+						</div>
+						<div>
+							<dt>Email</dt>
+							<dd><a data-fill="email"></a></dd>
+						</div>
+						<div>
+							<dt>Profile</dt>
+							<dd><a rel="author" data-fill="profile"></a></dd>
+						</div>
+					</dl>
+				</header>
+				<details class="mobile-toc">
+					<summary>RFC sections</summary>
+					<ol data-fill="toc"></ol>
+				</details>
+				<article data-fill="article"></article>
+				<footer class="document-footer">
+					<span data-fill="footer"></span>
+					<a href="#document">Return to top</a>
+				</footer>
+			</main>
+		</div>
+		<script>
+			const progress = document.querySelector('.progress');
+			const links = [...document.querySelectorAll('[data-section-link]')];
+			const sections = [...document.querySelectorAll('[data-section]')];
+
+			const setActive = (id) => {
+				for (const link of links) {
+					if (link.dataset.sectionLink === id) {
+						link.setAttribute('aria-current', 'true');
+					} else link.removeAttribute('aria-current');
+				}
+			};
+
+			const observer = new IntersectionObserver(
+				(entries) => {
+					const visible = entries
+						.filter((entry) => entry.isIntersecting)
+						.sort((left, right) =>
+							left.boundingClientRect.top - right.boundingClientRect.top
+						);
+					if (visible[0]) setActive(visible[0].target.dataset.section);
+				},
+				{ rootMargin: '-12% 0px -75% 0px' },
+			);
+			for (const section of sections) observer.observe(section);
+
+			const updateProgress = () => {
+				const distance = document.documentElement.scrollHeight
+					- window.innerHeight;
+				const ratio = distance > 0 ? Math.min(1, window.scrollY / distance) : 1;
+				progress.style.setProperty('--progress', ratio);
+			};
+			updateProgress();
+			window.addEventListener('scroll', updateProgress, { passive: true });
+
+			for (const link of document.querySelectorAll('.mobile-toc a')) {
+				link.addEventListener(
+					'click',
+					() => link.closest('details').removeAttribute('open'),
+				);
+			}
+		</script>
+	</body>
+</html>

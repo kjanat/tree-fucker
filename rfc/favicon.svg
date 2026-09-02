@@ -1,0 +1,40 @@
+<svg viewBox="0 0 32 32" aria-label="tree-fucker" role="img" xmlns="http://www.w3.org/2000/svg">
+	<style>
+		.ground {
+			fill: #f1f4f0;
+		}
+		.branch {
+			stroke: #286247;
+		}
+		.node {
+			fill: #286247;
+		}
+		.cursor {
+			fill: #9a4b32;
+		}
+
+		@media (prefers-color-scheme: dark) {
+			.ground {
+				fill: #171e1a;
+			}
+			.branch {
+				stroke: #80c49b;
+			}
+			.node {
+				fill: #80c49b;
+			}
+			.cursor {
+				fill: #e08a69;
+			}
+		}
+	</style>
+	<rect class="ground" rx="7" width="32" height="32" />
+	<g class="branch" fill="none" stroke-width="2.4" stroke-linecap="round">
+		<path d="M9 9v14" />
+		<path d="M9 16h10" />
+		<path d="M9 23h10" />
+	</g>
+	<circle class="node" cx="9" cy="9" r="3.4" />
+	<circle class="node" cx="22" cy="16" r="3.4" />
+	<circle class="cursor" cx="22" cy="23" r="3.4" />
+</svg>
