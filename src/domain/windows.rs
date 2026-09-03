@@ -61,7 +61,7 @@ impl DomainProbe for WindowsProbe {
         let capabilities = capabilities_of(serial, remote(handle));
         let crossed = crossing(parent, serial);
 
-        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed })
+        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case: None })
     }
 }
 

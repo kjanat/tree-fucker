@@ -7,8 +7,9 @@ use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{CostScope, DomainId, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::UpdateEvent;
 use tree_fucker::{
-    AccessTopology, CaseSensitivity, Config, DeclarationSource, DirectoryListing, DomainCapabilities, DomainCrossing,
-    DomainIdentity, EntryInfo, LoadAll, LoadState, PolicyRevision, RelativePath, WatcherKind,
+    AccessTopology, CaseSensitivity, Config, DeclarationSource, DirectoryListing, DomainCapabilities,
+    DomainCaseSensitivity, DomainCrossing, DomainIdentity, EntryInfo, LoadAll, LoadState, PolicyRevision, RelativePath,
+    WatcherKind,
 };
 
 const MEDIA: DomainId = DomainId::new(2);
@@ -493,4 +494,349 @@ fn two_domains_of_unknown_identity_share_one_record_that_declares_nothing() {
         Some(LoadState::Unloaded),
         "RFC 14.3: the second unidentified mount's own declared capabilities decide its crossing separately"
     );
+}
+
+fn cased(case: DomainCaseSensitivity) -> DomainCapabilities {
+    DomainCapabilities { case, ..DomainCapabilities::inline() }
+}
+
+#[test]
+fn a_case_insensitive_child_domain_folds_only_its_own_names() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_capabilities(DomainId::ROOT, cased(DomainCaseSensitivity::Sensitive));
+    fs.set_capabilities(MEDIA, cased(DomainCaseSensitivity::Insensitive));
+    fs.mkdir("top");
+    fs.create_file("top/README.md", 1);
+    fs.create_file("top/readme.md", 2);
+    fs.mkdir("mnt");
+    fs.create_file("mnt/README.md", 3);
+    fs.create_file("mnt/readme.md", 4);
+    fs.set_domain("mnt", MEDIA);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_until_idle();
+
+    let paths = h.paths();
+    assert!(
+        paths.contains(&"top/README.md".to_string()) && paths.contains(&"top/readme.md".to_string()),
+        "RFC 10.3 and 14.1: a case-insensitive mount folds its own names and nothing else, so the case-sensitive \
+         parent domain must keep both casings distinct; the tree holds {paths:?}"
+    );
+    assert_ne!(
+        h.entry("top/README.md").map(|e| e.id),
+        h.entry("top/readme.md").map(|e| e.id),
+        "RFC 14.1: case comparison follows the configured semantics of the domain the containing directory belongs to"
+    );
+
+    let folded: Vec<&String> = paths.iter().filter(|p| p.starts_with("mnt/")).collect();
+    assert_eq!(
+        folded.len(),
+        1,
+        "RFC 10.3 and 14.1: beneath a case-insensitive mount the two casings are one child; the tree holds {folded:?}"
+    );
+    assert_eq!(
+        h.entry("mnt/readme.md").map(|e| e.id),
+        h.entry("mnt/README.MD").map(|e| e.id),
+        "RFC 14.1: a lookup beneath the case-insensitive mount folds, whatever casing it is written in"
+    );
+    assert!(h.entry("mnt/readme.md").is_some());
+}
+
+#[test]
+fn a_remount_that_changes_case_sensitivity_rekeys_the_subtree_without_losing_entries() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_capabilities(DomainId::ROOT, cased(DomainCaseSensitivity::Sensitive));
+    fs.set_capabilities(MEDIA, cased(DomainCaseSensitivity::Sensitive));
+    fs.set_capabilities(BIND, cased(DomainCaseSensitivity::Insensitive));
+    fs.set_identity_space(MEDIA, 0);
+    fs.set_identity_space(BIND, 0);
+    fs.mkdir("mnt");
+    fs.mkdir("mnt/Inner");
+    fs.create_file("mnt/Inner/Leaf", 1);
+    fs.create_file("mnt/Alpha", 2);
+    fs.mkdir("mnt/alpha");
+    fs.create_file("mnt/alpha/buried", 3);
+    fs.set_domain("mnt", MEDIA);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_until_idle();
+
+    let before = h.paths();
+    assert!(
+        before.contains(&"mnt/Inner/Leaf".to_string())
+            && before.contains(&"mnt/Alpha".to_string())
+            && before.contains(&"mnt/alpha/buried".to_string()),
+        "the sensitive mount lost a casing it was configured to keep; it holds {before:?}"
+    );
+    assert_ne!(
+        h.entry("mnt/alpha").map(|e| e.id),
+        h.entry("mnt/Alpha").map(|e| e.id),
+        "the sensitive mount folded a lookup it was not configured to fold"
+    );
+    assert_eq!(h.snapshot().child_case(&path("mnt")), CaseSensitivity::Sensitive);
+    let leaf = h.entry("mnt/Inner/Leaf").map(|e| e.id);
+
+    fs.remount("mnt", BIND);
+    for _ in 0..4 {
+        h.run_round();
+        h.run_until_idle();
+    }
+
+    assert_eq!(
+        h.snapshot().child_case(&path("mnt")),
+        CaseSensitivity::Insensitive,
+        "RFC 10.3: a child name is keyed under the case sensitivity of the domain its containing directory \
+         belongs to"
+    );
+    let after = h.paths();
+    assert!(
+        after.contains(&"mnt/Inner/Leaf".to_string()),
+        "the re-key dropped a descendant that did not collide; the tree holds {after:?}"
+    );
+    assert_eq!(
+        h.entry("mnt/alpha").map(|e| (e.path.to_string(), e.kind())),
+        Some(("mnt/Alpha".to_string(), tree_fucker::EntryKind::File)),
+        "RFC 11.5: the survivor of a re-key collision is the one the next listing would also keep, which the \
+         collision order decides by name before kind; the tree holds {after:?}"
+    );
+    assert!(
+        !after.contains(&"mnt/alpha/buried".to_string()),
+        "a descendant of the entry the collision dropped survived without its parent; the tree holds {after:?}"
+    );
+
+    h.take_events();
+    h.run_round();
+    h.run_until_idle();
+    let settled: Vec<tree_fucker::PathChange> = h
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            UpdateEvent::Delta(update) => Some(update.changes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|change| change.path().starts_with(&path("mnt")))
+        .collect();
+    assert_eq!(
+        settled,
+        Vec::new(),
+        "RFC 11.5: the re-key survivor must be the entry the next listing keeps, so a further round publishes \
+         no change beneath the remounted directory"
+    );
+    assert_eq!(
+        h.entry("mnt/inner/leaf").map(|e| e.id),
+        leaf,
+        "RFC 14.1: after the remount the subtree is keyed under the new domain's case semantics"
+    );
+    assert_eq!(
+        h.entry("mnt/ALPHA").map(|e| e.id),
+        h.entry("mnt/alpha").map(|e| e.id),
+        "RFC 10.3: the re-keyed subtree folds under the remounted domain"
+    );
+    assert!(h.entry("mnt/alpha").is_some(), "the colliding casings folded away to nothing");
+}
+
+fn inconclusive_mount(child: DomainCapabilities) -> Arc<FakeFileSystem> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_capabilities(
+        DomainId::ROOT,
+        DomainCapabilities { topology: AccessTopology::Local, ..DomainCapabilities::inline() },
+    );
+    fs.set_capabilities(MEDIA, child);
+    fs.report_unknown_domain_identity(MEDIA);
+    fs.report_not_domain_root(MEDIA);
+    fs.mkdir("local");
+    fs.create_file("local/f", 1);
+    fs.mkdir("mnt");
+    fs.mkdir("mnt/inner");
+    fs.create_file("mnt/inner/deep", 1);
+    fs.set_domain("mnt", MEDIA);
+    fs
+}
+
+#[test]
+fn an_inconclusive_crossing_into_foreign_storage_is_not_traversed_by_default() {
+    let fs =
+        inconclusive_mount(DomainCapabilities { topology: AccessTopology::Remote, ..DomainCapabilities::inline() });
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    h.run_round();
+
+    assert_eq!(
+        (reads(&fs, "mnt"), reads(&fs, "mnt/inner")),
+        (0, 0),
+        "RFC 14.3: a tree rooted on a local filesystem MUST NOT traverse a network filesystem mounted beneath the \
+         root unless the consumer asks for it, and an adapter that cannot prove the boundary does not make it a \
+         consumer request"
+    );
+    assert_eq!(
+        h.entry("mnt").and_then(|e| e.load_state()),
+        Some(LoadState::Unloaded),
+        "RFC 14.3: the default crossing mode represents the mount point as Unloaded"
+    );
+    assert!(
+        h.stats().crossings.iter().any(|event| event.path == path("mnt") && event.mode == DomainCrossing::LoadOnDemand),
+        "RFC 16: the crossing decision taken on an inconclusive boundary must be observable; the tree recorded {:?}",
+        h.stats().crossings
+    );
+    assert!(h.paths().contains(&"local/f".to_string()), "the parent domain was traversed");
+}
+
+#[test]
+fn an_inconclusive_boundary_with_the_parents_capabilities_is_the_same_domain() {
+    let fs = inconclusive_mount(DomainCapabilities { topology: AccessTopology::Local, ..DomainCapabilities::inline() });
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+
+    assert_eq!(
+        h.entry("mnt").and_then(|e| e.load_state()),
+        Some(LoadState::Loaded),
+        "RFC 14.3: an inconclusive boundary whose declared capabilities match the parent's is the same storage, \
+         so no crossing decision applies to it"
+    );
+    assert!(
+        h.paths().contains(&"mnt/inner/deep".to_string()),
+        "the subtree beneath an unproven, indistinguishable boundary was not traversed; the tree holds {:?}",
+        h.paths()
+    );
+    assert!(
+        !h.stats().crossings.iter().any(|event| event.path == path("mnt")),
+        "RFC 14.3: only a crossing may be recorded as one; the tree recorded {:?}",
+        h.stats().crossings
+    );
+}
+
+#[test]
+fn a_priority_path_survives_a_case_change_on_a_containing_directory() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_capabilities(DomainId::ROOT, cased(DomainCaseSensitivity::Sensitive));
+    fs.set_capabilities(MEDIA, cased(DomainCaseSensitivity::Sensitive));
+    fs.set_capabilities(BIND, cased(DomainCaseSensitivity::Insensitive));
+    fs.set_identity_space(MEDIA, 0);
+    fs.set_identity_space(BIND, 0);
+    fs.mkdir("mnt");
+    let watched: Vec<RelativePath> = (0..3)
+        .map(|i| {
+            fs.mkdir(&format!("mnt/W{i}"));
+            fs.create_file(&format!("mnt/W{i}/f"), 1);
+            path(&format!("mnt/W{i}"))
+        })
+        .collect();
+    fs.mkdir("mnt/Plain");
+    fs.create_file("mnt/Plain/f", 1);
+    fs.set_domain("mnt", MEDIA);
+    let config = Config { batch_size: 2, ..crossing(DomainCrossing::Follow) };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+
+    let t = h.command(Command::SetPriority(watched));
+    assert_eq!(h.result(t), Some(Ok(())));
+    for _ in 0..2 {
+        h.run_round();
+    }
+    assert!(
+        fs.count_ops(FakeOp::ReadDir, "mnt/W0") > fs.count_ops(FakeOp::ReadDir, "mnt/Plain"),
+        "the priority set was never serviced before the remount, so this test measures nothing"
+    );
+
+    fs.remount("mnt", BIND);
+    for _ in 0..4 {
+        h.run_round();
+        h.run_until_idle();
+    }
+    assert_eq!(
+        h.snapshot().child_case(&path("mnt")),
+        CaseSensitivity::Insensitive,
+        "the remount did not change the case sensitivity this test depends on"
+    );
+
+    let before = (fs.count_ops(FakeOp::ReadDir, "mnt/W0"), fs.count_ops(FakeOp::ReadDir, "mnt/Plain"));
+    for _ in 0..2 {
+        h.run_round();
+    }
+    let watched = fs.count_ops(FakeOp::ReadDir, "mnt/W0") - before.0;
+    let plain = fs.count_ops(FakeOp::ReadDir, "mnt/Plain") - before.1;
+    assert!(
+        watched > plain,
+        "RFC 11.3 and 14.1: a stored priority path must keep matching its directory after a case change on a \
+         containing directory re-keys it; across two rounds after the remount the priority directory was listed \
+         {watched} times against the sibling's {plain}"
+    );
+    assert_eq!(h.stats().priority_cursor.1, 3, "the priority set lost a path");
+}
+
+fn wide_listing_folds(children: usize) -> (u64, usize) {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("wide");
+    for i in 0..children {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    let before = h.stats().path_folds;
+    let t = h.command(Command::Refresh(vec![path("wide")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    (
+        h.stats().path_folds - before,
+        h.snapshot().entries().filter(|e| e.path.starts_with(&path("wide")) && !e.path.is_root()).count() - 1,
+    )
+}
+
+#[test]
+fn relisting_a_directory_folds_its_own_path_and_never_one_path_per_child() {
+    let (narrow, narrow_children) = wide_listing_folds(20);
+    let (wide, wide_children) = wide_listing_folds(400);
+    assert_eq!((narrow_children, wide_children), (20, 400), "the fixture did not represent every child");
+    assert_eq!(
+        narrow, wide,
+        "a listing must derive every child key from the containing directory's single fold, so its cost in \
+         path folds cannot grow with the child count; twenty children cost {narrow} folds and four hundred \
+         cost {wide}"
+    );
+    assert!(wide < 16, "a listing that changes nothing must fold a handful of paths, not {wide}");
+}
+
+#[test]
+fn per_domain_watch_accounting_matches_a_recomputed_scan() {
+    let fs = Arc::new(FakeFileSystem::new(tree_fucker::WatcherKind::NonRecursive));
+    fs.mkdir("local");
+    fs.mkdir("local/inner");
+    fs.mkdir("mnt");
+    for i in 0..6 {
+        fs.mkdir(&format!("mnt/d{i}"));
+        fs.create_file(&format!("mnt/d{i}/f"), 1);
+    }
+    fs.set_domain("mnt", MEDIA);
+    let config = Config { watcher_path_limit: 5, ..crossing(DomainCrossing::Follow) };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+
+    let stats = h.stats();
+    let watched: usize = stats.domains.iter().map(|domain| domain.paths_watched).sum();
+    let capped: usize = stats.domains.iter().map(|domain| domain.paths_unwatched_by_cap).sum();
+    assert_eq!(
+        (watched, capped),
+        (stats.paths_watched, stats.paths_unwatched_by_cap),
+        "the per-domain watch accounts must sum to the tree's; the tree reports {stats:?}"
+    );
+    assert_eq!(stats.paths_watched, 5, "the cap did not bind, so the accounting was not exercised");
+    assert!(stats.paths_unwatched_by_cap > 0, "nothing was turned away, so the capped account was not exercised");
+    assert_eq!(
+        stats.loaded_directories,
+        h.snapshot().loaded_directories().count(),
+        "RFC 16: the maintained loaded-directory count must equal a scan of the snapshot"
+    );
+
+    fs.remount("mnt", BIND);
+    for _ in 0..4 {
+        h.run_round();
+        h.run_until_idle();
+    }
+    let stats = h.stats();
+    let watched: usize = stats.domains.iter().map(|domain| domain.paths_watched).sum();
+    assert_eq!(
+        watched, stats.paths_watched,
+        "a directory that changes storage domain must carry its watch account with it; the tree reports {:?}",
+        stats.domains
+    );
+    assert_eq!(stats.loaded_directories, h.snapshot().loaded_directories().count());
 }

@@ -155,3 +155,39 @@ impl Entry {
         self.path.depth()
     }
 }
+
+pub type CollisionKey<'a> = (
+    &'a std::ffi::OsStr,
+    u8,
+    Option<(u64, u64)>,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+    Option<u64>,
+    Option<u32>,
+);
+
+pub fn kind_rank(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::Directory => 0,
+        EntryKind::File => 1,
+        EntryKind::Symlink => 2,
+        EntryKind::Other => 3,
+    }
+}
+
+pub fn collision_key<'a>(
+    name: &'a std::ffi::OsStr,
+    kind: EntryKind,
+    metadata: &Metadata,
+    identity: Option<FileIdentity>,
+) -> CollisionKey<'a> {
+    (
+        name,
+        kind_rank(kind),
+        identity.map(|id| (id.device, id.inode)),
+        metadata.modified,
+        metadata.created,
+        metadata.size,
+        metadata.permissions,
+    )
+}

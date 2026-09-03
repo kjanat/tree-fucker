@@ -73,7 +73,7 @@ impl Default for Config {
             paths_per_command: 65536,
             priority_set_limit: 65536,
             update_stream_capacity: 256,
-            watcher_path_limit: 65536,
+            watcher_path_limit: 16384,
             entries_per_directory: 1_000_000,
             entries_per_lease: 4096,
             operations_per_lease: 256,

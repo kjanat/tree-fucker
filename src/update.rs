@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::core::MonotonicTime;
@@ -164,6 +164,7 @@ pub struct Health {
     pub initial_scan: InitialScanState,
     pub root: RootAvailability,
     pub watcher: WatcherHealth,
+    pub watcher_domains: BTreeMap<crate::domain::StorageDomainId, WatcherHealth>,
     pub reconciliation: ReconciliationHealth,
     pub resource: ResourceHealth,
     pub shutdown: ShutdownState,

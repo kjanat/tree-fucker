@@ -198,6 +198,10 @@ pub struct PathKey {
 }
 
 impl PathKey {
+    pub fn root() -> PathKey {
+        PathKey { folded: RelativePath::root() }
+    }
+
     pub fn depth(&self) -> usize {
         self.folded.depth()
     }
@@ -219,11 +223,18 @@ impl PathKey {
     }
 
     pub fn child(&self, name: &OsStr, case: CaseSensitivity) -> Result<PathKey, PathError> {
+        validate_name(name)?;
+        Ok(self.descend(name, case))
+    }
+
+    pub fn descend(&self, name: &OsStr, case: CaseSensitivity) -> PathKey {
         let folded_name = match case {
             CaseSensitivity::Sensitive => name.to_os_string(),
             CaseSensitivity::Insensitive => fold_component(name),
         };
-        Ok(PathKey { folded: self.folded.join(&folded_name)? })
+        let mut components = self.folded.components.to_vec();
+        components.push(folded_name);
+        PathKey { folded: RelativePath { components: Arc::from(components) } }
     }
 }
 

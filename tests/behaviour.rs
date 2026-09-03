@@ -892,7 +892,7 @@ fn a_standalone_registration_landing_after_its_directory_vanishes_releases_the_w
     h.run_until_idle();
     assert_eq!(fs.watch_count(), 4);
     h.auto_register = false;
-    h.inject_watcher_event(tree_fucker::fs::WatcherEvent::Failed { message: "backend gone".into() });
+    h.inject_watcher_event(tree_fucker::fs::WatcherEvent::Failed { message: "backend gone".into(), path: None });
     assert_eq!(fs.watch_count(), 0);
     for _ in 0..10 {
         if h.pending_registrations().iter().any(|(_, p, _)| *p == path("c")) {

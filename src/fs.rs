@@ -295,7 +295,7 @@ pub enum HintKind {
 pub enum WatcherEvent {
     Hint { paths: Vec<RelativePath>, kind: HintKind },
     Overflow,
-    Failed { message: String },
+    Failed { message: String, path: Option<RelativePath> },
     Dropped { count: u64 },
 }
 

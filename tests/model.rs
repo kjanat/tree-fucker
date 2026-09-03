@@ -640,3 +640,124 @@ fn a_random_history_over_several_domains_converges_and_every_operation_carries_a
         );
     }
 }
+
+fn watched_history(seed: u64, limit: usize) -> (Harness, Arc<FakeFileSystem>, Vec<String>, usize) {
+    let mut rng = Lcg(seed);
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    let mut known: Vec<String> = Vec::new();
+    for i in 0..6 {
+        let name = format!("d{i}");
+        fs.mkdir(&name);
+        known.push(name.clone());
+        let file = format!("{name}/f");
+        fs.create_file(&file, 1);
+        known.push(file);
+    }
+    for (index, domain) in [(1u64, DomainId::new(31)), (4, DomainId::new(34))] {
+        fs.set_domain(&format!("d{index}"), domain);
+        fs.set_identity_space(domain, index);
+    }
+    let config = Config { watcher_path_limit: limit, domain_crossing: DomainCrossing::Follow, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    let mut worst = h.stats().paths_watched;
+    for step in 0..40 {
+        let dirs = directories(&fs, &known);
+        let dir = rng.pick(&dirs).cloned().unwrap_or_default();
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        match rng.next() % 6 {
+            0 => {
+                let name = format!("{prefix}sub{step}");
+                fs.mkdir(&name);
+                known.push(name);
+            }
+            1 => {
+                let name = format!("{prefix}n{step}");
+                fs.create_file(&name, 1);
+                known.push(name);
+            }
+            2 => {
+                if let Some(victim) = rng.pick(&known).cloned() {
+                    fs.remove(&victim);
+                }
+            }
+            3 => {
+                if step % 9 == 0 {
+                    fs.emit_watcher_failure("backend restarted");
+                }
+            }
+            4 => {
+                if step % 5 == 0 {
+                    fs.emit_watcher_failure_under("d1", "mount watcher gone");
+                }
+            }
+            _ => {
+                h.run_round();
+            }
+        }
+        h.run_until_idle();
+        worst = worst.max(h.stats().paths_watched);
+    }
+    for _ in 0..50 {
+        h.run_round();
+        h.run_until_idle();
+        worst = worst.max(h.stats().paths_watched);
+        if h.health().reconciliation.last_round == Some(RoundResult::Successful) && h.pending_jobs().is_empty() {
+            break;
+        }
+    }
+    (h, fs, known, worst)
+}
+
+#[test]
+fn watch_registrations_in_a_random_history_never_exceed_the_cap_and_every_one_holds_a_grant() {
+    for seed in 1..8u64 {
+        let limit = 3 + usize::try_from(seed % 4).unwrap_or(0);
+        let (h, fs, known, worst) = watched_history(seed, limit);
+        assert!(
+            worst <= limit,
+            "RFC 9.2 and 10.4: the configured watcher path limit bounds the registered watch paths per tree; \
+             seed {seed} held {worst} of a limit of {limit}"
+        );
+        let performed =
+            u64::try_from(fs.ops().iter().filter(|(op, _)| *op == FakeOp::Watch).count()).unwrap_or(u64::MAX);
+        let granted = h.governor().watch_registration_grants;
+        assert!(performed > 0, "seed {seed} registered no watch, so the property was never tested");
+        assert!(
+            granted >= performed,
+            "RFC 15.1 item 1: seed {seed} performed {performed} watch registrations against {granted} governor \
+             grants"
+        );
+
+        let stats = h.stats();
+        assert!(
+            stats.paths_watched <= limit && stats.paths_watched <= stats.watcher_path_limit,
+            "RFC 10.4: seed {seed} settled holding {} watch paths under a limit of {limit}",
+            stats.paths_watched
+        );
+        for domain in &stats.domains {
+            assert!(
+                domain.paths_watched <= limit,
+                "RFC 10.4: seed {seed}: domain {} holds {} watch paths, above the tree cap of {limit}",
+                domain.id,
+                domain.paths_watched
+            );
+        }
+
+        let mut expected: Vec<String> = Vec::new();
+        for name in &known {
+            if reachable(&fs, name).is_some() {
+                expected.push(name.clone());
+            }
+        }
+        expected.push(".".into());
+        expected.sort();
+        expected.dedup();
+        let mut actual = h.paths();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "RFC 5.2 and 10.4: a tree whose watcher cap leaves directories unwatched must still converge; seed {seed}"
+        );
+    }
+}

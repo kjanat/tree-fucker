@@ -64,6 +64,16 @@ pub trait ScanPolicy: Send + Sync {
     ) -> DomainCrossing {
         configured
     }
+
+    fn watcher_path_limit(
+        &self,
+        _parent: &PolicyContext,
+        _path: &RelativePath,
+        _domain: &DomainCapabilities,
+        configured: usize,
+    ) -> usize {
+        configured
+    }
 }
 
 pub struct PathPredicate<F> {

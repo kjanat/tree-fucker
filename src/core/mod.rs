@@ -19,7 +19,10 @@ use types::*;
 pub use types::{Class, MonotonicTime};
 
 use crate::config::Config;
-use crate::domain::{DomainCapabilities, DomainCrossing, DomainIdentity, ProbeResult, StorageDomainId};
+use crate::domain::{
+    DomainCapabilities, DomainCrossing, DomainIdentity, ProbeResult, StorageDomainId, WatcherAvailability,
+    WatcherCapabilities, WatcherScope,
+};
 use crate::entry::{LoadState, MetadataFields, Shape};
 use crate::error::Error;
 use crate::fs::{
@@ -51,6 +54,10 @@ pub struct DomainStat {
     pub id: StorageDomainId,
     pub identity: DomainIdentity,
     pub capabilities: DomainCapabilities,
+    pub watcher: WatcherCapabilities,
+    pub watcher_health: WatcherHealth,
+    pub paths_watched: usize,
+    pub paths_unwatched_by_cap: usize,
     pub granted: Duration,
     pub charged: Duration,
 }
@@ -59,6 +66,48 @@ pub struct DomainStat {
 struct DomainRecord {
     identity: DomainIdentity,
     capabilities: DomainCapabilities,
+    watcher: WatcherCapabilities,
+}
+
+fn resolve_watcher(declared: WatcherCapabilities, root: WatcherKind) -> WatcherCapabilities {
+    let availability = match declared.availability {
+        WatcherAvailability::Unknown if root.is_present() => WatcherAvailability::Available,
+        WatcherAvailability::Unknown => WatcherAvailability::Unavailable,
+        declared => declared,
+    };
+    let scope = match declared.scope {
+        WatcherScope::Unknown if root.is_per_directory() => WatcherScope::PerDirectory,
+        WatcherScope::Unknown => WatcherScope::Recursive,
+        declared => declared,
+    };
+    WatcherCapabilities { availability, scope, ..declared }
+}
+
+fn watcher_backend(capabilities: WatcherCapabilities) -> WatcherKind {
+    match (capabilities.availability, capabilities.scope) {
+        (WatcherAvailability::Available, WatcherScope::PerDirectory) => WatcherKind::NonRecursive,
+        (WatcherAvailability::Available, _) => WatcherKind::Recursive,
+        _ => WatcherKind::None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WatchScope {
+    Recursive,
+    PerDirectory,
+}
+
+impl WatchScope {
+    pub(super) fn is_recursive(self) -> bool {
+        self == WatchScope::Recursive
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WatchDecision {
+    NotNeeded,
+    Register(WatchScope),
+    Capped,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +240,10 @@ pub struct Stats {
     pub resource: ResourceHealth,
     pub pending_requests: usize,
     pub watcher: WatcherKind,
+    pub watcher_path_limit: usize,
+    pub path_folds: u64,
+    pub paths_watched: usize,
+    pub paths_unwatched_by_cap: usize,
     pub dropped_hints: u64,
     pub coalesced_hints: u64,
     pub listings: u64,
@@ -266,6 +319,7 @@ pub struct Coordinator {
     class_rotation: usize,
     dispatch_rotation: usize,
     watcher_health: WatcherHealth,
+    watcher_degraded: BTreeMap<StorageDomainId, String>,
     watcher_restart_due: Option<MonotonicTime>,
     watcher_restart_attempts: u32,
     watches: Vec<WatchId>,
@@ -293,6 +347,7 @@ pub struct Coordinator {
     kind_resolutions: u64,
     identity_reads: u64,
     unresolved_listings: u64,
+    path_folds: u64,
     cancelled_sessions: u64,
     resource_limits: VecDeque<ResourceLimitEvent>,
     enrichments: u64,
@@ -363,6 +418,7 @@ impl Coordinator {
             } else {
                 WatcherHealth::Absent
             },
+            watcher_degraded: BTreeMap::new(),
             watcher_restart_due: None,
             watcher_restart_attempts: 0,
             watches: Vec::new(),
@@ -390,6 +446,7 @@ impl Coordinator {
             kind_resolutions: 0,
             identity_reads: 0,
             unresolved_listings: 0,
+            path_folds: 0,
             cancelled_sessions: 0,
             resource_limits: VecDeque::new(),
             enrichments: 0,
@@ -572,8 +629,9 @@ impl Coordinator {
                 started: held.started,
             })
             .collect();
-        let loaded = self.snapshot.loaded_directories().count();
-        let priority_len = self.priority.keys.len();
+        let loaded = self.entries.loaded_directories();
+        let priority_len = self.priority.paths.len();
+        let watches = self.entries.watch_accounts();
         Stats {
             version: self.snapshot.version(),
             initial_scan: self.initial_scan_state(),
@@ -607,6 +665,10 @@ impl Coordinator {
             blocking_slots,
             pending_requests: self.pending.len() + usize::from(self.root_probe.is_some()),
             watcher: self.caps.watcher,
+            watcher_path_limit: self.config.watcher_path_limit,
+            path_folds: self.path_folds,
+            paths_watched: watches.values().map(|account| account.watched).sum(),
+            paths_unwatched_by_cap: watches.values().map(|account| account.unwatched_by_cap).sum(),
             dropped_hints: self.dropped_hints,
             coalesced_hints: self.coalesced_hints,
             listings: self.listings,
@@ -642,14 +704,20 @@ impl Coordinator {
 
     fn domain_stats(&self) -> Vec<DomainStat> {
         let accounts = self.governor.view(self.now).domains;
+        let watches = self.entries.watch_accounts();
         self.domain_records
             .iter()
             .map(|(id, record)| {
                 let account = accounts.get(id).copied().unwrap_or_default();
+                let watch = watches.get(&Some(*id)).copied().unwrap_or_default();
                 DomainStat {
                     id: *id,
                     identity: record.identity.clone(),
                     capabilities: record.capabilities.clone(),
+                    watcher: record.watcher,
+                    watcher_health: self.domain_watcher_health(*id, record.watcher),
+                    paths_watched: watch.watched,
+                    paths_unwatched_by_cap: watch.unwatched_by_cap,
                     granted: account.granted,
                     charged: account.charged,
                 }
@@ -658,11 +726,8 @@ impl Coordinator {
     }
 
     pub(super) fn bind_domain(&mut self, probe: &ProbeResult) -> DomainBinding {
-        let (id, record) = match probe.identity.key() {
-            Some(key) => (
-                StorageDomainId::of(key),
-                DomainRecord { identity: probe.identity.clone(), capabilities: probe.capabilities.clone() },
-            ),
+        let (id, identity, capabilities) = match probe.identity.key() {
+            Some(key) => (StorageDomainId::of(key), probe.identity.clone(), probe.capabilities.clone()),
             None => {
                 let id = match self.unknown_domain {
                     Some(id) => id,
@@ -672,10 +737,11 @@ impl Coordinator {
                         id
                     }
                 };
-                (id, DomainRecord { identity: DomainIdentity::Unknown, capabilities: DomainCapabilities::default() })
+                (id, DomainIdentity::Unknown, DomainCapabilities::default())
             }
         };
-        self.domain_records.insert(id, record);
+        let watcher = resolve_watcher(capabilities.watcher, self.caps.watcher);
+        self.domain_records.insert(id, DomainRecord { identity, capabilities, watcher });
         DomainBinding { id, probe: probe.clone() }
     }
 
@@ -690,6 +756,127 @@ impl Coordinator {
     pub(super) fn parent_domain_probe(&self, entry: EntryId) -> Option<ProbeResult> {
         let parent = self.parent_of(entry)?;
         self.dir_state(parent).and_then(|d| d.domain.as_ref()).map(|binding| binding.probe.clone())
+    }
+
+    pub(super) fn domain_probe(&self, entry: EntryId) -> Option<ProbeResult> {
+        match self.dir_state(entry).and_then(|d| d.domain.as_ref()) {
+            Some(binding) => Some(binding.probe.clone()),
+            None => self.parent_domain_probe(entry),
+        }
+    }
+
+    pub(super) fn watcher_of(&self, entry: EntryId) -> WatcherCapabilities {
+        let declared = self.domain_probe(entry).map(|probe| probe.capabilities.watcher).unwrap_or_default();
+        resolve_watcher(declared, self.caps.watcher)
+    }
+
+    fn is_watch_anchor(&self, entry: EntryId) -> bool {
+        let Some(represented) = self.snapshot.get_by_id(entry) else {
+            return false;
+        };
+        if represented.path.is_root() {
+            return true;
+        }
+        let Some(own) = self.dir_state(entry).and_then(|d| d.domain.as_ref()).map(|binding| binding.id) else {
+            return false;
+        };
+        let parent = self
+            .parent_of(entry)
+            .and_then(|parent| self.dir_state(parent))
+            .and_then(|d| d.domain.as_ref())
+            .map(|binding| binding.id);
+        parent != Some(own)
+    }
+
+    pub(super) fn watcher_path_limit_of(&self, entry: EntryId) -> usize {
+        let configured = self.config.watcher_path_limit;
+        let Some(probe) = self.domain_probe(entry) else {
+            return configured;
+        };
+        let Some(path) = self.snapshot.get_by_id(entry).map(|e| e.path.clone()) else {
+            return configured;
+        };
+        let context = self.parent_context(entry).unwrap_or_else(PolicyContext::unit);
+        self.policy.watcher_path_limit(&context, &path, &probe.capabilities, configured).min(configured)
+    }
+
+    pub(super) fn tree_watch_capacity(&self) -> bool {
+        self.watched_paths() < self.config.watcher_path_limit
+    }
+
+    fn watched_paths(&self) -> usize {
+        self.entries.watch_accounts().values().map(|account| account.watched).sum()
+    }
+
+    fn watch_slot_available(&self, entry: EntryId) -> bool {
+        if !self.tree_watch_capacity() {
+            return false;
+        }
+        let domain = self.domain_of(entry);
+        let held = self.entries.watch_accounts().get(&domain).map(|account| account.watched).unwrap_or(0);
+        held < self.watcher_path_limit_of(entry)
+    }
+
+    pub(super) fn hold_watch_path(&mut self, entry: EntryId) {
+        let domain = self.domain_of(entry);
+        self.entries.set_watch(entry, WatchState::Pending, domain);
+    }
+
+    fn watch_target(&self, entry: EntryId) -> Option<WatchScope> {
+        let capabilities = self.watcher_of(entry);
+        if capabilities.availability != WatcherAvailability::Available {
+            return None;
+        }
+        let scope = match capabilities.scope {
+            WatcherScope::PerDirectory => WatchScope::PerDirectory,
+            WatcherScope::Recursive | WatcherScope::Unknown => WatchScope::Recursive,
+        };
+        if scope.is_recursive() && !self.is_watch_anchor(entry) {
+            return None;
+        }
+        let wanted = match self.dir_state(entry).map(|d| d.watch()) {
+            Some(WatchState::NotRegistered | WatchState::Capped) => true,
+            Some(WatchState::Failed) => {
+                self.config.watch_registration_failure == crate::config::WatchRegistrationFailure::RequireWatcher
+            }
+            Some(WatchState::Pending | WatchState::Registered(_)) | None => false,
+        };
+        wanted.then_some(scope)
+    }
+
+    pub(super) fn watch_decision(&self, entry: EntryId) -> WatchDecision {
+        match self.watch_target(entry) {
+            None => WatchDecision::NotNeeded,
+            Some(scope) if self.watch_slot_available(entry) => WatchDecision::Register(scope),
+            Some(_) => WatchDecision::Capped,
+        }
+    }
+
+    pub(super) fn degrade_domain_watcher(&mut self, entry: EntryId, reason: String) {
+        if let Some(domain) = self.domain_of(entry) {
+            self.watcher_degraded.insert(domain, reason);
+        }
+    }
+
+    pub(super) fn recover_domain_watcher(&mut self, entry: EntryId) {
+        if let Some(domain) = self.domain_of(entry) {
+            self.watcher_degraded.remove(&domain);
+        }
+    }
+
+    fn domain_watcher_health(&self, domain: StorageDomainId, capabilities: WatcherCapabilities) -> WatcherHealth {
+        let backend = watcher_backend(capabilities);
+        if !backend.is_present() {
+            return WatcherHealth::Absent;
+        }
+        match self.watcher_degraded.get(&domain) {
+            Some(reason) => WatcherHealth::Degraded { backend, reason: reason.clone() },
+            None => WatcherHealth::Healthy { backend },
+        }
+    }
+
+    fn watcher_domain_health(&self) -> BTreeMap<StorageDomainId, WatcherHealth> {
+        self.domain_records.iter().map(|(id, record)| (*id, self.domain_watcher_health(*id, record.watcher))).collect()
     }
 
     pub(super) fn crossing_mode(
@@ -909,6 +1096,7 @@ impl Coordinator {
             initial_scan: self.initial_scan_state(),
             root,
             watcher: self.watcher_health.clone(),
+            watcher_domains: self.watcher_domain_health(),
             reconciliation: ReconciliationHealth {
                 last_round: self.last_round_result.clone(),
                 degraded_paths: self.degraded_paths(),
@@ -998,11 +1186,7 @@ impl Coordinator {
         for id in std::mem::take(&mut self.watches) {
             self.outputs.push(Output::Unwatch(id));
         }
-        for state in self.entries.values_mut() {
-            if let Some(dir) = state.dir_mut() {
-                dir.watch = WatchState::NotRegistered;
-            }
-        }
+        self.entries.reset_watches();
     }
 
     fn arm_timer(&mut self) {

@@ -33,8 +33,7 @@ impl Coordinator {
                     self.outputs.push(Output::CommandFinished { id, result: Err(Error::PathLimit) });
                     return;
                 }
-                let keys = paths.iter().map(|p| self.snapshot.key(p)).collect();
-                self.priority = PrioritySet { keys, cursor: 0 };
+                self.priority = PrioritySet { paths: paths.into_iter().collect(), cursor: 0 };
                 self.outputs.push(Output::CommandFinished { id, result: Ok(()) });
             }
             Command::InitialScanComplete => {

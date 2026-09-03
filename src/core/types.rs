@@ -6,7 +6,7 @@ use crate::domain::{DomainCrossing, ProbeResult, StorageDomainId};
 use crate::entry::{Entry, LoadState, MetadataFields, Shape};
 use crate::fs::FsError;
 use crate::ids::*;
-use crate::path::{PathKey, RelativePath};
+use crate::path::RelativePath;
 use crate::policy::PolicyContext;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -381,11 +381,25 @@ pub enum DegradedCause {
     Enrichment,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WatchAccount {
+    pub watched: usize,
+    pub unwatched_by_cap: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchState {
     NotRegistered,
+    Pending,
     Registered(WatchId),
     Failed,
+    Capped,
+}
+
+impl WatchState {
+    pub fn holds_a_path(self) -> bool {
+        matches!(self, WatchState::Pending | WatchState::Registered(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,9 +417,16 @@ pub struct DirState {
     pub context_generation: ContextGeneration,
     pub override_load: Option<bool>,
     pub domain: Option<DomainBinding>,
+    watch_domain: Option<StorageDomainId>,
     pub crossing: Option<DomainCrossing>,
     coverage: Coverage,
-    pub watch: WatchState,
+    watch: WatchState,
+}
+
+impl DirState {
+    pub fn watch(&self) -> WatchState {
+        self.watch
+    }
 }
 
 impl Default for DirState {
@@ -420,6 +441,7 @@ impl Default for DirState {
             crossing: None,
             coverage: Coverage::Unloaded,
             watch: WatchState::NotRegistered,
+            watch_domain: None,
         }
     }
 }
@@ -464,6 +486,9 @@ pub struct EntryStates {
     due: BTreeMap<MonotonicTime, BTreeSet<EntryId>>,
     degraded: BTreeSet<EntryId>,
     metadata_degraded: BTreeSet<EntryId>,
+    watched: BTreeSet<EntryId>,
+    capped: BTreeSet<EntryId>,
+    watch_accounts: BTreeMap<Option<StorageDomainId>, WatchAccount>,
     uncovered: usize,
     covered: BTreeMap<ReconciliationGeneration, usize>,
 }
@@ -471,6 +496,110 @@ pub struct EntryStates {
 impl EntryStates {
     pub fn get(&self, id: EntryId) -> Option<&EntryState> {
         self.states.get(&id)
+    }
+
+    pub fn set_watch(&mut self, id: EntryId, watch: WatchState, domain: Option<StorageDomainId>) {
+        let Some(dir) = self.states.get_mut(&id).and_then(|state| state.dir.as_mut()) else {
+            return;
+        };
+        let previous = (dir.watch, dir.watch_domain);
+        dir.watch = watch;
+        dir.watch_domain = domain;
+        Self::release_watch(&mut self.watch_accounts, previous.0, previous.1);
+        Self::acquire_watch(&mut self.watch_accounts, watch, domain);
+        if watch.holds_a_path() {
+            self.watched.insert(id);
+        } else {
+            self.watched.remove(&id);
+        }
+        if watch == WatchState::Capped {
+            self.capped.insert(id);
+        } else {
+            self.capped.remove(&id);
+        }
+    }
+
+    pub fn rebind_watch_domain(&mut self, id: EntryId, domain: Option<StorageDomainId>) {
+        let Some(dir) = self.states.get_mut(&id).and_then(|state| state.dir.as_mut()) else {
+            return;
+        };
+        if dir.watch_domain == domain {
+            return;
+        }
+        let watch = dir.watch;
+        let previous = dir.watch_domain;
+        dir.watch_domain = domain;
+        Self::release_watch(&mut self.watch_accounts, watch, previous);
+        Self::acquire_watch(&mut self.watch_accounts, watch, domain);
+    }
+
+    pub fn watch_accounts(&self) -> &BTreeMap<Option<StorageDomainId>, WatchAccount> {
+        &self.watch_accounts
+    }
+
+    fn acquire_watch(
+        accounts: &mut BTreeMap<Option<StorageDomainId>, WatchAccount>,
+        watch: WatchState,
+        domain: Option<StorageDomainId>,
+    ) {
+        match watch {
+            WatchState::Pending | WatchState::Registered(_) => accounts.entry(domain).or_default().watched += 1,
+            WatchState::Capped => accounts.entry(domain).or_default().unwatched_by_cap += 1,
+            WatchState::NotRegistered | WatchState::Failed => {}
+        }
+    }
+
+    fn release_watch(
+        accounts: &mut BTreeMap<Option<StorageDomainId>, WatchAccount>,
+        watch: WatchState,
+        domain: Option<StorageDomainId>,
+    ) {
+        let Some(account) = accounts.get_mut(&domain) else {
+            return;
+        };
+        match watch {
+            WatchState::Pending | WatchState::Registered(_) => account.watched -= 1,
+            WatchState::Capped => account.unwatched_by_cap -= 1,
+            WatchState::NotRegistered | WatchState::Failed => return,
+        }
+        if *account == WatchAccount::default() {
+            accounts.remove(&domain);
+        }
+    }
+
+    pub fn watched_ids(&self) -> impl Iterator<Item = EntryId> {
+        self.watched.iter().copied()
+    }
+
+    pub fn capped_ids(&self) -> impl Iterator<Item = EntryId> {
+        self.capped.iter().copied()
+    }
+
+    pub fn any_capped(&self) -> bool {
+        !self.capped.is_empty()
+    }
+
+    pub fn reset_watches(&mut self) {
+        let mut pending: BTreeSet<EntryId> = BTreeSet::new();
+        let mut accounts: BTreeMap<Option<StorageDomainId>, WatchAccount> = BTreeMap::new();
+        for (id, state) in self.states.iter_mut() {
+            let Some(dir) = state.dir.as_mut() else {
+                continue;
+            };
+            match dir.watch {
+                WatchState::Pending => {
+                    pending.insert(*id);
+                    Self::acquire_watch(&mut accounts, WatchState::Pending, dir.watch_domain);
+                }
+                WatchState::NotRegistered | WatchState::Registered(_) | WatchState::Failed | WatchState::Capped => {
+                    dir.watch = WatchState::NotRegistered;
+                    dir.watch_domain = None;
+                }
+            }
+        }
+        self.watched = pending;
+        self.capped.clear();
+        self.watch_accounts = accounts;
     }
 
     pub fn get_mut(&mut self, id: EntryId) -> Option<&mut EntryState> {
@@ -489,14 +618,33 @@ impl EntryStates {
         let coverage = state.coverage();
         let due = state.retry.as_ref().and_then(|r| r.due);
         let degraded = state.degraded.is_some();
+        let watched = state.dir.as_ref().map(|d| d.watch.holds_a_path()).unwrap_or(false);
+        let capped = state.dir.as_ref().map(|d| d.watch == WatchState::Capped).unwrap_or(false);
+        let acquired = state.dir.as_ref().map(|dir| (dir.watch, dir.watch_domain));
         if let Some(previous) = self.states.insert(id, state) {
             Self::unindex(&mut self.due, previous.retry.as_ref().and_then(|r| r.due), id);
+            if let Some(dir) = previous.dir() {
+                Self::release_watch(&mut self.watch_accounts, dir.watch, dir.watch_domain);
+            }
             self.release_coverage(previous.coverage());
+        }
+        if let Some(acquired) = acquired {
+            Self::acquire_watch(&mut self.watch_accounts, acquired.0, acquired.1);
         }
         if degraded {
             self.degraded.insert(id);
         } else {
             self.degraded.remove(&id);
+        }
+        if watched {
+            self.watched.insert(id);
+        } else {
+            self.watched.remove(&id);
+        }
+        if capped {
+            self.capped.insert(id);
+        } else {
+            self.capped.remove(&id);
         }
         self.metadata_degraded.remove(&id);
         self.acquire_coverage(coverage);
@@ -508,6 +656,11 @@ impl EntryStates {
         Self::unindex(&mut self.due, previous.retry.as_ref().and_then(|r| r.due), id);
         self.degraded.remove(&id);
         self.metadata_degraded.remove(&id);
+        self.watched.remove(&id);
+        self.capped.remove(&id);
+        if let Some(dir) = previous.dir() {
+            Self::release_watch(&mut self.watch_accounts, dir.watch, dir.watch_domain);
+        }
         self.release_coverage(previous.coverage());
         Some(previous)
     }
@@ -517,6 +670,9 @@ impl EntryStates {
         self.due.clear();
         self.degraded.clear();
         self.metadata_degraded.clear();
+        self.watched.clear();
+        self.capped.clear();
+        self.watch_accounts.clear();
         self.uncovered = 0;
         self.covered.clear();
     }
@@ -559,17 +715,21 @@ impl EntryStates {
         self.degraded.iter().copied()
     }
 
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut EntryState> {
-        self.states.values_mut()
-    }
-
     pub fn set_directory(&mut self, id: EntryId, directory: bool) {
         let state = self.states.entry(id).or_default();
         let previous = state.coverage();
+        let released = state.dir.as_ref().map(|dir| (dir.watch, dir.watch_domain));
         match (directory, state.dir.is_some()) {
             (true, false) => state.dir = Some(DirState::default()),
             (false, true) => state.dir = None,
             _ => return,
+        }
+        if !directory {
+            self.watched.remove(&id);
+            self.capped.remove(&id);
+            if let Some(released) = released {
+                Self::release_watch(&mut self.watch_accounts, released.0, released.1);
+            }
         }
         self.release_coverage(previous);
     }
@@ -597,6 +757,10 @@ impl EntryStates {
             Some(Coverage::Covered(generation)) => Some(generation),
             _ => None,
         }
+    }
+
+    pub fn loaded_directories(&self) -> usize {
+        self.uncovered + self.covered.values().sum::<usize>()
     }
 
     pub fn coverage_pending(&self, minimum: ReconciliationGeneration) -> bool {
@@ -901,7 +1065,7 @@ pub struct Batch {
 
 #[derive(Clone, Debug, Default)]
 pub struct PrioritySet {
-    pub keys: BTreeSet<PathKey>,
+    pub paths: BTreeSet<RelativePath>,
     pub cursor: usize,
 }
 

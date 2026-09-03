@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rustix::fs::{AtFlags, CWD, FileType, Statx, StatxAttributes, StatxFlags, statx};
+use rustix::fs::{AtFlags, CWD, FileType, IFlags, Statx, StatxAttributes, StatxFlags, ioctl_getflags, statx};
 use rustix::io::Errno;
 
 use super::{
@@ -16,6 +16,7 @@ use super::{
 use crate::path::CaseSensitivity;
 
 const STATX_MNT_ID_UNIQUE: StatxFlags = StatxFlags::from_bits_retain(0x4000);
+const FS_CASEFOLD_FL: IFlags = IFlags::from_bits_retain(0x4000_0000);
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 
 #[derive(Default)]
@@ -77,8 +78,19 @@ impl DomainProbe for LinuxProbe {
             capabilities.sources.identity_reliability = DeclarationSource::Unknown;
         }
 
-        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed })
+        let directory_case = match capabilities.case {
+            DomainCaseSensitivity::PerDirectory { .. } => directory_case(directory),
+            _ => None,
+        };
+
+        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case })
     }
+}
+
+fn directory_case(directory: &Path) -> Option<CaseSensitivity> {
+    let handle = fs::File::open(directory).ok()?;
+    let flags = ioctl_getflags(&handle).ok()?;
+    Some(if flags.contains(FS_CASEFOLD_FL) { CaseSensitivity::Insensitive } else { CaseSensitivity::Sensitive })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -712,5 +724,63 @@ mod tests {
         assert_eq!(string_at(strings, 0), Some("btrfs".to_owned()));
         assert_eq!(string_at(strings, 6), Some("/dev/nvme0n1p2".to_owned()));
         assert_eq!(string_at(strings, 99), None);
+    }
+
+    #[test]
+    fn a_directorys_case_attribute_is_read_where_the_ioctl_succeeds() {
+        let mut read = 0;
+        for path in ["/", "/tmp", "/home"] {
+            let Ok(handle) = fs::File::open(path) else {
+                continue;
+            };
+            let Ok(flags) = ioctl_getflags(&handle) else {
+                continue;
+            };
+            assert!(!flags.contains(FS_CASEFOLD_FL), "{path} is a casefolded directory on this host");
+            assert_eq!(
+                directory_case(Path::new(path)),
+                Some(CaseSensitivity::Sensitive),
+                "RFC 14.3: case sensitivity on ext4 and f2fs is a per-directory attribute, so a directory whose \
+                 inode flags the adapter read answers the attribute it read for {path}"
+            );
+            read += 1;
+        }
+        assert!(read > 0, "the inode-flags ioctl succeeded on no directory, so nothing was read");
+        assert_eq!(
+            directory_case(Path::new("/proc")),
+            None,
+            "RFC 10.3: a directory whose inode flags the adapter cannot read answers Unknown, never a guess"
+        );
+    }
+
+    #[test]
+    fn a_probe_refines_case_only_on_a_per_directory_domain() {
+        let probe = LinuxProbe::new();
+        let Ok(mountinfo) = fs::read_to_string(MOUNTINFO) else {
+            return;
+        };
+        let mut probed = 0;
+        for line in mountinfo.lines() {
+            let Some(target) = line.split(' ').nth(4) else {
+                continue;
+            };
+            let Ok(result) = probe.probe(Path::new(target), None) else {
+                continue;
+            };
+            probed += 1;
+            match result.capabilities.case {
+                DomainCaseSensitivity::PerDirectory { .. } => assert_eq!(
+                    result.directory_case,
+                    directory_case(Path::new(target)),
+                    "RFC 10.3: a domain declaring PerDirectory carries the attribute the adapter read for {target}"
+                ),
+                declared => assert_eq!(
+                    result.directory_case, None,
+                    "RFC 10.3: case sensitivity is refined per directory only where the platform carries a \
+                     per-directory attribute; {target} declares {declared:?}"
+                ),
+            }
+        }
+        assert!(probed > 0, "no mount on this host could be probed");
     }
 }

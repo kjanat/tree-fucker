@@ -295,6 +295,10 @@ impl Coordinator {
         }
         if let JobPhase::Registering(request) = job.phase {
             self.abandon_registration(request);
+            if let Some(entry) = job.entry() {
+                let domain = self.domain_of(entry);
+                self.entries.set_watch(entry, WatchState::NotRegistered, domain);
+            }
         }
         self.queue_order.retain(|q| *q != id);
         if let Some(entry) = job.entry() {
@@ -754,9 +758,9 @@ impl Coordinator {
                 match result {
                     Ok(watch) => {
                         self.watches.push(watch);
-                        if let Some(dir) = self.dir_state_mut(entry) {
-                            dir.watch = WatchState::Registered(watch);
-                        }
+                        let domain = self.domain_of(entry);
+                        self.entries.set_watch(entry, WatchState::Registered(watch), domain);
+                        self.recover_domain_watcher(entry);
                         self.entries.advance_watch_phase(entry);
                         if is_root {
                             self.watcher_health = WatcherHealth::Healthy { backend: self.caps.watcher };
@@ -768,13 +772,11 @@ impl Coordinator {
                     }
                     Err(err) => {
                         self.push_error(job.path.clone(), Operation::WatchRegistration, err.clone());
-                        if let Some(dir) = self.dir_state_mut(entry) {
-                            dir.watch = WatchState::Failed;
-                        }
-                        self.watcher_health = WatcherHealth::Degraded {
-                            backend: self.caps.watcher,
-                            reason: format!("registration failed for {}: {err}", job.path),
-                        };
+                        let domain = self.domain_of(entry);
+                        self.entries.set_watch(entry, WatchState::Failed, domain);
+                        let reason = format!("registration failed for {}: {err}", job.path);
+                        self.degrade_domain_watcher(entry, reason.clone());
+                        self.watcher_health = WatcherHealth::Degraded { backend: self.caps.watcher, reason };
                         match self.config.watch_registration_failure {
                             WatchRegistrationFailure::ReconcileOnly => {
                                 if is_root && self.open_gate == OpenGate::Pending {
@@ -794,17 +796,17 @@ impl Coordinator {
             }
             RegistrationTarget::Standalone(entry) => match result {
                 Ok(watch) => {
-                    let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);
-                    match self.dir_state_mut(entry) {
-                        Some(dir) => dir.watch = WatchState::Registered(watch),
-                        None => {
-                            self.outputs.push(Output::Unwatch(watch));
-                            return;
-                        }
+                    if self.dir_state(entry).is_none() {
+                        self.outputs.push(Output::Unwatch(watch));
+                        return;
                     }
+                    let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);
+                    let domain = self.domain_of(entry);
+                    self.entries.set_watch(entry, WatchState::Registered(watch), domain);
+                    self.recover_domain_watcher(entry);
                     self.watches.push(watch);
                     self.entries.advance_watch_phase(entry);
-                    if is_root || self.caps.watcher.is_per_directory() {
+                    if is_root || self.watcher_of(entry).scope == crate::domain::WatcherScope::PerDirectory {
                         self.watcher_health = WatcherHealth::Healthy { backend: self.caps.watcher };
                         self.watcher_restart_attempts = 0;
                         self.coverage_invalidate();
@@ -817,13 +819,11 @@ impl Coordinator {
                         .map(|e| e.path.clone())
                         .unwrap_or_else(crate::path::RelativePath::root);
                     self.push_error(path, Operation::WatchRegistration, err.clone());
-                    if let Some(dir) = self.dir_state_mut(entry) {
-                        dir.watch = WatchState::Failed;
-                    }
-                    self.watcher_health = WatcherHealth::Degraded {
-                        backend: self.caps.watcher,
-                        reason: format!("restart failed: {err}"),
-                    };
+                    let domain = self.domain_of(entry);
+                    self.entries.set_watch(entry, WatchState::Failed, domain);
+                    let reason = format!("restart failed: {err}");
+                    self.degrade_domain_watcher(entry, reason.clone());
+                    self.watcher_health = WatcherHealth::Degraded { backend: self.caps.watcher, reason };
                     self.watcher_restart_attempts = self.watcher_restart_attempts.saturating_add(1);
                     let delay = self.backoff(self.watcher_restart_attempts);
                     self.watcher_restart_due = Some(self.now + delay);

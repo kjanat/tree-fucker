@@ -115,7 +115,9 @@ struct Inner {
     capabilities: HashMap<DomainId, DomainCapabilities>,
     default_capabilities: DomainCapabilities,
     identity_spaces: HashMap<DomainId, u64>,
+    directory_cases: HashMap<RelativePath, CaseSensitivity>,
     unknown_identities: BTreeSet<DomainId>,
+    non_domain_roots: BTreeSet<DomainId>,
     inline_domains: bool,
     unknown_kinds: BTreeSet<RelativePath>,
     chunk: usize,
@@ -181,7 +183,9 @@ impl FakeFileSystem {
                 capabilities: HashMap::new(),
                 default_capabilities: DomainCapabilities::inline(),
                 identity_spaces: HashMap::new(),
+                directory_cases: HashMap::new(),
                 unknown_identities: BTreeSet::new(),
+                non_domain_roots: BTreeSet::new(),
                 inline_domains: true,
                 unknown_kinds: BTreeSet::new(),
                 chunk: DEFAULT_CHUNK,
@@ -491,8 +495,17 @@ impl FakeFileSystem {
         lock(&self.inner).identity_spaces.insert(domain, space);
     }
 
+    pub fn report_directory_case(&self, p: &str, case: CaseSensitivity) {
+        let path = Self::path(p);
+        lock(&self.inner).directory_cases.insert(path, case);
+    }
+
     pub fn report_unknown_domain_identity(&self, domain: DomainId) {
         lock(&self.inner).unknown_identities.insert(domain);
+    }
+
+    pub fn report_not_domain_root(&self, domain: DomainId) {
+        lock(&self.inner).non_domain_roots.insert(domain);
     }
 
     pub fn report_inline_domains(&self, inline: bool) {
@@ -533,6 +546,9 @@ impl FakeFileSystem {
 
     fn domain_root(inner: &Inner, path: &RelativePath) -> bool {
         let domain = Self::domain_for(inner, path);
+        if inner.non_domain_roots.contains(&domain) {
+            return false;
+        }
         match path.parent() {
             Some(parent) => Self::domain_for(inner, &parent) != domain,
             None => true,
@@ -547,7 +563,8 @@ impl FakeFileSystem {
             DomainIdentity::Known(Self::domain_key(domain))
         };
         let probe =
-            DeclaredProbe::new(identity, Self::capabilities_of_domain(inner, domain), Self::domain_root(inner, path));
+            DeclaredProbe::new(identity, Self::capabilities_of_domain(inner, domain), Self::domain_root(inner, path))
+                .with_directory_case(inner.directory_cases.get(path).copied());
         match probe.probe(Path::new("."), parent) {
             Ok(result) => result,
             Err(_) => ProbeResult::unknown(),
@@ -761,8 +778,24 @@ impl FakeFileSystem {
         let mut inner = lock(&self.inner);
         let watches: Vec<Arc<dyn WatcherSink>> = inner.watches.drain().map(|(_, w)| w.sink).collect();
         for sink in watches {
-            sink.deliver(WatcherEvent::Failed { message: message.to_string() });
+            sink.deliver(WatcherEvent::Failed { message: message.to_string(), path: None });
         }
+    }
+
+    pub fn emit_watcher_failure_under(&self, prefix: &str, message: &str) -> usize {
+        let scope = Self::path(prefix);
+        let mut inner = lock(&self.inner);
+        let failing: Vec<WatchId> =
+            inner.watches.iter().filter(|(_, w)| w.path.starts_with(&scope)).map(|(id, _)| *id).collect();
+        let mut delivered = 0;
+        for id in failing {
+            let Some(watch) = inner.watches.remove(&id) else {
+                continue;
+            };
+            watch.sink.deliver(WatcherEvent::Failed { message: message.to_string(), path: Some(scope.clone()) });
+            delivered += 1;
+        }
+        delivered
     }
 
     pub fn watch_count(&self) -> usize {

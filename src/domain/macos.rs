@@ -45,7 +45,7 @@ impl DomainProbe for MacOsProbe {
         let crossed = crossing(parent, &identity, &capabilities.identity_space);
         let is_domain_root = at_mount_point(directory, &c_string(&stat.f_mntonname));
 
-        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed })
+        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case: None })
     }
 }
 

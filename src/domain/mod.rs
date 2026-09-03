@@ -478,6 +478,24 @@ impl DomainCapabilities {
             && other.identity_reliability.establishes_rename()
             && self.identities_comparable(other)
     }
+
+    pub fn same_storage_as(&self, parent: &DomainCapabilities) -> bool {
+        self.semantics == parent.semantics
+            && self.topology == parent.topology
+            && self.transport == parent.transport
+            && self.media == parent.media
+            && self.identity_space == parent.identity_space
+    }
+
+    pub fn foreign_beneath(&self, parent: &DomainCapabilities) -> bool {
+        if parent.topology != AccessTopology::Local {
+            return false;
+        }
+        matches!(
+            self.topology,
+            AccessTopology::Remote | AccessTopology::Userspace | AccessTopology::Virtual | AccessTopology::Unknown
+        ) || self.media == MediaHint::Removable
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -518,6 +536,7 @@ pub struct ProbeResult {
     pub capabilities: DomainCapabilities,
     pub is_domain_root: bool,
     pub crossed: Crossing,
+    pub directory_case: Option<CaseSensitivity>,
 }
 
 impl ProbeResult {
@@ -527,6 +546,18 @@ impl ProbeResult {
             capabilities: DomainCapabilities::default(),
             is_domain_root: false,
             crossed: Crossing::Inconclusive,
+            directory_case: None,
+        }
+    }
+
+    pub fn case(&self) -> Option<CaseSensitivity> {
+        match self.capabilities.case {
+            DomainCaseSensitivity::Sensitive => Some(CaseSensitivity::Sensitive),
+            DomainCaseSensitivity::Insensitive => Some(CaseSensitivity::Insensitive),
+            DomainCaseSensitivity::PerDirectory { domain_default } => {
+                Some(self.directory_case.unwrap_or(domain_default))
+            }
+            DomainCaseSensitivity::Unknown => None,
         }
     }
 }

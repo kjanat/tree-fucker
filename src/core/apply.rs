@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use super::types::*;
 use super::{Coordinator, CrossingEvent, Output};
@@ -20,6 +19,13 @@ pub(super) struct Observed<'a> {
     pub info: EntryInfo,
 }
 
+pub(super) struct Candidate<'a> {
+    pub key: PathKey,
+    pub path: RelativePath,
+    pub info: EntryInfo,
+    pub domain: Option<&'a ProbeResult>,
+}
+
 pub(super) struct Classification<'a> {
     pub ctx: &'a PolicyContext,
     pub inherit: Reasons,
@@ -30,6 +36,20 @@ pub(super) struct Classification<'a> {
 fn crossed(parent: Option<&ProbeResult>, child: &ProbeResult) -> Crossing {
     let mount_root = if child.is_domain_root { Crossing::Proven } else { Crossing::NotCrossed };
     child.crossed.stronger(Crossing::between(parent, &child.identity)).stronger(mount_root)
+}
+
+fn requires_crossing_decision(parent: Option<&ProbeResult>, child: &ProbeResult) -> bool {
+    match crossed(parent, child) {
+        Crossing::Proven => true,
+        Crossing::NotCrossed => false,
+        Crossing::Inconclusive => match parent {
+            Some(parent) => {
+                !child.capabilities.same_storage_as(&parent.capabilities)
+                    || child.capabilities.foreign_beneath(&parent.capabilities)
+            }
+            None => false,
+        },
+    }
 }
 
 enum IdentityMatch {
@@ -51,29 +71,8 @@ struct Chosen {
     domain: Option<Box<ProbeResult>>,
 }
 
-type CollisionKey<'a> =
-    (&'a OsString, u8, Option<(u64, u64)>, Option<SystemTime>, Option<SystemTime>, Option<u64>, Option<u32>);
-
-fn kind_rank(kind: EntryKind) -> u8 {
-    match kind {
-        EntryKind::Directory => 0,
-        EntryKind::File => 1,
-        EntryKind::Symlink => 2,
-        EntryKind::Other => 3,
-    }
-}
-
-fn collision_key(candidate: &Chosen) -> CollisionKey<'_> {
-    let metadata = candidate.info.metadata;
-    (
-        &candidate.name,
-        kind_rank(candidate.info.kind),
-        candidate.info.identity.map(|id| (id.device, id.inode)),
-        metadata.modified,
-        metadata.created,
-        metadata.size,
-        metadata.permissions,
-    )
+fn collision_key(candidate: &Chosen) -> crate::entry::CollisionKey<'_> {
+    crate::entry::collision_key(&candidate.name, candidate.info.kind, &candidate.info.metadata, candidate.info.identity)
 }
 
 #[derive(Default)]
@@ -103,8 +102,12 @@ impl Coordinator {
         };
         let fields = self.config.metadata_fields;
         let observed_fields = fields.intersect(listing.supplied_fields);
-        let case = self.caps.case;
-        let dir_key = self.snapshot.key(&dir.path);
+        let mut builder = self.snapshot.builder();
+        let mut effects = Effects::default();
+        effects.removed.extend(builder.set_child_case(dir_id, listing.domain.case()));
+        let Some((dir_key, case)) = builder.directory_key(dir_id) else {
+            return Ok(());
+        };
         let mut order: Vec<PathKey> = Vec::with_capacity(listing.entries.len());
         let mut chosen: HashMap<PathKey, Chosen> = HashMap::with_capacity(listing.entries.len());
         let mut malformed: Vec<ErrorCause> = Vec::new();
@@ -165,8 +168,6 @@ impl Coordinator {
             .into_iter()
             .filter_map(|key| chosen.remove(&key).map(|kept| (kept.path, key, kept.info, kept.domain)))
             .collect();
-        let mut builder = self.snapshot.builder();
-        let mut effects = Effects::default();
         let previous_domain =
             self.dir_state(dir_id).and_then(|d| d.domain.as_ref()).map(|b| b.probe.capabilities.clone());
         let binding = self.bind_domain(&listing.domain);
@@ -196,12 +197,16 @@ impl Coordinator {
         let inherit = Reasons { initial_scan: job.reasons.initial_scan, ..Default::default() };
         let classification =
             Classification { ctx: &ctx, inherit, fields: observed_fields, parent_domain: Some(&own_domain) };
-        let existing: HashMap<PathKey, Arc<Entry>> =
-            builder.children(dir_id).into_iter().map(|e| (e.path.key(case), e)).collect();
+        let existing: HashMap<PathKey, Arc<Entry>> = builder
+            .children(dir_id)
+            .into_iter()
+            .filter_map(|e| Some((dir_key.descend(e.path.file_name()?, case), e)))
+            .collect();
         let mut seen_ids: HashSet<EntryId> = HashSet::new();
         for (path, key, info, child_domain) in children {
             let Some(old) = existing.get(&key) else {
-                self.insert_new(&mut builder, &mut effects, path, info, child_domain.as_deref(), &classification);
+                let candidate = Candidate { key, path, info, domain: child_domain.as_deref() };
+                self.insert_new(&mut builder, &mut effects, candidate, &classification);
                 continue;
             };
             seen_ids.insert(old.id);
@@ -211,12 +216,20 @@ impl Coordinator {
                 ChildBinding::Replaced => false,
             };
             if bound {
-                self.rebind_child_domain(&mut effects, old.id, &path, child_domain.as_deref(), &own_domain);
+                self.rebind_child_domain(
+                    &mut builder,
+                    &mut effects,
+                    old.id,
+                    &path,
+                    child_domain.as_deref(),
+                    &own_domain,
+                );
                 let observed = Observed { path: &path, info };
                 self.reconcile_existing(&mut builder, &mut effects, old, observed, &classification);
             } else {
                 effects.removed.extend(builder.remove_subtree(old.id));
-                self.insert_new(&mut builder, &mut effects, path, info, child_domain.as_deref(), &classification);
+                let candidate = Candidate { key, path, info, domain: child_domain.as_deref() };
+                self.insert_new(&mut builder, &mut effects, candidate, &classification);
             }
         }
         for old in existing.values() {
@@ -290,9 +303,11 @@ impl Coordinator {
         self.metadata_operations += u64::from(read.metadata_operations);
         self.enrichments += 1;
         let supplied = fields.intersect(read.supplied_fields);
-        let case = self.caps.case;
         let mut builder = self.snapshot.builder();
         let mut effects = Effects::default();
+        let Some((dir_key, case)) = builder.directory_key(dir_id) else {
+            return JobOutcome::Stale;
+        };
         if let Some(metadata) = read.directory {
             let merged = dir.metadata.merged(metadata, supplied);
             if merged != dir.metadata {
@@ -302,12 +317,15 @@ impl Coordinator {
         let by_key: HashMap<PathKey, Metadata> = read
             .children
             .into_iter()
-            .filter_map(|(name, metadata)| Some((self.snapshot.key(&dir.path).child(&name, case).ok()?, metadata)))
+            .filter_map(|(name, metadata)| Some((dir_key.child(&name, case).ok()?, metadata)))
             .collect();
         let ctx = self.context_for_children(dir_id).unwrap_or_else(PolicyContext::unit);
         let children: Vec<Arc<Entry>> = builder.children(dir_id);
         for child in children {
-            let Some(metadata) = by_key.get(&child.path.key(case)).copied() else {
+            let Some(key) = child.path.file_name().map(|name| dir_key.descend(name, case)) else {
+                continue;
+            };
+            let Some(metadata) = by_key.get(&key).copied() else {
                 continue;
             };
             let merged = child.metadata.merged(metadata, supplied);
@@ -365,16 +383,14 @@ impl Coordinator {
         &mut self,
         builder: &mut SnapshotBuilder,
         effects: &mut Effects,
-        path: RelativePath,
-        info: EntryInfo,
-        domain: Option<&ProbeResult>,
+        candidate: Candidate<'_>,
         classification: &Classification<'_>,
     ) {
+        let Candidate { key, path, info, domain } = candidate;
         let Classification { ctx, inherit, fields, parent_domain } = *classification;
         let decision = self.policy.classify(ctx, &path, &info);
         let crossing = match (info.kind, domain) {
-            (EntryKind::Directory, Some(probe)) => crossed(parent_domain, probe)
-                .is_proven()
+            (EntryKind::Directory, Some(probe)) => requires_crossing_decision(parent_domain, probe)
                 .then(|| self.policy.crossing(ctx, &path, &probe.capabilities, self.config.domain_crossing)),
             _ => None,
         };
@@ -398,10 +414,11 @@ impl Coordinator {
         let mut entry = new_entry(id, path.clone(), shape);
         entry.metadata = info.metadata.project(fields);
         entry.identity = info.identity;
-        if builder.insert(entry).is_err() {
+        if builder.insert_at(key, entry).is_err() {
             return;
         }
         if let (EntryKind::Directory, Some(probe)) = (info.kind, domain) {
+            effects.removed.extend(builder.set_child_case(id, probe.case()));
             let binding = self.bind_domain(probe);
             let child = binding.id;
             effects.domains.push((id, binding));
@@ -697,6 +714,7 @@ impl Coordinator {
     }
 
     pub(super) fn commit(&mut self, builder: SnapshotBuilder, effects: Effects, job: Option<&ActiveJob>) {
+        self.path_folds += u64::try_from(builder.folds()).unwrap_or(u64::MAX);
         let touched: Vec<EntryId> = builder.touched().collect();
         let previous = self.snapshot.version();
         let changes: Vec<PathChange> = if touched.is_empty() {
@@ -771,9 +789,11 @@ impl Coordinator {
                 continue;
             }
             self.entries.set_directory(id, true);
+            let domain = binding.id;
             if let Some(dir) = self.dir_state_mut(id) {
                 dir.domain = Some(binding);
             }
+            self.entries.rebind_watch_domain(id, Some(domain));
         }
         let mut crossing_events: Vec<CrossingEvent> = Vec::new();
         for (id, event) in effects.crossings {
@@ -809,6 +829,7 @@ impl Coordinator {
             }
             self.request(id, path, ReadNeed::Listing, request_reasons, Vec::new());
         }
+        let mut parents: HashMap<RelativePath, Option<EntryId>> = HashMap::new();
         for change in &changes {
             let membership_parents: Vec<RelativePath> = match change {
                 PathChange::Added { path, .. } | PathChange::Removed { path, .. } => {
@@ -822,7 +843,15 @@ impl Coordinator {
                 | PathChange::MetadataChanged { .. } => Vec::new(),
             };
             for parent_path in membership_parents {
-                if let Some(parent) = self.snapshot.get(&parent_path).map(|p| p.id)
+                let parent = match parents.get(&parent_path) {
+                    Some(known) => *known,
+                    None => {
+                        let resolved = self.snapshot.get(&parent_path).map(|p| p.id);
+                        parents.insert(parent_path, resolved);
+                        resolved
+                    }
+                };
+                if let Some(parent) = parent
                     && let Some(dir) = self.dir_state_mut(parent)
                 {
                     dir.child_state = dir.child_state.next();
@@ -835,7 +864,15 @@ impl Coordinator {
                 other => other.path().parent().into_iter().collect(),
             };
             for owner_path in owner_paths {
-                if let Some(owner) = self.snapshot.get(&owner_path).map(|p| p.id) {
+                let owner = match parents.get(&owner_path) {
+                    Some(known) => *known,
+                    None => {
+                        let resolved = self.snapshot.get(&owner_path).map(|p| p.id);
+                        parents.insert(owner_path, resolved);
+                        resolved
+                    }
+                };
+                if let Some(owner) = owner {
                     let state = self.entry_state_mut(owner);
                     state.state_generation = state.state_generation.next();
                 }
@@ -852,6 +889,7 @@ impl Coordinator {
 
     fn rebind_child_domain(
         &mut self,
+        builder: &mut SnapshotBuilder,
         effects: &mut Effects,
         child: EntryId,
         path: &RelativePath,
@@ -864,15 +902,16 @@ impl Coordinator {
         let unchanged = self
             .dir_state(child)
             .and_then(|d| d.domain.as_ref())
-            .map(|binding| binding.probe.identity == probe.identity)
+            .map(|binding| binding.probe == *probe)
             .unwrap_or(false);
         if unchanged {
             return;
         }
+        effects.removed.extend(builder.set_child_case(child, probe.case()));
         let binding = self.bind_domain(probe);
         let id = binding.id;
         effects.domains.push((child, binding));
-        if crossed(Some(parent), probe).is_proven() {
+        if requires_crossing_decision(Some(parent), probe) {
             let mode = self.crossing_mode(child, path, &probe.capabilities);
             let parent_domain = self.bind_domain(parent).id;
             effects.crossings.push((
@@ -907,12 +946,13 @@ impl Coordinator {
         self.domain_resolutions += 1;
         let parent_probe = self.parent_domain_probe(id);
         let parent_domain = self.parent_of(id).and_then(|parent| self.domain_of(parent));
-        let proven = crossed(parent_probe.as_ref(), &probe).is_proven();
+        let proven = requires_crossing_decision(parent_probe.as_ref(), &probe);
         let binding = self.bind_domain(&probe);
         let child = binding.id;
         let override_load = self.dir_state(id).and_then(|d| d.override_load);
         let mut builder = self.snapshot.builder();
         let mut effects = Effects::default();
+        effects.removed.extend(builder.set_child_case(id, probe.case()));
         effects.domains.push((id, binding));
         if proven && entry.is_directory() {
             let mode = if override_load == Some(true) {
@@ -955,14 +995,13 @@ impl Coordinator {
         self.entries.clear_retry(id);
         self.entries.set_degraded(id, None);
         self.entries.set_metadata_degraded(id, None);
-        if let Some(state) = self.entries.get_mut(id)
-            && let Some(dir) = state.dir_mut()
-            && let WatchState::Registered(watch) = dir.watch
-            && self.caps.watcher.is_per_directory()
+        if let Some(WatchState::Registered(watch)) = self.dir_state(id).map(|dir| dir.watch())
+            && self.watcher_of(id).scope == crate::domain::WatcherScope::PerDirectory
         {
             self.outputs.push(Output::Unwatch(watch));
             self.watches.retain(|w| *w != watch);
-            dir.watch = WatchState::NotRegistered;
+            let domain = self.domain_of(id);
+            self.entries.set_watch(id, WatchState::NotRegistered, domain);
         }
     }
 
@@ -977,10 +1016,11 @@ impl Coordinator {
         self.pending.remove(&id);
         self.pending_enrichment.remove(&id);
         self.pending_domain.remove(&id);
+        let per_directory = self.watcher_of(id).scope == crate::domain::WatcherScope::PerDirectory;
         if let Some(state) = self.entries.remove(id)
             && let Some(dir) = state.dir()
-            && let WatchState::Registered(watch) = dir.watch
-            && self.caps.watcher.is_per_directory()
+            && let WatchState::Registered(watch) = dir.watch()
+            && per_directory
         {
             self.outputs.push(Output::Unwatch(watch));
             self.watches.retain(|w| *w != watch);

@@ -20,9 +20,44 @@ pub struct Snapshot {
 struct Inner {
     version: SnapshotVersion,
     case: CaseSensitivity,
+    child_case: HashMap<EntryId, CaseSensitivity>,
     by_path: OrdMap<PathKey, Arc<Entry>>,
     by_id: HashMap<EntryId, PathKey>,
     children: HashMap<EntryId, OrdMap<PathKey, EntryId>>,
+}
+
+fn survivor(candidate: &Arc<Entry>, kept: &Arc<Entry>) -> EntryId {
+    let empty = OsStr::new("");
+    let candidate_key = crate::entry::collision_key(
+        candidate.path.file_name().unwrap_or(empty),
+        candidate.kind(),
+        &candidate.metadata,
+        candidate.identity,
+    );
+    let kept_key =
+        crate::entry::collision_key(kept.path.file_name().unwrap_or(empty), kept.kind(), &kept.metadata, kept.identity);
+    if candidate_key < kept_key { candidate.id } else { kept.id }
+}
+
+fn fold(
+    path: &RelativePath,
+    default: CaseSensitivity,
+    by_path: &OrdMap<PathKey, Arc<Entry>>,
+    child_case: &HashMap<EntryId, CaseSensitivity>,
+) -> (PathKey, CaseSensitivity) {
+    let mut key = PathKey::root();
+    let mut case = default;
+    let declared = |key: &PathKey| by_path.get(key).and_then(|entry| child_case.get(&entry.id)).copied();
+    if let Some(root) = declared(&key) {
+        case = root;
+    }
+    for name in path.components() {
+        key = key.descend(name, case);
+        if let Some(next) = declared(&key) {
+            case = next;
+        }
+    }
+    (key, case)
 }
 
 impl Snapshot {
@@ -31,6 +66,7 @@ impl Snapshot {
             inner: Arc::new(Inner {
                 version,
                 case,
+                child_case: HashMap::new(),
                 by_path: OrdMap::new(),
                 by_id: HashMap::new(),
                 children: HashMap::new(),
@@ -55,7 +91,15 @@ impl Snapshot {
     }
 
     pub fn key(&self, path: &RelativePath) -> PathKey {
-        path.key(self.inner.case)
+        self.fold(path).0
+    }
+
+    pub fn child_case(&self, path: &RelativePath) -> CaseSensitivity {
+        self.fold(path).1
+    }
+
+    fn fold(&self, path: &RelativePath) -> (PathKey, CaseSensitivity) {
+        fold(path, self.inner.case, &self.inner.by_path, &self.inner.child_case)
     }
 
     pub fn root(&self) -> Option<&Entry> {
@@ -93,7 +137,8 @@ impl Snapshot {
 
     pub fn child_by_name(&self, id: EntryId, name: &OsStr) -> Option<&Entry> {
         let parent = self.get_by_id(id)?;
-        let key = self.key(&parent.path).child(name, self.inner.case).ok()?;
+        let (parent_key, case) = self.fold(&parent.path);
+        let key = parent_key.child(name, case).ok()?;
         let child_id = self.inner.children.get(&id)?.get(&key)?;
         self.get_by_id(*child_id)
     }
@@ -122,6 +167,8 @@ impl Snapshot {
     pub fn builder(&self) -> SnapshotBuilder {
         SnapshotBuilder {
             case: self.inner.case,
+            folds: 0,
+            child_case: self.inner.child_case.clone(),
             by_path: self.inner.by_path.clone(),
             by_id: self.inner.by_id.clone(),
             children: self.inner.children.clone(),
@@ -138,6 +185,8 @@ impl fmt::Debug for Snapshot {
 
 pub struct SnapshotBuilder {
     case: CaseSensitivity,
+    folds: usize,
+    child_case: HashMap<EntryId, CaseSensitivity>,
     by_path: OrdMap<PathKey, Arc<Entry>>,
     by_id: HashMap<EntryId, PathKey>,
     children: HashMap<EntryId, OrdMap<PathKey, EntryId>>,
@@ -153,6 +202,110 @@ pub enum BuildError {
 }
 
 impl SnapshotBuilder {
+    fn fold(&mut self, path: &RelativePath) -> (PathKey, CaseSensitivity) {
+        self.folds += 1;
+        fold(path, self.case, &self.by_path, &self.child_case)
+    }
+
+    pub fn folds(&self) -> usize {
+        self.folds
+    }
+
+    pub fn key(&mut self, path: &RelativePath) -> PathKey {
+        self.fold(path).0
+    }
+
+    pub fn directory_key(&mut self, id: EntryId) -> Option<(PathKey, CaseSensitivity)> {
+        let path = self.get(id)?.path.clone();
+        Some(self.fold(&path))
+    }
+
+    pub fn child_case(&mut self, id: EntryId) -> CaseSensitivity {
+        match self.get(id).map(|entry| entry.path.clone()) {
+            Some(path) => self.fold(&path).1,
+            None => self.case,
+        }
+    }
+
+    pub fn set_child_case(&mut self, id: EntryId, case: Option<CaseSensitivity>) -> Vec<Arc<Entry>> {
+        let Some(path) = self.get(id).map(|entry| entry.path.clone()) else {
+            return Vec::new();
+        };
+        let before = self.fold(&path).1;
+        match case {
+            Some(case) => self.child_case.insert(id, case),
+            None => self.child_case.remove(&id),
+        };
+        if self.fold(&path).1 == before {
+            return Vec::new();
+        }
+        self.rekey_subtree(id)
+    }
+
+    fn rekey_subtree(&mut self, root: EntryId) -> Vec<Arc<Entry>> {
+        let mut order: Vec<EntryId> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(current) = stack.pop() {
+            let kids = self.child_ids(current);
+            self.children.remove(&current);
+            order.extend(kids.iter().copied());
+            stack.extend(kids);
+        }
+        for id in &order {
+            self.remember(*id);
+        }
+        let mut moved: Vec<Arc<Entry>> = Vec::new();
+        for id in &order {
+            if let Some(key) = self.by_id.remove(id)
+                && let Some(entry) = self.by_path.remove(&key)
+            {
+                moved.push(entry);
+            }
+        }
+        let mut collided: Vec<RelativePath> = Vec::new();
+        let mut dropped: Vec<Arc<Entry>> = Vec::new();
+        for entry in moved {
+            if collided.iter().any(|prefix| entry.path.starts_with(prefix)) {
+                self.child_case.remove(&entry.id);
+                dropped.push(entry);
+                continue;
+            }
+            let key = self.fold(&entry.path).0;
+            if let Some(incumbent) = self.by_path.get(&key).cloned() {
+                if survivor(&entry, &incumbent) != entry.id {
+                    collided.push(entry.path.clone());
+                    self.child_case.remove(&entry.id);
+                    dropped.push(entry);
+                    continue;
+                }
+                self.evict(&key, &incumbent);
+                collided.push(incumbent.path.clone());
+                dropped.push(incumbent);
+            }
+            self.by_id.insert(entry.id, key.clone());
+            self.by_path.insert(key.clone(), entry.clone());
+            if let Some(parent_key) = key.parent()
+                && let Some(parent) = self.by_path.get(&parent_key).map(|p| p.id)
+            {
+                self.children.entry(parent).or_default().insert(key, entry.id);
+            }
+        }
+        dropped
+    }
+
+    fn evict(&mut self, key: &PathKey, entry: &Arc<Entry>) {
+        self.by_id.remove(&entry.id);
+        self.by_path.remove(key);
+        self.children.remove(&entry.id);
+        self.child_case.remove(&entry.id);
+        if let Some(parent_key) = key.parent()
+            && let Some(parent) = self.by_path.get(&parent_key).map(|p| p.id)
+            && let Some(siblings) = self.children.get_mut(&parent)
+        {
+            siblings.remove(key);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.by_path.len()
     }
@@ -166,8 +319,9 @@ impl SnapshotBuilder {
         self.by_path.get(key).map(|e| e.as_ref())
     }
 
-    pub fn get_path(&self, path: &RelativePath) -> Option<&Entry> {
-        self.by_path.get(&path.key(self.case)).map(|e| e.as_ref())
+    pub fn get_path(&mut self, path: &RelativePath) -> Option<&Entry> {
+        let key = self.key(path);
+        self.by_path.get(&key).map(|e| e.as_ref())
     }
 
     pub fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
@@ -189,7 +343,11 @@ impl SnapshotBuilder {
     }
 
     pub fn insert(&mut self, entry: Entry) -> Result<(), BuildError> {
-        let key = entry.path.key(self.case);
+        let key = self.key(&entry.path);
+        self.insert_at(key, entry)
+    }
+
+    pub fn insert_at(&mut self, key: PathKey, entry: Entry) -> Result<(), BuildError> {
         if self.by_path.contains_key(&key) {
             return Err(BuildError::DuplicatePath(entry.path.clone()));
         }
@@ -232,6 +390,7 @@ impl SnapshotBuilder {
                 stack.extend(children.values().copied());
             }
             self.remember(current);
+            self.child_case.remove(&current);
             if let Some(key) = self.by_id.remove(&current)
                 && let Some(entry) = self.by_path.remove(&key)
             {
@@ -249,7 +408,7 @@ impl SnapshotBuilder {
 
     pub fn rename_subtree(&mut self, id: EntryId, new_path: RelativePath) -> Result<Vec<EntryId>, BuildError> {
         let old_key = self.by_id.get(&id).cloned().ok_or(BuildError::UnknownEntry(id))?;
-        let new_key = new_path.key(self.case);
+        let new_key = self.key(&new_path);
         if new_key != old_key && self.by_path.contains_key(&new_key) {
             return Err(BuildError::DuplicatePath(new_path));
         }
@@ -285,7 +444,7 @@ impl SnapshotBuilder {
         }
         for entry in collected {
             let rebased = entry.path.rebase(&old_path, &new_path).ok_or(BuildError::UnknownEntry(entry.id))?;
-            let key = rebased.key(self.case);
+            let key = self.key(&rebased);
             let mut updated = entry.as_ref().clone();
             updated.path = rebased;
             updated.generation = updated.generation.next();
@@ -309,31 +468,31 @@ impl SnapshotBuilder {
     }
 
     pub fn finish(self, version: SnapshotVersion) -> (Snapshot, Vec<PathChange>) {
-        let case = self.case;
+        let sort_key = |path: &RelativePath| fold(path, self.case, &self.by_path, &self.child_case).0;
         let mut changes: Vec<(SortKey, PathChange)> = Vec::new();
         for (id, before) in &self.before {
             let after = self.by_id.get(id).and_then(|k| self.by_path.get(k)).cloned();
             match (before, after) {
                 (None, None) => {}
                 (None, Some(after)) => {
-                    let key = after.path.key(case);
+                    let key = sort_key(&after.path);
                     changes.push((
                         SortKey::added(key, *id),
                         PathChange::Added { id: *id, path: after.path.clone(), kind: after.kind() },
                     ));
                 }
                 (Some(before), None) => {
-                    let key = before.path.key(case);
+                    let key = sort_key(&before.path);
                     changes.push((
                         SortKey::removed(key, *id),
                         PathChange::Removed { id: *id, path: before.path.clone(), kind: before.kind() },
                     ));
                 }
                 (Some(before), Some(after)) => {
-                    let new_key = after.path.key(case);
+                    let new_key = sort_key(&after.path);
                     if before.path != after.path {
                         changes.push((
-                            SortKey::renamed(before.path.key(case), new_key.clone(), *id),
+                            SortKey::renamed(sort_key(&before.path), new_key.clone(), *id),
                             PathChange::Renamed {
                                 id: *id,
                                 old_path: before.path.clone(),
@@ -375,7 +534,14 @@ impl SnapshotBuilder {
         }
         changes.sort_by(|a, b| a.0.cmp(&b.0));
         let snapshot = Snapshot {
-            inner: Arc::new(Inner { version, case, by_path: self.by_path, by_id: self.by_id, children: self.children }),
+            inner: Arc::new(Inner {
+                version,
+                case: self.case,
+                child_case: self.child_case,
+                by_path: self.by_path,
+                by_id: self.by_id,
+                children: self.children,
+            }),
         };
         (snapshot, changes.into_iter().map(|(_, c)| c).collect())
     }

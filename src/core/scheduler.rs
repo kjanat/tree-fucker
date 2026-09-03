@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::governor::{GrantId, Reservation};
 use super::types::*;
-use super::{Coordinator, JobSpec, ListingWork, Output, Work};
+use super::{Coordinator, JobSpec, ListingWork, Output, WatchDecision, WatchScope, Work};
 use crate::entry::{LoadState, Shape};
 use crate::fs::{CancellationToken, Lease};
 use crate::ids::*;
@@ -15,6 +15,7 @@ impl Coordinator {
             return;
         }
         let periodic = self.baseline_due;
+        self.retry_capped_watches();
         self.materialize_retries();
         self.materialize_enrichment();
         self.materialize_domain_requests();
@@ -63,14 +64,26 @@ impl Coordinator {
 
     fn try_grant(&mut self, entry: Option<EntryId>, need: ReadNeed, path: &RelativePathOwned) -> Option<JobGrant> {
         let id = self.next_job_id;
-        let registration = entry.map(|e| self.needs_registration(e, need)).unwrap_or(false);
+        let decision = match entry {
+            Some(entry) => self.registration_decision(entry, need),
+            None => WatchDecision::NotNeeded,
+        };
+        let registration = match (decision, entry) {
+            (WatchDecision::Register(scope), _) => Some(scope),
+            (WatchDecision::Capped, Some(entry)) => {
+                let domain = self.domain_of(entry);
+                self.entries.set_watch(entry, WatchState::Capped, domain);
+                None
+            }
+            (WatchDecision::Capped, None) | (WatchDecision::NotNeeded, _) => None,
+        };
         let domain = entry.and_then(|e| self.domain_of(e));
         let now = self.now;
         let reservation = Reservation {
             id: GrantId::Job(id),
             path: path.clone(),
             reads: 1,
-            registrations: u32::from(registration),
+            registrations: u32::from(registration.is_some()),
             lease: 0,
             domain,
         };
@@ -223,14 +236,14 @@ impl Coordinator {
     }
 
     fn materialize_priority(&mut self) {
-        if self.priority.keys.is_empty() {
+        if self.priority.paths.is_empty() {
             return;
         }
-        let loaded: Vec<(crate::path::PathKey, EntryId)> = self
+        let loaded: Vec<EntryId> = self
             .priority
-            .keys
+            .paths
             .iter()
-            .filter_map(|key| self.snapshot.get_key(key).filter(|e| e.is_loaded()).map(|e| (key.clone(), e.id)))
+            .filter_map(|path| self.snapshot.get(path).filter(|e| e.is_loaded()).map(|e| e.id))
             .collect();
         if loaded.is_empty() {
             return;
@@ -238,7 +251,7 @@ impl Coordinator {
         let start = self.priority.cursor % loaded.len();
         let take = self.config.batch_size.min(loaded.len());
         for offset in 0..take {
-            let (_, id) = &loaded[(start + offset) % loaded.len()];
+            let id = &loaded[(start + offset) % loaded.len()];
             if self.active_by_entry.contains_key(id) {
                 continue;
             }
@@ -544,14 +557,16 @@ impl Coordinator {
             Some(entry_id) => JobTarget::Entry { id: entry_id, guards: self.capture_guards(entry_id, request.need) },
             None => JobTarget::RootProbe { expected_unavailable: self.root.incarnation() },
         };
-        let phase = if grant.registration {
-            let req = self.next_watch_request();
-            self.registrations.insert(req, RegistrationTarget::Job(id));
-            let recursive = !self.caps.watcher.is_per_directory();
-            self.outputs.push(Output::RegisterWatch { request: req, path: request.path.clone(), recursive });
-            JobPhase::Registering(req)
-        } else {
-            JobPhase::Queued
+        let phase = match (grant.registration, entry) {
+            (Some(scope), Some(entry_id)) => {
+                let req = self.next_watch_request();
+                self.registrations.insert(req, RegistrationTarget::Job(id));
+                let recursive = scope.is_recursive();
+                self.hold_watch_path(entry_id);
+                self.outputs.push(Output::RegisterWatch { request: req, path: request.path.clone(), recursive });
+                JobPhase::Registering(req)
+            }
+            (Some(_), None) | (None, _) => JobPhase::Queued,
         };
         let job = ActiveJob {
             id,
@@ -599,27 +614,14 @@ impl Coordinator {
         }
     }
 
-    fn needs_registration(&self, entry: EntryId, need: ReadNeed) -> bool {
-        if need != ReadNeed::Listing || !self.caps.watcher.is_present() {
-            return false;
+    fn registration_decision(&self, entry: EntryId, need: ReadNeed) -> WatchDecision {
+        if need != ReadNeed::Listing {
+            return WatchDecision::NotNeeded;
         }
-        let Some(e) = self.snapshot.get_by_id(entry) else {
-            return false;
-        };
-        if e.shape != Shape::Directory(LoadState::Loading) {
-            return false;
+        if self.snapshot.get_by_id(entry).map(|e| e.shape) != Some(Shape::Directory(LoadState::Loading)) {
+            return WatchDecision::NotNeeded;
         }
-        let is_root = e.path.is_root();
-        if !self.caps.watcher.is_per_directory() && !is_root {
-            return false;
-        }
-        match self.dir_state(entry).map(|d| d.watch) {
-            Some(WatchState::NotRegistered) => true,
-            Some(WatchState::Failed) => {
-                self.config.watch_registration_failure == crate::config::WatchRegistrationFailure::RequireWatcher
-            }
-            _ => false,
-        }
+        self.watch_decision(entry)
     }
 
     pub(super) fn capture_guards(&self, entry: EntryId, need: ReadNeed) -> Guards {
@@ -763,7 +765,7 @@ type RelativePathOwned = crate::path::RelativePath;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct JobGrant {
     pub id: JobId,
-    pub registration: bool,
+    pub registration: Option<WatchScope>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

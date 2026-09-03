@@ -1,6 +1,6 @@
 use super::governor::GrantId;
 use super::types::*;
-use super::{Coordinator, Output};
+use super::{Coordinator, Output, WatchDecision};
 use crate::entry::{LoadState, Shape};
 use crate::fs::{HintKind, WatcherEvent};
 use crate::path::RelativePath;
@@ -19,14 +19,47 @@ impl Coordinator {
                 self.dropped_hints += count;
                 self.coverage_invalidate();
             }
-            WatcherEvent::Failed { message } => {
-                self.watcher_health = WatcherHealth::Degraded { backend: self.caps.watcher, reason: message.clone() };
-                self.push_error(RelativePath::root(), Operation::Watcher, ErrorCause::WatcherLost(message));
-                self.unwatch_all();
-                self.coverage_invalidate();
-                let delay = self.backoff(self.watcher_restart_attempts);
-                self.watcher_restart_due = Some(self.now + delay);
+            WatcherEvent::Failed { message, path } => self.on_watcher_failed(message, path),
+        }
+    }
+
+    fn on_watcher_failed(&mut self, message: String, path: Option<RelativePath>) {
+        let scope = path.as_ref().and_then(|path| self.snapshot.get(path)).map(|entry| entry.id);
+        let reported = path.unwrap_or_else(RelativePath::root);
+        match scope {
+            Some(entry) => {
+                self.degrade_domain_watcher(entry, message.clone());
+                self.unwatch_domain(entry);
             }
+            None => {
+                self.watcher_health = WatcherHealth::Degraded { backend: self.caps.watcher, reason: message.clone() };
+                let domains: Vec<crate::domain::StorageDomainId> = self.domain_records.keys().copied().collect();
+                for domain in domains {
+                    self.watcher_degraded.insert(domain, message.clone());
+                }
+                self.unwatch_all();
+            }
+        }
+        self.push_error(reported, Operation::Watcher, ErrorCause::WatcherLost(message));
+        self.coverage_invalidate();
+        let delay = self.backoff(self.watcher_restart_attempts);
+        self.watcher_restart_due = Some(self.now + delay);
+    }
+
+    fn unwatch_domain(&mut self, entry: crate::ids::EntryId) {
+        let Some(domain) = self.domain_of(entry) else {
+            return;
+        };
+        let held: Vec<crate::ids::EntryId> =
+            self.entries.watched_ids().filter(|id| self.domain_of(*id) == Some(domain)).collect();
+        for id in held {
+            let Some(WatchState::Registered(watch)) = self.dir_state(id).map(|d| d.watch()) else {
+                continue;
+            };
+            self.outputs.push(Output::Unwatch(watch));
+            self.watches.retain(|held| *held != watch);
+            let domain = self.domain_of(id);
+            self.entries.set_watch(id, WatchState::NotRegistered, domain);
         }
     }
 
@@ -84,39 +117,58 @@ impl Coordinator {
     }
 
     pub(super) fn restart_watcher(&mut self) {
-        let RootState::Available { id: root_id, .. } = self.root else {
+        let RootState::Available { .. } = self.root else {
             return;
         };
-        let targets: Vec<(crate::ids::EntryId, RelativePath, bool)> = if self.caps.watcher.is_per_directory() {
-            self.snapshot
-                .loaded_directories()
-                .filter(|e| !matches!(self.dir_state(e.id).map(|d| d.watch), Some(WatchState::Registered(_))))
-                .map(|e| (e.id, e.path.clone(), false))
-                .collect()
-        } else {
-            vec![(root_id, RelativePath::root(), true)]
-        };
-        let mut deferred = false;
-        for (id, path, recursive) in targets {
-            let request = self.next_watch_request();
-            let now = self.now;
-            let reservation = super::governor::Reservation {
-                id: GrantId::WatchRegistration(request),
-                path: path.clone(),
-                reads: 0,
-                registrations: 1,
-                lease: 0,
-                domain: self.domain_of(id),
-            };
-            if self.governor.try_admit(reservation, now).is_err() {
-                deferred = true;
-                break;
-            }
-            self.registrations.insert(request, RegistrationTarget::Standalone(id));
-            self.outputs.push(Output::RegisterWatch { request, path, recursive });
-        }
-        if deferred {
+        let candidates: Vec<crate::ids::EntryId> = self.snapshot.loaded_directories().map(|e| e.id).collect();
+        if self.register_watches(candidates) {
             self.watcher_restart_due = Some(self.now + self.config.minimum_period);
         }
+    }
+
+    pub(super) fn retry_capped_watches(&mut self) {
+        let RootState::Available { .. } = self.root else {
+            return;
+        };
+        if !self.entries.any_capped() || !self.tree_watch_capacity() {
+            return;
+        }
+        let candidates: Vec<crate::ids::EntryId> = self.entries.capped_ids().take(self.config.batch_size).collect();
+        self.register_watches(candidates);
+    }
+
+    fn register_watches(&mut self, candidates: Vec<crate::ids::EntryId>) -> bool {
+        for id in candidates {
+            let Some(path) = self.snapshot.get_by_id(id).map(|e| e.path.clone()) else {
+                continue;
+            };
+            match self.watch_decision(id) {
+                WatchDecision::NotNeeded => continue,
+                WatchDecision::Capped => {
+                    let domain = self.domain_of(id);
+                    self.entries.set_watch(id, WatchState::Capped, domain);
+                    continue;
+                }
+                WatchDecision::Register(scope) => {
+                    let request = self.next_watch_request();
+                    let now = self.now;
+                    let reservation = super::governor::Reservation {
+                        id: GrantId::WatchRegistration(request),
+                        path: path.clone(),
+                        reads: 0,
+                        registrations: 1,
+                        lease: 0,
+                        domain: self.domain_of(id),
+                    };
+                    if self.governor.try_admit(reservation, now).is_err() {
+                        return true;
+                    }
+                    self.hold_watch_path(id);
+                    self.registrations.insert(request, RegistrationTarget::Standalone(id));
+                    self.outputs.push(Output::RegisterWatch { request, path, recursive: scope.is_recursive() });
+                }
+            }
+        }
+        false
     }
 }
