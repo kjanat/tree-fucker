@@ -145,11 +145,13 @@ Abstract
       crossing policy, accounting, concurrency, and watcher capabilities
       apply. A domain records, separately and where the platform exposes
       them, the underlying filesystem instance that supplies its
-      semantics and identity space, and its transport. Two mounts of one
-      filesystem instance are two domains for policy and accounting that
-      share one identity space. Neither st_dev nor a mount identifier
-      alone is a domain key on every platform. A tree can span several
-      domains.
+      semantics, the identity space within which file identities are
+      comparable, and its transport. Two mounts of one identity space
+      are two domains for policy and accounting that share that identity
+      space. A filesystem instance can contain several identity spaces:
+      each Btrfs subvolume is an independent inode namespace [BTRFS].
+      Neither st_dev nor a mount identifier alone is a domain key on
+      every platform. A tree can span several domains.
 
    Domain crossing
       The point at which traversal enters a directory that belongs to a
@@ -441,9 +443,13 @@ Abstract
    EntryId values are scoped to one tree instance and MUST NOT be reused
    during that instance's lifetime.
 
-   Identity comparisons are meaningful only between entries that share
-   an identity space, which is the underlying filesystem instance of
-   their storage domain. A device-and-inode pair, a file identifier, or
+   Identity comparisons are meaningful only between entries whose
+   storage domains declare the same identity space. An identity space is
+   at most one filesystem instance and can be smaller: each Btrfs
+   subvolume is an independent inode namespace, so two subvolumes of one
+   Btrfs filesystem are two identity spaces even though a bind mount and
+   its origin within one subvolume share one [BTRFS]. A
+   device-and-inode pair, a file identifier, or
    any other identity establishes a rename only where the domain
    declares stable identity; that declaration is a capability, never an
    assumption, and remote, userspace, overlay, and virtual filesystems
@@ -670,10 +676,12 @@ Abstract
       }
 
    Every Tree opened in one process shares one host governor (Section
-   15.9). `open` accepts the shared governor and uses the process-wide
-   default when none is supplied. A consumer that opens many trees
-   therefore multiplies nothing; the physical ceilings and the global
-   accounting are one per process.
+   15.9). `open` uses the process-wide governor. An API that opens a tree
+   under an independently constructed governor MUST be named as an
+   opt-out from the process-wide guarantee, and a tree opened that way is
+   outside the bound that Section 15.9 states for the process. A consumer
+   that opens trees through `open` multiplies nothing; the physical
+   ceilings and the global accounting are one per process.
 
    A command is accepted only after the coordinator assigns it a causal
    barrier. If command capacity is exhausted, the command fails before
@@ -769,12 +777,11 @@ Abstract
 
    Other terminal conditions have these command effects:
 
-      configured entry limit exceeded
-         the command fails with LimitExceeded;
-
-      resource ceiling reached by a required read, or the command's
-      worker-time ceiling reached with a required read outstanding
-         the command fails with ResourceLimited;
+      a configured resource limit reached by a required read, including
+      entries per directory, represented entries, listing or snapshot
+      bytes, or the command's worker-time ceiling with a required read
+      outstanding
+         the command fails with ResourceLimited naming the resource;
 
       worker for a required read declared stuck
          the command fails with Stuck;
@@ -895,11 +902,32 @@ Abstract
 
 9.2.  Configuration Defaults
 
-   A conforming implementation provides these defaults:
+   Configuration is owned at two levels. The host governor configuration
+   is one per process and holds every physical ceiling and every global
+   budget. A tree configuration holds representation limits, policy, and
+   per-tree behaviour, and MAY impose a subordinate limit that is tighter
+   than the host's. A tree MUST NOT raise a host limit, and opening
+   another tree changes no host limit.
 
-      batch size                         64
+   A conforming implementation provides these host governor defaults:
+
       maximum in-flight jobs             8
       per-domain concurrency ceiling     4
+      background duty, per domain        1 percent of one worker
+      background duty, global            2 percent of one worker
+      background burst, per domain       0.25 worker-seconds
+      background burst, global           0.5 worker-seconds
+      foreground duty                    25 percent of one worker
+      foreground burst                   2 worker-seconds
+      bootstrap allowance                0.5 worker-seconds
+      aggregate accounted-memory ceiling 512 MiB
+      in-flight listing byte ceiling     32 MiB
+      initial cost estimate              20 milliseconds
+      stuck worker threshold             30 seconds
+
+   and these tree defaults:
+
+      batch size                         64
       pending command capacity           1024
       paths per command limit            65536
       priority-set path limit            4096
@@ -908,16 +936,7 @@ Abstract
       entries per directory limit        250000
       represented entry limit            1000000
       snapshot byte ceiling              256 MiB
-      in-flight listing byte ceiling     32 MiB
-      background duty, per domain        1 percent of one worker
-      background duty, global            2 percent of one worker
-      background burst, per domain       0.25 worker-seconds
-      background burst, global           0.5 worker-seconds
-      foreground duty                    25 percent of one worker
-      foreground burst                   2 worker-seconds
       foreground ceiling per command     30 worker-seconds
-      initial cost estimate              20 milliseconds
-      stuck worker threshold             30 seconds
       metadata fields                    none
       domain crossing                    LoadOnDemand
       transient degrade threshold        3 consecutive failures
@@ -928,7 +947,9 @@ Abstract
    Duty rates are expressed in worker-seconds per wall-second (Section
    15.2). One percent of one worker means the tree occupies a blocking
    worker slot for at most ten milliseconds per second on average, plus
-   the configured burst.
+   the configured burst. A tree's snapshot byte ceiling counts toward the
+   host's aggregate accounted-memory ceiling; the tighter of the two
+   binds.
 
    All numeric limits and listed modes are configurable. Reducing a limit
    below current use fails without changing active state. Reaching an
@@ -1073,6 +1094,14 @@ Abstract
    cannot perform an unbounded number of operations before the governor
    can react.
 
+   A session waiting for a subsequent lease MUST NOT occupy a physical
+   filesystem-worker slot. It MAY retain bounded continuation state, an
+   open directory handle or iterator, and its partial buffer, but
+   yielding a lease returns physical execution capacity to the host
+   governor, and continuation resumes only after both a new lease and a
+   physical slot are granted. A throttled session therefore costs memory
+   and a handle, never a worker.
+
    The worst-case latency of cooperative cancellation is one chunk of
    enumeration plus one blocked filesystem call. The second term has no
    bound.
@@ -1113,6 +1142,9 @@ Abstract
       where the platform carries a per-directory attribute;
       timestamp granularity, declared per domain because no platform
       reports it;
+      identity space: the namespace within which this domain's
+      identities are comparable, shared by every domain that maps the
+      same namespace and by nothing else;
       identity reliability: none, advisory, or stable;
       kind source: whether enumeration reports kinds always, sometimes,
       or never;
@@ -1697,9 +1729,9 @@ Abstract
    PermissionDenied, Transient, or Unsupported.
 
    Retryable work outcomes are Transient, PermissionDenied, Unsupported,
-   WatcherRegistrationFailed, and the core-generated LimitExceeded,
-   ResourceLimited, and Stuck. NotFound and NotDirectory are structural
-   outcomes governed by Section 13.2. Fatal terminates the tree.
+   WatcherRegistrationFailed, and the core-generated ResourceLimited and
+   Stuck. NotFound and NotDirectory are structural outcomes governed by
+   Section 13.2. Fatal terminates the tree.
 
    Every retry is admitted through the resource governor. A failed or
    cancelled attempt is charged its measured cost, plus a configured
@@ -1731,30 +1763,28 @@ Abstract
    represented metadata target or Loading directory that has no baseline
    opportunity retries with backoff through the retry class.
 
-   LimitExceeded retains the previous snapshot and current Loaded or
-   Loading state, publishes degraded path health immediately, and makes the
-   current command fail and any designated obligation Unsatisfied. It
-   retains one coalesced listing retry. A Loaded target can retry through
-   later baseline work; a Loading target retries with backoff. A relevant
-   watcher hint, explicit refresh, or configured limit increase expedites
-   that retry.
-
-   ResourceLimited is reported when a listing session stops at the
-   configured entry or result-size ceiling, when accounted memory would
-   exceed its ceiling on commit, or when a command's reads have reached
-   the command's worker-time ceiling while a required read remains. It
-   retains the previous snapshot and the current load state, publishes
-   degraded path health with a resource-limit cause, fails the current
-   command, and makes any designated obligation Unsatisfied. It retains
-   one coalesced listing retry, admitted only when the governor grants
-   it. ResourceLimited names a resource ceiling. LimitExceeded names a
-   representation limit. Neither truncates.
+   ResourceLimited is one structured outcome that names the resource it
+   hit: entries per directory, represented entries, listing bytes,
+   snapshot bytes, in-flight bytes, or command worker time, together with
+   the configured limit. It is reported when a listing session stops at
+   the entry or result-size ceiling, when a commit would exceed the
+   represented-entry or a byte ceiling, or when a command's reads have
+   reached the command's worker-time ceiling while a required read
+   remains. It retains the previous snapshot and the current Loaded or
+   Loading state, publishes degraded path health with the resource as
+   its cause, fails the current command, and makes any designated
+   obligation Unsatisfied. It retains one coalesced listing retry,
+   admitted only when the governor grants it. A Loaded target can retry
+   through later baseline work; a Loading target retries with backoff. A
+   relevant watcher hint, explicit refresh, or configured limit increase
+   expedites that retry. ResourceLimited never truncates.
 
    A Stuck outcome is reported for a logical job whose worker exceeded
    the stuck threshold (Section 13.5). It completes an attached command
    with a Stuck error, makes a designated obligation Unsatisfied, and
-   retains one coalesced retry that is admitted only when the domain has
-   a free slot that is not held by a stuck worker.
+   retains one coalesced retry. That retry, and every other job for the
+   same storage domain, is admitted only after every stuck worker on the
+   domain has returned: one stuck worker quarantines the domain.
 
    Each represented read target retains at most one coalesced retry record.
    The record carries its required phase: Metadata, Listing, or
@@ -1894,12 +1924,15 @@ Abstract
       discarded if its job is gone, and only then is the slot released.
 
    The tree MUST report stuck workers with their paths, operations, and
-   start times. A domain whose window is entirely held by stuck workers
-   admits nothing until a call returns; other domains are unaffected
+   start times. One stuck worker quarantines its storage domain: while
+   any physical worker on a domain is stuck, the governor admits no new
+   work on that domain, retries included, and the domain's resource
+   state reports StuckWorker. The quarantine lifts when every stuck
+   worker on the domain has returned. Other domains are unaffected
    because closed-batch completion counts the logical outcome. A dead
-   mount therefore degrades one domain instead of exhausting the host's
-   blocking pool, and the number of blocked threads never exceeds the
-   configured physical ceilings.
+   mount therefore costs exactly the workers that were already inside
+   it when it died, never more, and degrades one domain instead of
+   exhausting the host's blocking pool.
 
 13.6.  Capacity Exhaustion
 
@@ -1935,14 +1968,14 @@ Abstract
    them, the underlying filesystem instance that supplies its semantics
    and identity space, and its transport. Crossing policy, accounting,
    concurrency, and watcher capabilities operate on the mount instance.
-   Identity comparisons operate on the filesystem instance. Two mounts of
-   one filesystem instance, such as a bind mount and its origin, are two
-   domains that share one identity space; on Linux, Btrfs subvolumes are
-   distinct `st_dev` values within one filesystem instance, and bind
-   mounts are distinct mounts sharing one `st_dev` [STATMOUNT]. `st_dev`
-   is therefore neither a domain key nor a filesystem-instance key on
-   every platform, and an adapter MUST NOT use it as one where the
-   platform exposes a better identifier. A domain crossing is detected
+   Identity comparisons operate on the identity space. A bind mount and
+   its origin are two domains that share one identity space. Two Btrfs
+   subvolumes are two identity spaces within one filesystem instance,
+   each with its own `st_dev`, while bind mounts are distinct mounts
+   sharing one `st_dev` [BTRFS] [STATMOUNT]. `st_dev` is therefore
+   neither a domain key nor a filesystem-instance key on every platform,
+   and an adapter MUST NOT use it as one where the platform exposes a
+   better identifier. A domain crossing is detected
    per mount, at the directory where traversal leaves the parent's
    domain, through the domain-resolution operation of Section 10.3
    before that directory is first listed.
@@ -2013,11 +2046,14 @@ Abstract
    value generated at format time that is not required to be unique, and
    documents only the pair of serial and 128-bit file identifier as
    identifying a file on one computer [FILE-ID-INFO] [MS-FSCC]. The
-   adapter therefore uses the serial as a crossing detector and as a
-   session-scoped domain key, uses the volume GUID path as the
-   reboot-stable identity only where the volume management call
-   succeeds, and reports that identity as Unknown on SMB shares and ReFS
-   volumes, where the call is documented as unsupported. Remoteness comes
+   adapter therefore uses a serial mismatch as a crossing detector and
+   treats serial equality as inconclusive. Domain identity comes from
+   positive evidence: the volume GUID path where the volume management
+   call succeeds, a protocol-native adapter's own identity, or another
+   platform identifier that names the volume. Without such evidence the
+   adapter keeps domains conservatively distinct and reports the identity
+   as Unknown, which is the case on SMB shares and ReFS volumes, where
+   the call is documented as unsupported. Remoteness comes
    from the remote-protocol information of the handle, not from the
    shape of the path. A junction within one volume is not a crossing.
    Case sensitivity on NTFS is a per-directory flag that the volume flag
@@ -2283,7 +2319,8 @@ Abstract
       Concurrency, the domain window is fully occupied;
       Memory, accounted memory is at the configured ceiling;
       ForegroundCeiling, the foreground allowance is exhausted; or
-      StuckWorker, a worker has exceeded the stuck threshold;
+      StuckWorker, a worker on the domain has exceeded the stuck
+      threshold and the domain is quarantined until it returns;
 
    together with the earliest time at which admission can resume, when
    that time is computable, and otherwise the state change that will
@@ -2349,15 +2386,23 @@ Abstract
    The governor is scoped to the host process. Every Tree instance
    opened in one process shares one host governor: one set of physical
    ceilings on in-flight workers and accounted memory, one global
-   background bucket, one global foreground bucket, and one accounting of
-   worker time per storage domain. Per-tree budgets MAY be configured
-   beneath the host governor, and per-domain buckets are shared by every
-   tree that reaches the same domain, so several trees rooted on one
-   network volume together consume that volume's allowance once.
+   background bucket, one global foreground bucket, one bootstrap
+   allowance, and one accounting of worker time per storage domain. The
+   host governor owns the limits listed as host defaults in Section 9.2.
+   Per-tree budgets MAY be configured beneath it and only tighten it.
+
+   Per-domain buckets are shared by every tree that reaches the same
+   domain. For that to hold, adapters MUST report the same domain
+   identity for the same mount to every tree in the process; a domain
+   whose identity is Unknown is accounted as its own domain per tree,
+   which is conservative because it splits the global envelope rather
+   than multiplying it.
 
    A consumer that opens many trees, such as an editor with many
    worktrees, therefore cannot multiply the envelope by opening more
-   trees. The envelope is per process.
+   trees. The envelope is per process. An API that opens a tree under an
+   independent governor is an explicit opt-out from this section and
+   MUST be named as one.
 
    Separate processes cannot be governed by this specification. A host
    that runs several processes using this library relies on operating
@@ -2541,8 +2586,9 @@ Abstract
       own version
       a domain crossing charges the child domain from its first listing
       one domain's debt never reduces another domain's admissible rate
-      a stuck worker keeps its slot and its domain stops admitting when
-      the window is full
+      a stuck worker keeps its slot and quarantines its domain until it
+      returns, so a dead domain never gains a second stuck worker
+      a session suspended between leases holds no worker slot
       a labelled domain that measures slow converges to a window of one
       throttling is reported in the resource health field and never as
       degradation
@@ -2729,6 +2775,9 @@ Abstract
 
 
 23.  Informative References
+
+   [BTRFS]  Btrfs contributors, "btrfs(5)", Btrfs documentation, section
+            "Subvolumes", <https://btrfs.readthedocs.io/en/latest/btrfs-man5.html>.
 
    [AIMD]  Chiu, D. and R. Jain, "Analysis of the Increase and Decrease
            Algorithms for Congestion Avoidance in Computer Networks",
