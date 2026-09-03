@@ -104,7 +104,7 @@ Abstract
       A complete listing result that was normalized, validated against
       every applicable publication guard, and applied to the current
       snapshot. A valid empty diff is accepted. A failed, cancelled, stale,
-      or discarded result is not accepted.
+      stuck, or discarded result is not accepted.
 
    Designated round attempt
       The one filesystem job assigned to satisfy a round obligation. A job
@@ -141,11 +141,15 @@ Abstract
       A tree whose relevant filesystem state is no longer changing.
 
    Storage domain
-      A region of the filesystem in which filesystem semantics, identity
-      stability, watcher behavior, and broad access topology are the
-      same. On a POSIX system a domain corresponds to one mounted
-      filesystem instance, identified by that instance rather than by
-      st_dev. A tree can span several domains.
+      A mount instance as traversal reaches it: the unit at which
+      crossing policy, accounting, concurrency, and watcher capabilities
+      apply. A domain records, separately and where the platform exposes
+      them, the underlying filesystem instance that supplies its
+      semantics and identity space, and its transport. Two mounts of one
+      filesystem instance are two domains for policy and accounting that
+      share one identity space. Neither st_dev nor a mount identifier
+      alone is a domain key on every platform. A tree can span several
+      domains.
 
    Domain crossing
       The point at which traversal enters a directory that belongs to a
@@ -257,8 +261,10 @@ Abstract
    other reasons does not extend the round. There is no wall-clock bound:
    filesystem calls can be arbitrarily slow or can fail to return. A
    call that never returns holds its worker slot as a stuck worker under
-   Section 13.5; the round then waits for the call to return, for the
-   obligation to be removed, or for the tree to terminate.
+   Section 13.5. Its logical job reaches a Stuck outcome at the stuck
+   threshold, which makes the designated obligation Unsatisfied, so the
+   round can still end; the physical slot stays held until the call
+   returns.
 
    A round MAY also remain open because the resource governor defers
    admission of its remaining obligations under Section 15. Deferral is
@@ -308,9 +314,12 @@ Abstract
    time.
 
    Resource throttling under Section 15 delays condition 3; it does not
-   negate it. Every configured duty rate is greater than zero, so every
-   denied job is eventually granted, and convergence follows at the pace
-   the budget permits.
+   negate it while physical workers make progress and the relevant hard
+   limits permit the operation. A job denied for lack of budget is
+   granted once its buckets refill and a slot is free. A job that a hard
+   limit forbids indefinitely, such as a listing above the entry ceiling
+   or a command past its worker-time ceiling, is reported as
+   ResourceLimited under Section 13.1 rather than deferred.
 
 5.3.  Watcher Independence
 
@@ -364,7 +373,7 @@ Abstract
 
    Reconciliation scheduler
       Maintains round obligations, cursors, retry work, request barriers,
-      and admission budgets for every directory-listing reason.
+      and class reservations for every directory-listing reason.
 
    Resource governor
       Accounts the filesystem cost of every job against per-domain and
@@ -432,10 +441,15 @@ Abstract
    EntryId values are scoped to one tree instance and MUST NOT be reused
    during that instance's lifetime.
 
-   Identity comparisons are meaningful only between entries of the same
-   storage domain. An identity supplied by a domain whose identity
-   reliability is advisory MAY be published as metadata but MUST NOT
-   establish a rename.
+   Identity comparisons are meaningful only between entries that share
+   an identity space, which is the underlying filesystem instance of
+   their storage domain. A device-and-inode pair, a file identifier, or
+   any other identity establishes a rename only where the domain
+   declares stable identity; that declaration is a capability, never an
+   assumption, and remote, userspace, overlay, and virtual filesystems
+   declare it only when the adapter knows it holds. An identity supplied
+   by a domain whose identity reliability is advisory MAY be published
+   as metadata but MUST NOT establish a rename.
 
    Implementations MAY retain an EntryId across a rename when identity is
    unambiguous. Consumers MUST tolerate a rename represented as removal
@@ -655,6 +669,12 @@ Abstract
           pub async fn shutdown(&self) -> Result<()>;
       }
 
+   Every Tree opened in one process shares one host governor (Section
+   15.9). `open` accepts the shared governor and uses the process-wide
+   default when none is supplied. A consumer that opens many trees
+   therefore multiplies nothing; the physical ceilings and the global
+   accounting are one per process.
+
    A command is accepted only after the coordinator assigns it a causal
    barrier. If command capacity is exhausted, the command fails before
    acceptance. Dropping a caller-side future does not cancel an accepted
@@ -725,11 +745,12 @@ Abstract
    with a shutdown error.
 
    For `refresh`, `load`, and `invalidate_policy`, a required read that
-   reaches Transient, PermissionDenied, Unsupported, or Fatal failure
-   completes the command with that error; background recovery follows
-   Section 13. A stale result is rescheduled and does not complete the
-   command. There is no wall-clock completion bound while the target keeps
-   changing.
+   reaches Transient, PermissionDenied, Unsupported, ResourceLimited,
+   Stuck, or Fatal failure completes the command with that error;
+   background recovery follows Section 13. A stale result is rescheduled
+   and does not complete the command. There is no wall-clock completion
+   bound while the target keeps changing or while the governor defers
+   the command's reads.
 
    Concurrent removal has these command effects:
 
@@ -750,6 +771,13 @@ Abstract
 
       configured entry limit exceeded
          the command fails with LimitExceeded;
+
+      resource ceiling reached by a required read, or the command's
+      worker-time ceiling reached with a required read outstanding
+         the command fails with ResourceLimited;
+
+      worker for a required read declared stuck
+         the command fails with Stuck;
 
       root NotFound or non-directory
          root lifecycle rules in Section 13.2 override this table;
@@ -980,14 +1008,35 @@ Abstract
    because a filesystem that never reports kinds would otherwise never
    converge.
 
+   For every storage domain the adapter declares, per item, whether the
+   enumeration primitive supplies it inline or whether obtaining it
+   requires an additional operation per child: the child's kind, its
+   identity, and each metadata field. On Unix the inode number is inline
+   in the directory entry, the kind is usually inline, and every metadata
+   field requires a per-child read. On Windows kind, timestamps, and size
+   are inline and identity requires a handle. The governor charges every
+   per-child operation the session performs. Identity acquisition MUST
+   NOT be modelled as metadata I/O where the platform supplies it inline.
+
    Configured metadata is obtained by enrichment: a separately requested
    read of the configured fields for observed children. Enrichment is
    requested only for fields the configuration enables and is charged to
    the same budgets as the listing. The default configuration enables no
    metadata fields. A consumer that needs modification times or sizes
-   enables them explicitly and accepts their cost. A baseline listing
-   MUST refresh every enabled field for the directory itself and for
-   each immediate child.
+   enables them explicitly and accepts their cost.
+
+   A Complete membership observation commits independently of
+   enrichment. Enrichment is separately admitted and separately
+   retryable work whose failure degrades the metadata of the affected
+   children; it MUST NOT prevent a structurally valid membership listing
+   from committing. Unknown-kind resolution remains part of the
+   membership observation, because kind decides whether traversal is
+   safe. A baseline round MUST refresh every enabled field for each
+   loaded directory and its immediate children; that refresh MAY be
+   performed by the listing session or by a separate enrichment job.
+   Round success under Section 5.1 is a membership property. A pending
+   or failed enrichment does not degrade the round; it is reported as a
+   metadata degradation of the affected path.
 
    Metadata equality never proves that directory contents are unchanged
    (Section 5.4). Disabling enrichment therefore removes cost, not
@@ -1000,8 +1049,7 @@ Abstract
    core and the configured entry ceiling. A session ends in exactly one
    of:
 
-      Complete, carrying every observed child, their resolved kinds, and
-      any requested enrichment;
+      Complete, carrying every observed child and their resolved kinds;
       Cancelled, when the token was set;
       ResourceLimited, when the entry ceiling or result-size ceiling was
       reached, carrying the count seen so far; or
@@ -1011,6 +1059,19 @@ Abstract
    than the entry ceiling plus one chunk before stopping. The core never
    observes a partial listing under any outcome, so the all-or-nothing
    rule of Section 7.3 holds by construction.
+
+   Admission of a session is not admission of unbounded work. A session
+   runs under a work lease that covers a bounded number of enumerated
+   entries and per-child operations. Before each chunk, and before each
+   batch of kind-resolution or enrichment reads, the session MUST hold
+   remaining lease; when it does not, it MUST yield and continue only
+   after the governor grants a further lease. A lease that is not granted
+   leaves the session suspended with its partial state held in its
+   bounded buffer, or ends it as Cancelled when the coordinator prefers
+   to release the buffer. Chunking therefore bounds filesystem pressure,
+   not only memory and cancellation latency: one underestimated listing
+   cannot perform an unbounded number of operations before the governor
+   can react.
 
    The worst-case latency of cooperative cancellation is one chunk of
    enumeration plus one blocked filesystem call. The second term has no
@@ -1023,8 +1084,21 @@ Abstract
 
    The adapter identifies the storage domain of every directory it lists
    and reports it with the session outcome, together with whether the
-   directory is a domain root. Capabilities are declared per storage
-   domain, never once per tree:
+   directory is a domain root. Because the crossing policy of Section
+   14.3 must be applied before a candidate directory is first listed,
+   and because directory enumeration on most platforms does not report
+   a child's mount, the abstraction also provides a governed domain
+   resolution operation for a directory that has not been listed.
+   Enumeration MAY report a child's domain inline where the platform
+   supplies it, in which case no separate resolution is needed.
+
+   Operations performed before a domain is known, including root
+   canonicalization, root validation, root probes, and domain resolution
+   itself, are charged to a bootstrap scope: a conservative allowance
+   under the global ceilings that is attributed to the resolved domain
+   once it is known.
+
+   Capabilities are declared per storage domain, never once per tree:
 
       filesystem semantics, such as ext4, Btrfs, XFS, ZFS, APFS, HFS+,
       NTFS, ReFS, exFAT, FAT, NFS, SMB, FUSE, tmpfs, overlay, or
@@ -1041,7 +1115,10 @@ Abstract
       reports it;
       identity reliability: none, advisory, or stable;
       kind source: whether enumeration reports kinds always, sometimes,
-      or never; and
+      or never;
+      identity source: inline from enumeration, per-child read, or none;
+      metadata source per field: inline from enumeration or per-child
+      read; and
       watcher capabilities under Section 10.4.
 
    Every field supports Unknown, and Unknown is the required value for
@@ -1225,8 +1302,8 @@ Abstract
    concurrency window of Section 15.5. The coordinator MAY keep
    accepting and coalescing inputs, but MUST NOT admit another
    snapshot-producing job until every batch member is Accepted, failed,
-   stale or discarded, or cancelled. Newly ready work joins the next
-   cycle.
+   stale or discarded, cancelled, or stuck. Newly ready work joins the
+   next cycle.
 
    Admission into a closed batch is the dispatch point for causal barriers
    and generation capture, even when a job waits for a worker. An admitted
@@ -1235,6 +1312,12 @@ Abstract
    performing I/O where the runtime can prevent the start; where it
    cannot, its cancellation token is set and its result is discarded on
    arrival.
+
+   A batch member whose worker is declared stuck under Section 13.5
+   reaches a Stuck terminal outcome as a logical job and leaves the
+   batch, so one dead storage domain cannot hold a closed batch open and
+   freeze unrelated domains. Its physical worker continues to hold its
+   slots and to accrue cost until its call returns.
 
    Every listing reason enters one of the weighted fair classes defined in
    Section 6. The scheduler divides capacity between:
@@ -1507,10 +1590,11 @@ Abstract
       Accepted outcome
          Set the designated obligation to Accepted.
 
-      Failed, stale, or cancelled outcome
+      Failed, stale, cancelled, or stuck outcome
          Set the designated obligation to Unsatisfied and retain separate
          retry work when the directory remains Loaded. Later jobs do not
-         alter this round's terminal outcome.
+         alter this round's terminal outcome. A late result from a stuck
+         worker is discarded.
 
       Load
          A directory entering Loading is scheduled immediately as control
@@ -1553,13 +1637,18 @@ Abstract
 
    Let `next_admissible` be the earliest monotonic time at which the
    governor can grant the next background job on any domain that has
-   pending baseline work. The periodic timer is due no earlier than:
+   pending baseline work, when such a time is computable. Bucket
+   depletion has a computable refill time. Concurrency exhaustion,
+   memory pressure, a per-command ceiling, and a stuck worker have no
+   computable resume time; for those the governor reports none and the
+   coordinator wakes on the state change that frees capacity. The
+   periodic timer is due no earlier than:
 
       max(now + minimum_period, next_admissible)
 
-   and, when capacity exists, no later than `now + maximum_period`. An
-   implementation MAY configure a fixed interval; the fixed interval is
-   still subject to `next_admissible`.
+   when `next_admissible` is known, and, when capacity exists, no later
+   than `now + maximum_period`. An implementation MAY configure a fixed
+   interval; the fixed interval is still subject to `next_admissible`.
 
    The defaults are:
 
@@ -1608,9 +1697,9 @@ Abstract
    PermissionDenied, Transient, or Unsupported.
 
    Retryable work outcomes are Transient, PermissionDenied, Unsupported,
-   WatcherRegistrationFailed, and the core-generated LimitExceeded and
-   ResourceLimited. NotFound and NotDirectory are structural outcomes
-   governed by Section 13.2. Fatal terminates the tree.
+   WatcherRegistrationFailed, and the core-generated LimitExceeded,
+   ResourceLimited, and Stuck. NotFound and NotDirectory are structural
+   outcomes governed by Section 13.2. Fatal terminates the tree.
 
    Every retry is admitted through the resource governor. A failed or
    cancelled attempt is charged its measured cost, plus a configured
@@ -1651,14 +1740,21 @@ Abstract
    that retry.
 
    ResourceLimited is reported when a listing session stops at the
-   configured entry or result-size ceiling, or when accounted memory
-   would exceed its ceiling on commit. It retains the previous snapshot
-   and the current load state, publishes degraded path health with a
-   resource-limit cause, fails the current command, and makes any
-   designated obligation Unsatisfied. It retains one coalesced listing
-   retry, admitted only when the governor grants it. ResourceLimited
-   names a resource ceiling. LimitExceeded names a representation limit.
-   Neither truncates.
+   configured entry or result-size ceiling, when accounted memory would
+   exceed its ceiling on commit, or when a command's reads have reached
+   the command's worker-time ceiling while a required read remains. It
+   retains the previous snapshot and the current load state, publishes
+   degraded path health with a resource-limit cause, fails the current
+   command, and makes any designated obligation Unsatisfied. It retains
+   one coalesced listing retry, admitted only when the governor grants
+   it. ResourceLimited names a resource ceiling. LimitExceeded names a
+   representation limit. Neither truncates.
+
+   A Stuck outcome is reported for a logical job whose worker exceeded
+   the stuck threshold (Section 13.5). It completes an attached command
+   with a Stuck error, makes a designated obligation Unsatisfied, and
+   retains one coalesced retry that is admitted only when the domain has
+   a free slot that is not held by a stuck worker.
 
    Each represented read target retains at most one coalesced retry record.
    The record carries its required phase: Metadata, Listing, or
@@ -1781,15 +1877,29 @@ Abstract
 
    A worker whose call has neither returned nor been reported lost is a
    stuck worker once its occupancy exceeds the configured stuck
-   threshold. A stuck worker MUST continue to occupy its concurrency slot
-   and to accrue worker time against its domain until its call returns.
-   Discarding its job or setting its cancellation token does not release
-   the slot. The tree MUST report stuck workers with their paths,
-   operations, and start times. The governor MUST stop admitting new
-   work to a domain whose stuck workers occupy its whole window, so a
-   dead mount degrades one domain instead of exhausting the host's
-   blocking pool. When a stuck call returns, its result is discarded if
-   its job is gone and its slot is released.
+   threshold. A logical job and the physical worker that runs it have
+   distinct lifetimes:
+
+      The logical job reaches a Stuck terminal outcome under Section
+      13.1. It leaves its closed batch, its designated obligation becomes
+      Unsatisfied, its attached commands complete with a Stuck error, and
+      its retry state is retained.
+
+      The physical worker continues to hold its domain slot, its global
+      in-flight slot, and its share of the physical ceilings, and
+      continues to accrue worker time against its domain, until its call
+      returns. Discarding the job, setting its cancellation token, or
+      declaring it stuck releases nothing physical. No replacement worker
+      is started for the same slot. When the call returns, its result is
+      discarded if its job is gone, and only then is the slot released.
+
+   The tree MUST report stuck workers with their paths, operations, and
+   start times. A domain whose window is entirely held by stuck workers
+   admits nothing until a call returns; other domains are unaffected
+   because closed-batch completion counts the logical outcome. A dead
+   mount therefore degrades one domain instead of exhausting the host's
+   blocking pool, and the number of blocked threads never exceeds the
+   configured physical ceilings.
 
 13.6.  Capacity Exhaustion
 
@@ -1820,12 +1930,22 @@ Abstract
 14.3.  Storage Domains and Mount Boundaries
 
    Every directory belongs to exactly one storage domain (Section 2). A
-   domain is identified by the adapter. On POSIX systems the identity is
-   the mounted filesystem instance, which is neither `st_dev` nor a mount
-   identifier alone: Btrfs subvolumes share one instance across distinct
-   `st_dev` values, and bind mounts share `st_dev` across distinct mounts
-   [STATMOUNT]. A domain crossing is detected per mount, at the directory
-   where traversal leaves the parent's domain.
+   domain is a mount instance as traversal reaches it and is identified
+   by the adapter. It records separately, where the platform exposes
+   them, the underlying filesystem instance that supplies its semantics
+   and identity space, and its transport. Crossing policy, accounting,
+   concurrency, and watcher capabilities operate on the mount instance.
+   Identity comparisons operate on the filesystem instance. Two mounts of
+   one filesystem instance, such as a bind mount and its origin, are two
+   domains that share one identity space; on Linux, Btrfs subvolumes are
+   distinct `st_dev` values within one filesystem instance, and bind
+   mounts are distinct mounts sharing one `st_dev` [STATMOUNT]. `st_dev`
+   is therefore neither a domain key nor a filesystem-instance key on
+   every platform, and an adapter MUST NOT use it as one where the
+   platform exposes a better identifier. A domain crossing is detected
+   per mount, at the directory where traversal leaves the parent's
+   domain, through the domain-resolution operation of Section 10.3
+   before that directory is first listed.
 
    Crossing is controlled by a configured domain-crossing mode:
 
@@ -1886,22 +2006,30 @@ Abstract
    and Apple's own guidance is that the event list is advisory and a
    periodic full sweep remains necessary [FSEVENTS].
 
-   On Windows a domain is keyed by the volume serial number that
-   `GetFileInformationByHandleEx` returns for a directory handle, which
-   detects every boundary in one call: drive letters, mounted folders,
-   junctions to another volume, DFS redirects, and network redirectors
-   [FILE-ID-INFO]. A junction within one volume is not a crossing. Volume
-   information calls are unsupported on SMB and mount-point enumeration
-   is unsupported on ReFS; failure maps to Unknown, not to a default.
+   On Windows the adapter opens each directory and reads `FILE_ID_INFO`.
+   A change in the volume serial number between a parent and its child
+   proves that a boundary was crossed; an unchanged serial does not
+   prove the opposite, because Windows documents the serial as an opaque
+   value generated at format time that is not required to be unique, and
+   documents only the pair of serial and 128-bit file identifier as
+   identifying a file on one computer [FILE-ID-INFO] [MS-FSCC]. The
+   adapter therefore uses the serial as a crossing detector and as a
+   session-scoped domain key, uses the volume GUID path as the
+   reboot-stable identity only where the volume management call
+   succeeds, and reports that identity as Unknown on SMB shares and ReFS
+   volumes, where the call is documented as unsupported. Remoteness comes
+   from the remote-protocol information of the handle, not from the
+   shape of the path. A junction within one volume is not a crossing.
    Case sensitivity on NTFS is a per-directory flag that the volume flag
-   does not reflect. A ReFS 128-bit file identifier encodes the parent
-   directory, so it is not rename-stable across directories, which is
-   consistent with the same-parent limit that Section 7.4 already places
-   on Rename. `ReadDirectoryChangesW` reports overflow as a successful
-   call with zero bytes and reports an unsupported target with
-   `ERROR_INVALID_FUNCTION`; the adapter treats the first as a rescan
-   requirement and the second as the absence of a watcher for that
-   domain [RDCW].
+   does not reflect. The ReFS 128-bit file identifier is documented as
+   stable until deletion and unique within the volume even though its
+   low 64 bits index the directory the file was created in, so ReFS MAY
+   declare stable identity; the 64-bit identifier is not unique on ReFS
+   and MUST NOT be used there [MS-FSCC]. `ReadDirectoryChangesW` reports
+   overflow as a successful call with zero bytes and reports an
+   unsupported target with `ERROR_INVALID_FUNCTION`; the adapter treats
+   the first as a rescan requirement and the second as the absence of a
+   watcher for that domain [RDCW].
 
    On every platform, timestamp granularity, whether external writers
    exist, and the semantics of a userspace or third-party filesystem
@@ -1934,11 +2062,14 @@ Abstract
    A conforming implementation MUST satisfy all of the following:
 
    1. Every filesystem operation the tree performs is admitted through
-      one resource governor. Reconciliation, watcher-triggered reads,
-      retries, the initial scan, overflow recovery, policy invalidation,
-      priority work, root recovery, kind resolution, and metadata
-      enrichment are all governed. No scheduling class, command, or
-      recovery path bypasses the governor.
+      one resource governor: root canonicalization and validation, root
+      probes, domain resolution, watch registration and removal, listing
+      sessions and their work leases, kind resolution, metadata reads,
+      and metadata enrichment, whatever scheduling class, command, or
+      recovery path requested them. Reconciliation, watcher-triggered
+      reads, retries, the initial scan, overflow recovery, policy
+      invalidation, priority work, and root recovery are all governed.
+      No operation bypasses the governor.
 
    2. The scheduler decides which eligible work runs. The governor
       decides whether work may run at all. A job that is ready for
@@ -1947,16 +2078,20 @@ Abstract
       retry record unchanged.
 
    3. Watcher events influence scheduling priority. They MUST NOT
-      increase the amount of filesystem work the tree is permitted to
-      perform. Over any window of wall time, the background work admitted
-      under an unbounded stream of watcher hints MUST NOT exceed the work
-      admitted with no hints at all.
+      increase the configured background envelope: no rate, burst,
+      concurrency ceiling, or memory ceiling changes because hints
+      arrive. A hint MAY make a job eligible earlier than the baseline
+      cursor would; every such job is admitted within the same envelope
+      as timer-requested work, so an unbounded stream of hints admits no
+      more background work than the envelope allows.
 
    4. Work explicitly requested by the consumer through `refresh` or
       `load` MAY draw on a separate bounded foreground allowance. That
-      allowance has hard ceilings on rate, burst, and per-command cost.
-      Foreground and background allowances MUST NOT transfer capacity to
-      each other.
+      allowance is a priority and burst reservation within the shared
+      physical ceilings on concurrency and memory; it never bypasses
+      them. It has hard ceilings on rate, burst, and per-command
+      admitted cost. Foreground and background allowances MUST NOT
+      transfer capacity to each other.
 
    5. Resource exhaustion and throttling are observable through the
       health state defined in Section 15.6. Throttling MUST NOT be
@@ -1986,7 +2121,8 @@ Abstract
    of elapsed wall time. Concurrency MUST NOT reduce the accounted cost
    of work.
 
-   The adapter reports, with every completed job:
+   The adapter reports, with every completed job and with every lease a
+   listing session consumes:
 
       blocking time occupied by the job
       listing operations performed
@@ -2004,10 +2140,13 @@ Abstract
       error, cancellation, and stale-result counts
 
    A job whose reported blocking time is absent or exceeds its occupancy
-   is charged its occupancy. A job whose result never arrives is charged
-   its occupancy when its worker is declared lost or when the tree stops.
-   A hung filesystem call therefore accumulates cost for as long as it
-   occupies a slot.
+   is charged its occupancy. An operation that has not completed is
+   charged its occupancy so far at every accounting point: whenever the
+   governor evaluates admission, each running job's reservation is
+   replaced by the larger of the reservation and its elapsed occupancy.
+   A permanently stuck operation therefore never appears to have
+   consumed zero budget; it accrues cost continuously until its call
+   returns or the tree stops.
 
    Latency is summarized per storage domain as a moving minimum over a
    short interval together with median and tail estimates. The moving
@@ -2038,21 +2177,33 @@ Abstract
       accounted memory plus the estimated result size is within the
       configured ceiling.
 
-   Admission reserves the estimate. Completion reconciles the difference
-   against the domain bucket in full and against the global bucket up to
-   a configured per-job cap, so one pathological domain repays its own
-   debt without consuming the allowance of other domains.
+   Admission reserves the estimate. Completion, and every accounting
+   point before it, reconciles actual occupancy against both the domain
+   bucket and the global bucket in full. Global accounting is honest: it
+   MUST NOT ignore any part of a job's actual occupancy. Per-domain
+   fairness comes from the per-domain buckets and windows, not from
+   discounting the global meter.
 
-   The bound that follows, and that a conforming implementation MUST
-   uphold, is: over any window of wall time W and for every storage
-   domain, background worker time charged is at most rate times W plus
-   capacity for that domain, and the same inequality holds for the
-   global bucket.
+   The enforceable bound, which a conforming implementation MUST uphold,
+   is stated on admission rather than on completion: over any window of
+   wall time W and for every storage domain, background worker time
+   admitted, that is reserved at admission, is at most rate times W plus
+   capacity for that domain, and the same inequality holds globally;
+   physical concurrency never exceeds the per-domain windows or the
+   global in-flight limit; the actual cost of a running operation is
+   charged in full as it accrues; and no further admission occurs on a
+   domain or globally while its bucket is in debt. A running call that
+   cannot be interrupted MAY overshoot its reservation without bound.
+   That overshoot is debt, it is visible in Section 16, and it suppresses
+   admission until repaid. No bound on actual worker time over a
+   wall-time window is claimed, because Section 4 item 8 makes such a
+   bound impossible to enforce.
 
    When no job can be admitted, the governor reports the earliest time
-   at which one could be. The periodic timer defined in Section 12 MUST
-   NOT fire earlier than that time. A throttled tree sleeps. It does not
-   poll.
+   at which one could be when that time is computable, as defined in
+   Section 12, and otherwise reports that it is waiting on a state
+   change. The periodic timer MUST NOT fire earlier than a reported time.
+   A throttled tree sleeps or waits. It does not poll.
 
    Denial is not an outcome. An obligation whose admission is denied
    stays Pending, the baseline cursor does not advance past it, a command
@@ -2063,11 +2214,21 @@ Abstract
 
    Reads dispatched to satisfy an accepted `refresh` or `load` command
    draw on the foreground buckets. The foreground buckets have their own
-   rate and capacity, and each command additionally has a ceiling on the
-   total worker time its reads may consume. Exhausting the foreground
-   allowance queues the command's reads; it neither fails the command
-   nor borrows from the background buckets. Section 9 places no
-   wall-clock bound on command completion.
+   rate and capacity. They are reservations within the shared physical
+   ceilings: a foreground read still needs a free slot in its domain
+   window and in the global in-flight limit and still counts against the
+   memory ceiling. Exhausting the foreground allowance queues the
+   command's reads; it neither fails the command nor borrows from the
+   background buckets. Section 9 places no wall-clock bound on command
+   completion.
+
+   Each command additionally has a ceiling on the worker time its reads
+   may be admitted with. The ceiling bounds admission: once the cost
+   admitted or charged for the command reaches it, no further operation
+   for that command is admitted. A running uninterruptible read MAY
+   overshoot it. When a required read remains after the ceiling is
+   reached, the command fails with ResourceLimited under Section 13.1;
+   this is a terminal outcome, not throttling with a resume time.
 
    Priority directories, policy invalidation, and root recovery are
    background work. They change which directory is read next. They do
@@ -2082,20 +2243,31 @@ Abstract
    removable, or virtual starts with a window of one. Local block
    storage MAY start higher but not above two.
 
-   The window adapts to measurements using additive increase and
-   multiplicative decrease [AIMD]. The window decreases by half when any
-   of the following is observed for the domain: tail listing latency
-   above a target derived from the moving minimum, an error in the
-   recent completion history, queue delay exceeding the product of the
-   window and the mean latency, or a worker occupied beyond the stuck
-   threshold. The window increases by one per window's worth of
-   completions only after sustained completions below the latency target
-   with bounded variance and no errors.
+   The window adapts to measurements. The normative requirements on
+   adaptation are:
 
-   Adaptation moves concurrency only. It MUST NOT move a duty rate, a
-   capacity, or any configured ceiling. A domain that behaves like an
-   overloaded remote volume is treated as one regardless of how it is
-   labelled.
+      it starts from the conservative initial window above;
+      it increases only on sustained evidence of low latency, bounded
+      variance, and no errors, and by a bounded step per window's worth
+      of completions;
+      it decreases promptly, by at least half, on evidence of contention:
+      tail latency above a target derived from the standing-delay
+      signal, an error in the recent history, queue delay exceeding the
+      product of the window and the mean latency, or a worker beyond the
+      stuck threshold;
+      it never exceeds the ceiling, whatever labels or measurements say;
+      it moves concurrency only, never a duty rate, a capacity, or any
+      configured ceiling.
+
+   The specified current strategy is additive increase and multiplicative
+   decrease [AIMD] driven by a moving-minimum latency signal [CODEL].
+   Another controller that meets the requirements above is conforming.
+   Token buckets in Section 15.3 are likewise the specified strategy;
+   the contract is the admission bound, the full-cost debt, and the
+   physical ceilings, not the bucket itself.
+
+   A domain that behaves like an overloaded remote volume is treated as
+   one regardless of how it is labelled.
 
    Implementations MUST NOT run synthetic benchmarks at startup to
    classify a domain. Measurements come from work the tree needed to
@@ -2113,7 +2285,9 @@ Abstract
       ForegroundCeiling, the foreground allowance is exhausted; or
       StuckWorker, a worker has exceeded the stuck threshold;
 
-   together with the earliest time at which admission can resume.
+   together with the earliest time at which admission can resume, when
+   that time is computable, and otherwise the state change that will
+   free capacity.
 
    A listing that exceeds a configured limit on entries, result bytes,
    or accounted memory is rejected in full with a ResourceLimited outcome
@@ -2135,16 +2309,21 @@ Abstract
       C be the configured global in-flight limit.
 
    Snapshot storage is O(N). Coordinator state per represented entry is
-   bounded by a constant. A reconciliation round retains the snapshot
-   version current at its start and a cursor; it MUST NOT copy the
-   obligation set. Per-round state is proportional to the number of
-   obligations that are designated, accepted ahead of the cursor,
-   awaiting a post-barrier successor, or unsatisfied, and is bounded by
-   C plus B plus the number of such exceptional obligations.
+   bounded by a constant. Per-round bookkeeping SHOULD be bounded by the
+   number of exceptional obligations, those that are designated,
+   accepted ahead of the cursor, awaiting a post-barrier successor, or
+   unsatisfied, plus C plus B, rather than by D. Retaining the snapshot
+   version current at round start as the frozen set, as Section 11.8
+   permits, satisfies this. An implementation that still enumerates the
+   obligation set conforms as long as the round semantics of Section
+   11.8 hold; the bound above is the target for the representation, not
+   a mandate on it.
 
    A dispatch cycle admits at most B jobs, and at most C are in flight,
-   but neither number bounds cost. Cost is bounded by the buckets in
-   Section 15.3. A single directory listing is bounded by the configured
+   but neither number bounds cost. Admitted cost is bounded by the
+   buckets in Section 15.3; actual cost is charged in full and exceeds
+   the admitted cost only through a running call that cannot be
+   interrupted. A single directory listing is bounded by the configured
    entries-per-directory limit and result-size limit, enforced while the
    listing is in progress under Section 10.2, so a directory beyond the
    limit is never materialized in full.
@@ -2164,6 +2343,26 @@ Abstract
    bounded number of entries, and cannot enumerate a directory of
    unbounded size. Consumers that need more capacity raise the relevant
    limit explicitly and accept the resulting resource use.
+
+15.9.  Scope Across Trees
+
+   The governor is scoped to the host process. Every Tree instance
+   opened in one process shares one host governor: one set of physical
+   ceilings on in-flight workers and accounted memory, one global
+   background bucket, one global foreground bucket, and one accounting of
+   worker time per storage domain. Per-tree budgets MAY be configured
+   beneath the host governor, and per-domain buckets are shared by every
+   tree that reaches the same domain, so several trees rooted on one
+   network volume together consume that volume's allowance once.
+
+   A consumer that opens many trees, such as an editor with many
+   worktrees, therefore cannot multiply the envelope by opening more
+   trees. The envelope is per process.
+
+   Separate processes cannot be governed by this specification. A host
+   that runs several processes using this library relies on operating
+   system mechanisms to bound their aggregate; the library reports its
+   own accounting so that such mechanisms can be configured.
 
 
 16.  Observability
@@ -2313,13 +2512,26 @@ Abstract
    For every generated history the following hold:
 
       no filesystem operation runs without a governor grant
-      background worker time charged over every window stays within the
+      background worker time admitted over every window stays within the
       configured rate and burst, per domain and globally
-      foreground worker time stays within its rate, burst, and per
-      command ceiling
+      actual cost of every operation is charged in full and a bucket in
+      debt admits nothing until repaid
+      physical in-flight workers never exceed the per-domain windows or
+      the global limit, stuck workers included
+      foreground admitted cost stays within its rate, burst, and per
+      command ceiling, and a command past its ceiling fails with
+      ResourceLimited rather than admitting more
       background and foreground buckets never transfer capacity
-      a watcher storm does not increase total admitted background work
-      a starved baseline obligation is admitted once budget permits
+      a watcher storm changes no rate, burst, or ceiling, and total
+      admitted background work under a storm stays within the same
+      envelope as without one
+      a listing session yields at every lease boundary and performs no
+      operation beyond its lease
+      a starved baseline obligation is admitted once budget permits and
+      a slot is free
+      a stuck worker on one domain ends its logical job, leaves the
+      closed batch, and does not delay another domain's baseline
+      a tree opened alongside other trees shares their envelope
       governor denial changes no obligation, cursor, barrier, or retry
       state
       throttling never causes a stale result to commit
@@ -2433,8 +2645,8 @@ Abstract
    7. passes deterministic tests with all watcher events suppressed;
 
    8. admits every filesystem operation through the resource governor of
-      Section 15 and stays within the configured budgets over every
-      window;
+      Section 15, stays within the admission envelope and the physical
+      ceilings over every window, and charges actual cost in full;
 
    9. never claims to interrupt a running filesystem call, and reports
       stuck workers;
@@ -2547,6 +2759,10 @@ Abstract
    [INOTIFY]  Linux man-pages project, "inotify(7)", Linux man-pages 6.18,
               14 February 2026,
               <https://man7.org/linux/man-pages/man7/inotify.7.html>.
+
+   [MS-FSCC]  Microsoft, "[MS-FSCC]: File System Control Codes",
+              sections 2.1.10 and 2.5.9 and Appendix B,
+              <https://learn.microsoft.com/openspecs/windows_protocols/ms-fscc/>.
 
    [NOTIFY]  notify-rs contributors, "notify", version 8.2.0,
              15 June 2026,
