@@ -43,6 +43,7 @@ pub struct Harness {
     timer: Option<(TimerId, MonotonicTime)>,
     sink: Arc<Sink>,
     cancelled: Vec<JobId>,
+    outstanding: VecDeque<JobSpec>,
     unwatched: Vec<WatchId>,
     stopped: bool,
     pub auto_register: bool,
@@ -67,6 +68,7 @@ impl Harness {
             timer: None,
             sink: Arc::new(Sink { queue: Mutex::new(VecDeque::new()) }),
             cancelled: Vec::new(),
+            outstanding: VecDeque::new(),
             unwatched: Vec::new(),
             stopped: false,
             auto_register: true,
@@ -95,7 +97,11 @@ impl Harness {
                 Output::StartJob(spec) => self.jobs.push_back(spec),
                 Output::CancelJob(id) => {
                     self.cancelled.push(id);
-                    self.jobs.retain(|j| j.id != id);
+                    if let Some(index) = self.jobs.iter().position(|j| j.id == id)
+                        && let Some(spec) = self.jobs.remove(index)
+                    {
+                        self.outstanding.push_back(spec);
+                    }
                 }
                 Output::RegisterWatch { request, path, recursive } => {
                     self.registrations.push_back((request, path, recursive))
@@ -173,6 +179,45 @@ impl Harness {
         true
     }
 
+    pub fn outstanding_jobs(&self) -> Vec<JobSpec> {
+        self.outstanding.iter().cloned().collect()
+    }
+
+    pub fn complete_outstanding_job(&mut self, id: JobId) -> bool {
+        let Some(index) = self.outstanding.iter().position(|j| j.id == id) else {
+            return false;
+        };
+        let Some(spec) = self.outstanding.remove(index) else {
+            return false;
+        };
+        let result = match spec.operation {
+            JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
+            JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
+        };
+        self.feed(Input::JobCompleted { job: spec.id, result });
+        true
+    }
+
+    pub fn lose_outstanding_job(&mut self, id: JobId) -> bool {
+        let Some(index) = self.outstanding.iter().position(|j| j.id == id) else {
+            return false;
+        };
+        self.outstanding.remove(index);
+        self.feed(Input::WorkerLost(WorkerLoss::Job(id)));
+        true
+    }
+
+    fn release_outstanding(&mut self) -> usize {
+        let mut count = 0;
+        while let Some(id) = self.outstanding.front().map(|j| j.id) {
+            if !self.lose_outstanding_job(id) {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
     pub fn lose_registration(&mut self, request: WatchRequestId) -> bool {
         let Some(index) = self.registrations.iter().position(|(r, _, _)| *r == request) else {
             return false;
@@ -244,6 +289,7 @@ impl Harness {
                 progress += self.complete_registrations();
             }
             progress += self.complete_all_jobs();
+            progress += self.release_outstanding();
             progress += self.deliver_watcher_events();
             if progress == 0 {
                 break;

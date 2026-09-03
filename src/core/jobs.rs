@@ -1,5 +1,5 @@
 use super::types::*;
-use super::{Coordinator, JobOperation, JobResult, JobSpec, Output, WorkerLoss};
+use super::{Coordinator, JobOperation, JobResult, Output, WorkerLoss};
 use crate::config::WatchRegistrationFailure;
 use crate::entry::{EntryKind, LoadState, Shape};
 use crate::error::Error;
@@ -12,9 +12,9 @@ impl Coordinator {
         let Some(job) = self.jobs.get(&id).cloned() else {
             return;
         };
-        if !matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
+        let Some(started) = job.phase.started() else {
             return;
-        }
+        };
         let Some(entry) = job.entry() else {
             self.on_probe_result(job, result);
             return;
@@ -33,14 +33,12 @@ impl Coordinator {
             self.finish_job(id, JobOutcome::Stale);
             return;
         }
-        if job.need == ReadNeed::Listing
-            && let Some(started) = job.started
-        {
+        if job.need == ReadNeed::Listing {
             self.last_listing_duration = Some(self.now.since(started));
         }
         let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);
         match (job.need, job.phase, result) {
-            (ReadNeed::Listing, JobPhase::Running, JobResult::Listing(Ok(listing))) => {
+            (ReadNeed::Listing, JobPhase::Running(_), JobResult::Listing(Ok(listing))) => {
                 self.listings += 1;
                 self.last_listing_children = Some(listing.entries.len());
                 match self.commit_listing(&job, listing) {
@@ -57,26 +55,22 @@ impl Coordinator {
                     }
                 }
             }
-            (ReadNeed::Listing, JobPhase::Running, JobResult::Listing(Err(FsError::NotFound))) => {
+            (ReadNeed::Listing, JobPhase::Running(_), JobResult::Listing(Err(FsError::NotFound))) => {
                 self.listing_failures += 1;
                 self.on_not_found(&job);
             }
-            (ReadNeed::Listing, JobPhase::Running, JobResult::Listing(Err(FsError::NotDirectory))) => {
+            (ReadNeed::Listing, JobPhase::Running(_), JobResult::Listing(Err(FsError::NotDirectory))) => {
                 if is_root {
                     self.root_lost();
                     self.finish_job(id, JobOutcome::Removed);
                     return;
                 }
                 if let Some(job) = self.jobs.get_mut(&id) {
-                    job.phase = JobPhase::Confirming;
+                    job.phase = JobPhase::Confirming(started);
                 }
-                self.outputs.push(Output::StartJob(JobSpec {
-                    id,
-                    path: job.path.clone(),
-                    operation: JobOperation::Metadata,
-                }));
+                self.dispatch_job(id, JobOperation::Metadata);
             }
-            (ReadNeed::Listing, JobPhase::Confirming, JobResult::Metadata(Ok(info))) => {
+            (ReadNeed::Listing, JobPhase::Confirming(_), JobResult::Metadata(Ok(info))) => {
                 if info.kind == EntryKind::Directory {
                     self.stale_results += 1;
                     self.finish_job(id, JobOutcome::Stale);
@@ -85,10 +79,10 @@ impl Coordinator {
                     self.finish_job(id, outcome);
                 }
             }
-            (ReadNeed::Listing, JobPhase::Confirming, JobResult::Metadata(Err(FsError::NotFound))) => {
+            (ReadNeed::Listing, JobPhase::Confirming(_), JobResult::Metadata(Err(FsError::NotFound))) => {
                 self.on_not_found(&job)
             }
-            (ReadNeed::Listing, JobPhase::Confirming, JobResult::Metadata(Err(FsError::NotDirectory))) => {
+            (ReadNeed::Listing, JobPhase::Confirming(_), JobResult::Metadata(Err(FsError::NotDirectory))) => {
                 self.listing_failures += 1;
                 self.resolve_ancestor(entry);
                 self.finish_job(id, JobOutcome::Failed(FsError::Transient("ancestor is not a directory".into())));
@@ -135,7 +129,7 @@ impl Coordinator {
         let Some(job) = self.jobs.get(&id).cloned() else {
             return;
         };
-        if !matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
+        if job.phase.started().is_none() {
             return;
         }
         self.lost_workers += 1;

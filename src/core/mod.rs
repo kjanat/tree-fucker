@@ -8,7 +8,7 @@ mod watcher;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -93,6 +93,14 @@ pub enum Output {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockingSlot {
+    pub job: JobId,
+    pub path: RelativePath,
+    pub operation: JobOperation,
+    pub started: MonotonicTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub version: SnapshotVersion,
     pub initial_scan: InitialScanState,
@@ -105,6 +113,8 @@ pub struct Stats {
     pub represented_entries: usize,
     pub queued_jobs: usize,
     pub in_flight_jobs: usize,
+    pub blocking_slots_held: usize,
+    pub blocking_slots: Vec<BlockingSlot>,
     pub pending_requests: usize,
     pub watcher: WatcherKind,
     pub dropped_hints: u64,
@@ -139,6 +149,7 @@ pub struct Coordinator {
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
     jobs: HashMap<JobId, ActiveJob>,
+    blocking_slots: BTreeMap<JobId, Occupancy>,
     active_by_entry: HashMap<EntryId, JobId>,
     probe_job: Option<JobId>,
     registrations: HashMap<WatchRequestId, RegistrationTarget>,
@@ -210,6 +221,7 @@ impl Coordinator {
             root_probe: None,
             probe_attempts: 0,
             jobs: HashMap::new(),
+            blocking_slots: BTreeMap::new(),
             active_by_entry: HashMap::new(),
             probe_job: None,
             registrations: HashMap::new(),
@@ -291,6 +303,16 @@ impl Coordinator {
 
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
+        match &input {
+            Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => {
+                self.blocking_slots.remove(job);
+            }
+            Input::Command { .. }
+            | Input::Watcher(_)
+            | Input::WatchRegistered { .. }
+            | Input::WorkerLost(WorkerLoss::WatchRegistration(_))
+            | Input::Timer(_) => {}
+        }
         if self.is_stopped() {
             match input {
                 Input::Command { id, .. } => {
@@ -322,8 +344,17 @@ impl Coordinator {
     pub fn stats(&self) -> Stats {
         let queued =
             self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Queued | JobPhase::Registering(_))).count();
-        let in_flight =
-            self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Running | JobPhase::Confirming)).count();
+        let in_flight = self.jobs.values().filter(|j| j.phase.started().is_some()).count();
+        let blocking_slots: Vec<BlockingSlot> = self
+            .blocking_slots
+            .iter()
+            .map(|(job, held)| BlockingSlot {
+                job: *job,
+                path: held.path.clone(),
+                operation: held.operation,
+                started: held.started,
+            })
+            .collect();
         let loaded = self.snapshot.loaded_directories().count();
         let priority_len = self.priority.keys.len();
         Stats {
@@ -338,6 +369,8 @@ impl Coordinator {
             represented_entries: self.snapshot.len(),
             queued_jobs: queued,
             in_flight_jobs: in_flight,
+            blocking_slots_held: blocking_slots.len(),
+            blocking_slots,
             pending_requests: self.pending.len() + usize::from(self.root_probe.is_some()),
             watcher: self.caps.watcher,
             dropped_hints: self.dropped_hints,
@@ -584,7 +617,7 @@ impl Coordinator {
         let ids: Vec<JobId> = self.jobs.keys().copied().collect();
         for id in ids {
             if let Some(job) = self.jobs.remove(&id) {
-                if matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
+                if job.phase.started().is_some() {
                     self.outputs.push(Output::CancelJob(id));
                 }
                 if let Some(entry) = job.entry() {

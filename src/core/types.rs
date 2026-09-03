@@ -181,8 +181,24 @@ pub struct Guards {
 pub enum JobPhase {
     Registering(WatchRequestId),
     Queued,
-    Running,
-    Confirming,
+    Running(MonotonicTime),
+    Confirming(MonotonicTime),
+}
+
+impl JobPhase {
+    pub fn started(self) -> Option<MonotonicTime> {
+        match self {
+            JobPhase::Running(at) | JobPhase::Confirming(at) => Some(at),
+            JobPhase::Registering(_) | JobPhase::Queued => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Occupancy {
+    pub path: RelativePath,
+    pub operation: super::JobOperation,
+    pub started: MonotonicTime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,7 +235,6 @@ pub struct ActiveJob {
     pub reasons: Reasons,
     pub barriers: Vec<CommandId>,
     pub designated: bool,
-    pub started: Option<MonotonicTime>,
 }
 
 impl ActiveJob {

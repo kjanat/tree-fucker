@@ -244,6 +244,61 @@ fn unload_cancels_in_flight_work_and_stale_results_never_commit() {
 }
 
 #[test]
+fn a_cancelled_worker_keeps_its_physical_slot_until_it_returns() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("d0");
+    fs.mkdir("d1");
+    fs.mkdir("d2");
+    let config = Config { batch_size: 4, max_in_flight: 2, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    let t = h.command(Command::Refresh(vec![path("d0"), path("d1"), path("d2")]));
+    assert_eq!(h.pending_jobs().len(), 2);
+    assert_eq!(h.stats().blocking_slots_held, 2);
+    let cancelled = h.pending_job_for("d0").expect("d0 listing in flight");
+    let u = h.command(Command::Unload(path("d0")));
+    assert_eq!(h.result(u), Some(Ok(())));
+    assert!(h.cancelled().contains(&cancelled.id));
+    assert_eq!(h.outstanding_jobs(), vec![cancelled.clone()]);
+    assert!(h.pending_job_for("d2").is_none(), "a replacement job took the slot of a worker that never returned");
+    assert_eq!(h.stats().in_flight_jobs, 1);
+    assert_eq!(h.stats().blocking_slots_held, 2);
+    let held = h.stats().blocking_slots;
+    let slot = held.iter().find(|s| s.job == cancelled.id).expect("cancelled worker still holds a slot");
+    assert_eq!(slot.path, path("d0"));
+    assert_eq!(slot.operation, JobOperation::Listing);
+    assert_eq!(slot.started, h.now());
+    assert!(h.complete_outstanding_job(cancelled.id));
+    assert!(h.stats().blocking_slots.iter().all(|s| s.job != cancelled.id));
+    assert!(h.pending_job_for("d2").is_some(), "the released slot admitted no queued job");
+    assert_eq!(h.stats().blocking_slots_held, 2);
+    h.run_until_idle();
+    assert_eq!(h.stats().blocking_slots_held, 0);
+    assert!(h.result(t).is_some());
+}
+
+#[test]
+fn shutdown_keeps_a_started_worker_slot_held_until_the_worker_returns() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    let job = h.pending_job_for("a").expect("listing in flight");
+    assert_eq!(h.stats().blocking_slots_held, 1);
+    let s = h.command(Command::Shutdown);
+    assert_eq!(h.result(s), Some(Ok(())));
+    assert!(h.stopped());
+    assert_eq!(h.result(t), Some(Err(Error::Shutdown)));
+    assert_eq!(h.stats().in_flight_jobs, 0);
+    assert_eq!(h.stats().blocking_slots_held, 1);
+    assert_eq!(h.stats().blocking_slots[0].job, job.id);
+    assert_eq!(h.stats().blocking_slots[0].path, path("a"));
+    assert!(h.complete_outstanding_job(job.id));
+    assert_eq!(h.stats().blocking_slots_held, 0);
+    assert!(!h.paths().contains(&"a/late".to_string()));
+}
+
+#[test]
 fn overflow_requires_new_coverage_generation() {
     let fs = populated(WatcherKind::Recursive);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));

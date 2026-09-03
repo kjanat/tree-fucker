@@ -283,7 +283,7 @@ impl Actor {
                     self.workers.insert(job, handle);
                 }
                 Output::CancelJob(id) => {
-                    if let Some(handle) = self.workers.remove(&id) {
+                    if let Some(handle) = self.workers.get(&id) {
                         handle.cancel();
                     }
                 }
@@ -332,6 +332,7 @@ impl Actor {
                 }
             }
         }
+        *lock(&self.shared.stats) = self.coordinator.stats();
         stopped
     }
 

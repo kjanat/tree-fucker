@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tree_fucker::core::JobOperation;
 use tree_fucker::policy::{PathPredicate, ScanDecision};
 use tree_fucker::testing::{BlockingMode, DeterministicRuntime, FailureMode, FakeFileSystem, FakeOp};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RecoverableError, RoundResult, UpdateEvent};
@@ -341,12 +342,23 @@ fn a_registration_dispatched_before_shutdown_releases_its_watch() {
     assert_eq!(fs.watch_count(), 0);
 }
 
-struct InertHandle;
+struct InertHandle {
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl tree_fucker::runtime::TaskHandle for InertHandle {
-    fn cancel(&self) {}
+    fn cancel(&self) {
+        self.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 
     fn detach(self: Box<Self>) {}
+}
+
+impl Drop for InertHandle {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 struct HoldingRuntime {
@@ -354,6 +366,8 @@ struct HoldingRuntime {
     hold: std::sync::atomic::AtomicBool,
     budget: std::sync::atomic::AtomicUsize,
     held: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HoldingRuntime {
@@ -363,7 +377,17 @@ impl HoldingRuntime {
             hold: std::sync::atomic::AtomicBool::new(false),
             budget: std::sync::atomic::AtomicUsize::new(0),
             held: std::sync::Mutex::new(Vec::new()),
+            cancels: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    fn cancels(&self) -> usize {
+        self.cancels.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn dropped_handles(&self) -> usize {
+        self.drops.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn hold(&self) {
@@ -416,7 +440,7 @@ impl tree_fucker::runtime::Runtime for HoldingRuntime {
     fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> tree_fucker::runtime::BoxTaskHandle {
         if self.hold.load(std::sync::atomic::Ordering::SeqCst) || self.take_budget() {
             self.held.lock().expect("held lock").push(work);
-            return Box::new(InertHandle);
+            return Box::new(InertHandle { cancels: self.cancels.clone(), drops: self.drops.clone() });
         }
         self.inner.spawn_blocking(work)
     }
@@ -433,6 +457,50 @@ fn poll_stream(
     let waker = futures_util::task::noop_waker();
     let mut cx = std::task::Context::from_waker(&waker);
     std::pin::Pin::new(stream).poll_next(&mut cx)
+}
+
+#[test]
+fn a_cancelled_worker_that_cannot_be_interrupted_holds_its_slot_and_its_handle_until_it_returns() {
+    let inner = Arc::new(DeterministicRuntime::new());
+    inner.set_blocking_mode(BlockingMode::Uninterruptible);
+    let runtime = Arc::new(HoldingRuntime::new(inner.clone()));
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.create_file("a/x", 3);
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let (handle, _stream) = inner
+        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .expect("open");
+    inner.block_on(handle.initial_scan_complete()).expect("scan");
+    let listings_before = fs.count_ops(FakeOp::ReadDir, "a");
+    fs.add_silently("a/late", EntryKind::File);
+    runtime.hold_next(1);
+    let mut refresh = Box::pin(handle.refresh(vec![path("a")]));
+    assert!(poll_once(refresh.as_mut()).is_pending());
+    inner.run_until_stalled();
+    assert_eq!(runtime.held(), 1);
+    let started = handle.stats().blocking_slots;
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].path, path("a"));
+    assert_eq!(started[0].operation, JobOperation::Listing);
+    let mut unload = Box::pin(handle.unload(path("a")));
+    assert!(poll_once(unload.as_mut()).is_pending());
+    inner.run_until_stalled();
+    assert_eq!(runtime.cancels(), 1);
+    assert_eq!(runtime.dropped_handles(), 0, "the worker handle was dropped before its result arrived");
+    assert_eq!(handle.stats().blocking_slots, started, "the slot was released before the worker returned");
+    assert_eq!(handle.stats().in_flight_jobs, 0);
+    assert_eq!(handle.snapshot().get(&path("a")).and_then(|e| e.load_state()), Some(LoadState::Unloaded));
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), listings_before);
+    runtime.release();
+    inner.run_until_stalled();
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), listings_before + 1);
+    assert_eq!(runtime.dropped_handles(), 1);
+    assert_eq!(handle.stats().blocking_slots_held, 0);
+    assert!(handle.snapshot().get(&path("a/late")).is_none());
+    assert_eq!(inner.block_on(unload), Ok(()));
+    assert_eq!(inner.block_on(refresh), Ok(()));
+    assert_eq!(handle.stats().lost_workers, 0);
 }
 
 #[test]

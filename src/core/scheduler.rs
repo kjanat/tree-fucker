@@ -378,7 +378,6 @@ impl Coordinator {
             reasons,
             barriers,
             designated,
-            started: None,
         };
         if let Some(entry_id) = entry {
             self.active_by_entry.insert(entry_id, id);
@@ -480,9 +479,7 @@ impl Coordinator {
             return;
         }
         loop {
-            let in_flight =
-                self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Running | JobPhase::Confirming)).count();
-            if in_flight >= self.config.max_in_flight {
+            if self.blocking_slots.len() >= self.config.max_in_flight {
                 break;
             }
             let Some(id) = self.queue_order.pop_front() else {
@@ -498,20 +495,28 @@ impl Coordinator {
                 self.finish_job(id, JobOutcome::Cancelled);
                 continue;
             }
-            let spec = JobSpec {
-                id,
-                path: job.path.clone(),
-                operation: match job.need {
-                    ReadNeed::Listing => JobOperation::Listing,
-                    ReadNeed::Metadata => JobOperation::Metadata,
-                },
+            let operation = match job.need {
+                ReadNeed::Listing => JobOperation::Listing,
+                ReadNeed::Metadata => JobOperation::Metadata,
             };
+            let now = self.now;
             if let Some(job) = self.jobs.get_mut(&id) {
-                job.phase = JobPhase::Running;
-                job.started = Some(self.now);
+                job.phase = JobPhase::Running(now);
             }
-            self.outputs.push(Output::StartJob(spec));
+            self.dispatch_job(id, operation);
         }
+    }
+
+    pub(super) fn dispatch_job(&mut self, id: JobId, operation: JobOperation) {
+        let Some(job) = self.jobs.get(&id) else {
+            return;
+        };
+        let Some(started) = job.phase.started() else {
+            return;
+        };
+        let path = job.path.clone();
+        self.blocking_slots.insert(id, Occupancy { path: path.clone(), operation, started });
+        self.outputs.push(Output::StartJob(JobSpec { id, path, operation }));
     }
 
     pub(super) fn job_terminal(&mut self, id: JobId) {
@@ -573,7 +578,7 @@ impl Coordinator {
         let Some(job) = self.jobs.get(&id) else {
             return;
         };
-        if matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
+        if job.phase.started().is_some() {
             self.outputs.push(Output::CancelJob(id));
         }
         self.finish_job(id, JobOutcome::Cancelled);
