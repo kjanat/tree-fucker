@@ -15,7 +15,7 @@ impl Coordinator {
         if !matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
             return;
         }
-        let Some(entry) = job.entry else {
+        let Some(entry) = job.entry() else {
             self.on_probe_result(job, result);
             return;
         };
@@ -139,7 +139,7 @@ impl Coordinator {
             return;
         }
         self.lost_workers += 1;
-        match job.entry {
+        match job.entry() {
             Some(_) => self.finish_job(id, JobOutcome::WorkerLost),
             None => {
                 self.push_error(crate::path::RelativePath::root(), Operation::RootProbe, ErrorCause::WorkerLost);
@@ -165,7 +165,7 @@ impl Coordinator {
     }
 
     fn on_not_found(&mut self, job: &ActiveJob) {
-        let Some(entry) = job.entry else { return };
+        let Some(entry) = job.entry() else { return };
         let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);
         if is_root {
             self.root_lost();
@@ -226,12 +226,14 @@ impl Coordinator {
             }
         }
         let not_before = if after_failure { Some(self.now + self.backoff(self.probe_attempts)) } else { None };
-        self.root_probe = Some(PendingRequest {
-            path: crate::path::RelativePath::root(),
-            need: ReadNeed::Metadata,
-            reasons: Reasons::control(),
-            barriers: Vec::new(),
-            designate_for_round: None,
+        self.root_probe = Some(RootProbe {
+            request: PendingRequest {
+                path: crate::path::RelativePath::root(),
+                need: ReadNeed::Metadata,
+                reasons: Reasons::control(),
+                barriers: Vec::new(),
+                designate_for_round: None,
+            },
             not_before,
         });
     }
@@ -240,7 +242,7 @@ impl Coordinator {
         let Some(job) = self.jobs.remove(&id) else {
             return;
         };
-        match job.entry {
+        match job.entry() {
             Some(entry) => {
                 if self.active_by_entry.get(&entry) == Some(&id) {
                     self.active_by_entry.remove(&entry);
@@ -253,10 +255,10 @@ impl Coordinator {
             }
         }
         if let JobPhase::Registering(request) = job.phase {
-            self.registrations.remove(&request);
+            self.abandon_registration(request);
         }
         self.queue_order.retain(|q| *q != id);
-        if let Some(entry) = job.entry {
+        if let Some(entry) = job.entry() {
             self.settle_obligations(&job, &outcome);
             self.settle_commands(&job, &outcome);
             self.settle_retry(entry, &job, &outcome);
@@ -265,7 +267,7 @@ impl Coordinator {
     }
 
     fn settle_obligations(&mut self, job: &ActiveJob, outcome: &JobOutcome) {
-        let Some(entry) = job.entry else { return };
+        let Some(entry) = job.entry() else { return };
         let round_generation = self.round.as_ref().map(|r| r.generation);
         match outcome {
             JobOutcome::Accepted => {
@@ -288,20 +290,19 @@ impl Coordinator {
         if job.reasons.initial_scan {
             match outcome {
                 JobOutcome::Failed(_) | JobOutcome::LimitExceeded | JobOutcome::WatcherRegistrationFailed => {
-                    if let Some((_, state)) = self.initial_scan.obligations.get_mut(&entry)
-                        && *state == ScanObligation::Pending
-                    {
-                        *state = ScanObligation::Unsatisfied;
-                        self.initial_scan.failed.insert(job.path.clone());
-                    }
+                    self.initial_scan.resolve_unsatisfied(entry, job.path.clone());
                 }
-                _ => {}
+                JobOutcome::Accepted
+                | JobOutcome::Removed
+                | JobOutcome::Stale
+                | JobOutcome::Cancelled
+                | JobOutcome::WorkerLost => {}
             }
         }
     }
 
     fn settle_commands(&mut self, job: &ActiveJob, outcome: &JobOutcome) {
-        let Some(entry) = job.entry else { return };
+        let Some(entry) = job.entry() else { return };
         let attached: Vec<CommandId> = job
             .barriers
             .iter()
@@ -334,22 +335,67 @@ impl Coordinator {
         }
     }
 
+    fn retry_phase(need: ReadNeed) -> RetryPhase {
+        match need {
+            ReadNeed::Listing => RetryPhase::Listing,
+            ReadNeed::Metadata => RetryPhase::Metadata,
+        }
+    }
+
+    fn merge_retry(
+        &mut self,
+        entry: EntryId,
+        phase: RetryPhase,
+        attempts: u32,
+        timing: RetryTiming,
+        reasons: Reasons,
+        barriers: &[CommandId],
+    ) {
+        let mut record = RetryRecord { phase, attempts, due: None, reasons, barriers: Vec::new() };
+        let existing = self.entries.take_retry(entry);
+        let retained = match existing {
+            Some(existing) => {
+                record.phase = record.phase.max(existing.phase);
+                record.reasons.merge(existing.reasons);
+                existing.barriers
+            }
+            None => Vec::new(),
+        };
+        let timing = match record.phase {
+            RetryPhase::WatchRegistrationThenListing => RetryTiming::Backoff,
+            RetryPhase::Listing | RetryPhase::Metadata => timing,
+        };
+        record.due = match timing {
+            RetryTiming::Backoff => Some(self.now + self.backoff(record.attempts)),
+            RetryTiming::Untimed => None,
+        };
+        for barrier in barriers.iter().copied().chain(retained) {
+            if self.commands.contains_key(&barrier) && !record.barriers.contains(&barrier) {
+                record.barriers.push(barrier);
+            }
+        }
+        self.entries.set_retry(entry, record);
+    }
+
     fn settle_retry(&mut self, entry: EntryId, job: &ActiveJob, outcome: &JobOutcome) {
         let represented = self.snapshot.get_by_id(entry).cloned();
         match outcome {
             JobOutcome::Accepted | JobOutcome::Removed => {
-                let state = self.entry_state_mut(entry);
-                state.transient_failures = 0;
-                let clear = match (&state.retry, job.need) {
+                let clear = match (self.entries.retry(entry).map(|r| r.phase), job.need) {
                     (Some(_), ReadNeed::Listing) => true,
-                    (Some(record), ReadNeed::Metadata) => record.phase == RetryPhase::Metadata,
+                    (Some(phase), ReadNeed::Metadata) => phase == RetryPhase::Metadata,
                     (None, _) => false,
                 };
                 if clear {
-                    state.retry = None;
+                    self.entries.clear_retry(entry);
                 }
-                if job.need == ReadNeed::Listing || state.retry.is_none() {
-                    state.degraded = None;
+                let Some(state) = self.entries.get_mut(entry) else {
+                    return;
+                };
+                state.transient_failures = 0;
+                let recovered = job.need == ReadNeed::Listing || state.retry().is_none();
+                if recovered {
+                    self.entries.set_degraded(entry, None);
                 }
             }
             JobOutcome::Failed(err) => {
@@ -367,62 +413,52 @@ impl Coordinator {
                     _ => DegradedCause::Transient,
                 };
                 let threshold = self.config.transient_degrade_threshold;
-                let attempts =
-                    self.entry_state(entry).and_then(|s| s.retry.as_ref()).map(|r| r.attempts + 1).unwrap_or(1);
-                let timed = matches!(err, FsError::Transient(_)) || !loaded;
-                let due = if timed { Some(self.now + self.backoff(attempts)) } else { None };
+                let attempts = self.entries.retry(entry).map(|r| r.attempts + 1).unwrap_or(1);
+                let timing = if matches!(err, FsError::Transient(_)) || !loaded {
+                    RetryTiming::Backoff
+                } else {
+                    RetryTiming::Untimed
+                };
                 let state = self.entry_state_mut(entry);
-                match cause {
+                let degraded = match cause {
                     DegradedCause::Transient => {
                         state.transient_failures += 1;
-                        if state.transient_failures >= threshold {
-                            state.degraded = Some(DegradedCause::Transient);
-                        }
+                        (state.transient_failures >= threshold).then_some(DegradedCause::Transient)
                     }
-                    other => state.degraded = Some(other),
+                    other => Some(other),
+                };
+                if degraded.is_some() {
+                    self.entries.set_degraded(entry, degraded);
                 }
-                let mut reasons = job.reasons;
-                reasons.baseline = false;
-                reasons.priority = false;
-                state.retry = Some(RetryRecord {
-                    phase: if job.need == ReadNeed::Listing { RetryPhase::Listing } else { RetryPhase::Metadata },
+                self.merge_retry(
+                    entry,
+                    Self::retry_phase(job.need),
                     attempts,
-                    due,
-                    reasons,
-                    barriers: Vec::new(),
-                });
+                    timing,
+                    job.reasons.for_retry(),
+                    &job.barriers,
+                );
             }
             JobOutcome::LimitExceeded => {
                 self.push_error(job.path.clone(), Operation::Listing, crate::update::ErrorCause::LimitExceeded);
                 let Some(current) = represented else { return };
                 let loaded = current.is_loaded();
-                let attempts =
-                    self.entry_state(entry).and_then(|s| s.retry.as_ref()).map(|r| r.attempts + 1).unwrap_or(1);
-                let due = if loaded { None } else { Some(self.now + self.backoff(attempts)) };
-                let mut reasons = job.reasons;
-                reasons.baseline = false;
-                reasons.priority = false;
-                let state = self.entry_state_mut(entry);
-                state.degraded = Some(DegradedCause::LimitExceeded);
-                state.retry =
-                    Some(RetryRecord { phase: RetryPhase::Listing, attempts, due, reasons, barriers: Vec::new() });
+                let attempts = self.entries.retry(entry).map(|r| r.attempts + 1).unwrap_or(1);
+                let timing = if loaded { RetryTiming::Untimed } else { RetryTiming::Backoff };
+                self.merge_retry(entry, RetryPhase::Listing, attempts, timing, job.reasons.for_retry(), &job.barriers);
+                self.entries.set_degraded(entry, Some(DegradedCause::LimitExceeded));
             }
             JobOutcome::WatcherRegistrationFailed => {
-                let attempts =
-                    self.entry_state(entry).and_then(|s| s.retry.as_ref()).map(|r| r.attempts + 1).unwrap_or(1);
-                let due = Some(self.now + self.backoff(attempts));
-                let mut reasons = job.reasons;
-                reasons.baseline = false;
-                reasons.priority = false;
-                let state = self.entry_state_mut(entry);
-                state.degraded = Some(DegradedCause::WatcherRegistration);
-                state.retry = Some(RetryRecord {
-                    phase: RetryPhase::WatchRegistrationThenListing,
+                let attempts = self.entries.retry(entry).map(|r| r.attempts + 1).unwrap_or(1);
+                self.merge_retry(
+                    entry,
+                    RetryPhase::WatchRegistrationThenListing,
                     attempts,
-                    due,
-                    reasons,
-                    barriers: Vec::new(),
-                });
+                    RetryTiming::Backoff,
+                    job.reasons.for_retry(),
+                    &job.barriers,
+                );
+                self.entries.set_degraded(entry, Some(DegradedCause::WatcherRegistration));
             }
             JobOutcome::WorkerLost => {
                 self.push_error(
@@ -434,29 +470,15 @@ impl Coordinator {
                 if !Self::still_required(&current, job.need) {
                     return;
                 }
-                let attempts =
-                    self.entry_state(entry).and_then(|s| s.retry.as_ref()).map(|r| r.attempts + 1).unwrap_or(1);
-                let due = Some(self.now + self.backoff(attempts));
-                let mut reasons = job.reasons;
-                reasons.baseline = false;
-                reasons.priority = false;
-                let mut barriers = job.barriers.clone();
-                let state = self.entry_state_mut(entry);
-                if let Some(existing) = state.retry.take() {
-                    reasons.merge(existing.reasons);
-                    for barrier in existing.barriers {
-                        if !barriers.contains(&barrier) {
-                            barriers.push(barrier);
-                        }
-                    }
-                }
-                state.retry = Some(RetryRecord {
-                    phase: if job.need == ReadNeed::Listing { RetryPhase::Listing } else { RetryPhase::Metadata },
+                let attempts = self.entries.retry(entry).map(|r| r.attempts + 1).unwrap_or(1);
+                self.merge_retry(
+                    entry,
+                    Self::retry_phase(job.need),
                     attempts,
-                    due,
-                    reasons,
-                    barriers,
-                });
+                    RetryTiming::Backoff,
+                    job.reasons.for_retry(),
+                    &job.barriers,
+                );
             }
             JobOutcome::Stale | JobOutcome::Cancelled => {
                 let Some(current) = represented else { return };
@@ -473,7 +495,6 @@ impl Coordinator {
                         reasons,
                         barriers: job.barriers.clone(),
                         designate_for_round: None,
-                        not_before: None,
                     },
                 );
             }
@@ -487,22 +508,35 @@ impl Coordinator {
         }
     }
 
+    fn abandon_registration(&mut self, request: WatchRequestId) {
+        if let Some(target) = self.registrations.get_mut(&request) {
+            *target = RegistrationTarget::Abandoned;
+        }
+    }
+
+    pub(super) fn release_watch(&mut self, result: Result<WatchId, ErrorCause>) {
+        if let Ok(watch) = result {
+            self.outputs.push(Output::Unwatch(watch));
+        }
+    }
+
     pub(super) fn on_watch_registered(&mut self, request: WatchRequestId, result: Result<WatchId, ErrorCause>) {
-        let Some(target) = self.registrations.remove(&request) else {
-            return;
-        };
+        let target = self.registrations.remove(&request).unwrap_or(RegistrationTarget::Abandoned);
         match target {
+            RegistrationTarget::Abandoned => self.release_watch(result),
             RegistrationTarget::Job(job_id) => {
                 let Some(job) = self.jobs.get(&job_id).cloned() else {
-                    if let Ok(watch) = result {
-                        self.outputs.push(Output::Unwatch(watch));
-                    }
+                    self.release_watch(result);
                     return;
                 };
                 if job.phase != JobPhase::Registering(request) {
+                    self.release_watch(result);
                     return;
                 }
-                let Some(entry) = job.entry else { return };
+                let Some(entry) = job.entry() else {
+                    self.release_watch(result);
+                    return;
+                };
                 let is_root = job.path.is_root();
                 match result {
                     Ok(watch) => {
@@ -510,6 +544,7 @@ impl Coordinator {
                         if let Some(dir) = self.dir_state_mut(entry) {
                             dir.watch = WatchState::Registered(watch);
                         }
+                        self.entries.advance_watch_phase(entry);
                         if is_root {
                             self.watcher_health = WatcherHealth::Healthy { backend: self.caps.watcher };
                             if self.open_gate == OpenGate::Pending {
@@ -546,14 +581,16 @@ impl Coordinator {
             }
             RegistrationTarget::Standalone(entry) => match result {
                 Ok(watch) => {
-                    self.watches.push(watch);
                     let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);
-                    if let Some(dir) = self.dir_state_mut(entry) {
-                        dir.watch = WatchState::Registered(watch);
-                    } else {
-                        self.outputs.push(Output::Unwatch(watch));
-                        return;
+                    match self.dir_state_mut(entry) {
+                        Some(dir) => dir.watch = WatchState::Registered(watch),
+                        None => {
+                            self.outputs.push(Output::Unwatch(watch));
+                            return;
+                        }
                     }
+                    self.watches.push(watch);
+                    self.entries.advance_watch_phase(entry);
                     if is_root || self.caps.watcher.is_per_directory() {
                         self.watcher_health = WatcherHealth::Healthy { backend: self.caps.watcher };
                         self.watcher_restart_attempts = 0;

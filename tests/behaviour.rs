@@ -5,7 +5,7 @@ use std::time::Duration;
 use tree_fucker::core::Command;
 use tree_fucker::fs::{DirectoryListing, EntryInfo, FsCapabilities};
 use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
-use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness};
+use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness, InjectedPosition};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RoundResult, UpdateEvent, WatcherHealth};
 use tree_fucker::{
     CaseSensitivity, Config, EntryKind, Error, FsError, LoadAll, LoadState, PathChange, PathPredicate, PolicyRevision,
@@ -357,6 +357,173 @@ fn case_only_rename_without_stable_identity_replaces_the_entry() {
 }
 
 #[test]
+fn case_colliding_children_keep_the_directory_converging() {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("src");
+    fs.create_file("src/README.md", 1);
+    fs.create_file("src/readme.md", 2);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert_eq!(h.entry("src").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert_eq!(h.entry("src/readme.md").map(|e| e.path.to_string()), Some("src/README.md".into()));
+    let duplicates: Vec<&ErrorCause> = h
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Delta(update) => Some(&update.errors),
+            UpdateEvent::Health { errors, .. } => Some(errors),
+            _ => None,
+        })
+        .flatten()
+        .map(|e| &e.error)
+        .filter(|e| matches!(e, ErrorCause::DuplicateName(_)))
+        .collect();
+    assert_eq!(duplicates.len(), 1);
+    fs.create_file("src/main.rs", 3);
+    let t = h.command(Command::Refresh(vec![path("src")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(h.paths().contains(&"src/main.rs".to_string()));
+    h.run_round();
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+    assert!(h.health().reconciliation.degraded_paths.is_empty());
+}
+
+fn collision_survivor(enumerated_first: &str, enumerated_second: &str) -> String {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("src");
+    fs.create_file(&format!("src/{enumerated_first}"), 1);
+    fs.inject_child("src", enumerated_second, EntryKind::File);
+    let mut h = Harness::open_default(fs, Arc::new(LoadAll));
+    h.run_until_idle();
+    h.entry("src/readme.md").expect("collision survivor").path.to_string()
+}
+
+#[test]
+fn the_surviving_case_collision_does_not_depend_on_enumeration_order() {
+    assert_eq!(collision_survivor("readme.md", "README.md"), "src/README.md");
+    assert_eq!(collision_survivor("README.md", "readme.md"), "src/README.md");
+}
+
+fn repeated_name_survivor(inject_before_create: bool) -> Option<u64> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("src");
+    if inject_before_create {
+        fs.inject_child("src", "readme.md", EntryKind::File);
+        fs.create_file("src/readme.md", 7);
+    } else {
+        fs.create_file("src/readme.md", 7);
+        fs.inject_child("src", "readme.md", EntryKind::File);
+    }
+    let mut h = Harness::open_default(fs, Arc::new(LoadAll));
+    h.run_until_idle();
+    h.entry("src/readme.md").expect("collision survivor").metadata.size
+}
+
+#[test]
+fn a_repeated_name_survives_by_content_rather_than_listing_position() {
+    assert_eq!(repeated_name_survivor(false), Some(7));
+    assert_eq!(repeated_name_survivor(true), Some(0));
+}
+
+fn repeated_name_kind_survivor(populate: impl Fn(&FakeFileSystem)) -> Option<EntryKind> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    populate(&fs);
+    let mut h = Harness::open_default(fs, Arc::new(LoadAll));
+    let root = h.pending_job_for("").expect("root listing").id;
+    assert!(h.complete_job(root));
+    let directory = h.pending_job_for("a").expect("directory listing").id;
+    assert!(h.complete_job(directory));
+    h.entry("a/b").map(|e| e.kind())
+}
+
+#[test]
+fn a_repeated_name_keeps_the_directory_regardless_of_enumeration_order() {
+    let kept = Some(EntryKind::Directory);
+    assert_eq!(
+        repeated_name_kind_survivor(|fs| {
+            fs.create_file("a/b", 3);
+            fs.inject_child("a", "b", EntryKind::Directory);
+        }),
+        kept
+    );
+    assert_eq!(
+        repeated_name_kind_survivor(|fs| {
+            fs.inject_child("a", "b", EntryKind::File);
+            fs.inject_child("a", "b", EntryKind::Directory);
+        }),
+        kept
+    );
+    assert_eq!(
+        repeated_name_kind_survivor(|fs| {
+            fs.inject_child("a", "b", EntryKind::Directory);
+            fs.inject_child("a", "b", EntryKind::File);
+        }),
+        kept
+    );
+}
+
+#[test]
+fn a_repeated_name_with_two_kinds_keeps_the_directory() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    fs.inject_child("a", "b", EntryKind::File);
+    fs.set_injected_position(InjectedPosition::First);
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.entry("a/b").map(|e| e.kind()), Some(EntryKind::Directory));
+    assert!(h.paths().contains(&"a/b/f1".to_string()));
+}
+
+#[test]
+fn a_case_collision_relisted_publishes_no_further_changes() {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("src");
+    fs.create_file("src/readme.md", 1);
+    fs.inject_child("src", "README.md", EntryKind::File);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let first = h.entry("src/readme.md").expect("collision survivor");
+    h.take_events();
+    h.run_round();
+    let again = h.entry("src/readme.md").expect("collision survivor");
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.path, first.path);
+    assert_eq!(published_changes(&h), Vec::new());
+}
+
+#[test]
+fn a_rejected_listing_publishes_no_duplicate_name_error() {
+    let fs = case_insensitive_fs(true);
+    fs.mkdir("src");
+    fs.create_file("src/README.md", 1);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    h.take_events();
+    fs.inject_child("src", "readme.md", EntryKind::File);
+    fs.inject_child("src", "..", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("src")]));
+    h.run_until_idle();
+    assert!(matches!(h.result(t), Some(Err(_))), "{:?}", h.result(t));
+    let causes: Vec<&ErrorCause> = h
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            UpdateEvent::Delta(update) => Some(&update.errors),
+            UpdateEvent::Health { errors, .. } => Some(errors),
+            _ => None,
+        })
+        .flatten()
+        .map(|e| &e.error)
+        .collect();
+    assert_eq!(causes.iter().filter(|e| matches!(e, ErrorCause::DuplicateName(_))).count(), 0, "{causes:?}");
+    assert_eq!(causes.iter().filter(|e| matches!(e, ErrorCause::InvalidName(_))).count(), 1, "{causes:?}");
+}
+
+#[test]
 fn case_only_rename_with_a_different_identity_replaces_the_subtree() {
     let fs = case_insensitive_fs(true);
     fs.mkdir("Docs");
@@ -544,4 +711,196 @@ fn lost_registration_worker_is_reported_and_the_listing_proceeds_without_a_watch
     assert_eq!(fs.count_ops(FakeOp::ReadDir, "c"), 1);
     assert_eq!(h.entry("c").and_then(|e| e.load_state()), Some(LoadState::Loaded));
     assert_eq!(fs.watch_count(), 3);
+}
+
+#[test]
+fn a_removed_degraded_initial_scan_path_lets_the_scan_complete() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.mkdir("a/x");
+    fs.mkdir("b");
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert!(matches!(h.health().initial_scan, InitialScanState::Degraded { .. }), "{:?}", h.health().initial_scan);
+    fs.remove_silently("a/x");
+    fs.remove_silently("a");
+    fs.clear_failures();
+    let t = h.command(Command::Refresh(vec![path("")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(!h.paths().contains(&"a".to_string()), "{:?}", h.paths());
+    assert!(matches!(h.health().initial_scan, InitialScanState::Complete { .. }), "{:?}", h.health().initial_scan);
+    let t = h.command(Command::InitialScanComplete);
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+}
+
+#[test]
+fn a_recovered_initial_scan_path_leaves_the_degraded_set() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.mkdir("a/c");
+    fs.create_file("a/c/f", 1);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    fs.fail("a/c", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    for _ in 0..8 {
+        h.advance(Duration::from_secs(30));
+    }
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    let failed = match h.health().initial_scan {
+        InitialScanState::Degraded { failed, .. } => failed,
+        other => panic!("{other:?}"),
+    };
+    let names: Vec<String> = failed.iter().map(|p| p.to_string()).collect();
+    assert_eq!(names, vec!["a/c".to_string()]);
+    let t = h.command(Command::InitialScanComplete);
+    h.run_until_idle();
+    match h.result(t) {
+        Some(Err(Error::InitialScanDegraded(paths))) => {
+            assert_eq!(paths.iter().map(|p| p.to_string()).collect::<Vec<String>>(), vec!["a/c".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_accepted_refresh_listing_resolves_a_degraded_initial_scan_obligation() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.create_file("a/f", 1);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert!(matches!(h.health().initial_scan, InitialScanState::Degraded { .. }), "{:?}", h.health().initial_scan);
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert!(h.paths().contains(&"a/f".to_string()), "{:?}", h.paths());
+    assert!(matches!(h.health().initial_scan, InitialScanState::Complete { .. }), "{:?}", h.health().initial_scan);
+    let t = h.command(Command::InitialScanComplete);
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    h.advance(Duration::from_secs(600));
+    assert!(matches!(h.health().initial_scan, InitialScanState::Complete { .. }), "{:?}", h.health().initial_scan);
+}
+
+#[test]
+fn a_registration_landing_after_job_cancellation_releases_the_watch() {
+    let fs = populated(WatcherKind::NonRecursive);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.auto_register = false;
+    let root_job = h.pending_job_for("").expect("root listing");
+    h.complete_job(root_job.id);
+    let (request, watch_path, recursive) = h.take_registration("c").expect("c registration");
+    assert_eq!(fs.watch_count(), 1);
+    let t = h.command(Command::Unload(path("c")));
+    assert_eq!(h.result(t), Some(Ok(())));
+    h.complete_registration(request, &watch_path, recursive);
+    assert_eq!(fs.watch_count(), 1, "unwatched {:?}", h.unwatched());
+}
+
+#[test]
+fn a_registration_landing_after_shutdown_releases_the_watch() {
+    let fs = populated(WatcherKind::NonRecursive);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.auto_register = false;
+    let root_job = h.pending_job_for("").expect("root listing");
+    h.complete_job(root_job.id);
+    let (request, watch_path, recursive) = h.take_registration("c").expect("c registration");
+    let t = h.command(Command::Shutdown);
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(fs.watch_count(), 0);
+    h.complete_registration(request, &watch_path, recursive);
+    assert_eq!(fs.watch_count(), 0, "unwatched {:?}", h.unwatched());
+}
+
+#[test]
+fn a_registration_landing_after_root_loss_releases_the_watch() {
+    let fs = populated(WatcherKind::NonRecursive);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    h.auto_register = false;
+    let unload = h.command(Command::Unload(path("c")));
+    assert_eq!(h.result(unload), Some(Ok(())));
+    fs.remove_root();
+    let refresh_a = h.command(Command::Refresh(vec![path("a")]));
+    let load_c = h.command(Command::Load(path("c")));
+    let refresh_root = h.command(Command::Refresh(vec![path("")]));
+    let a_job = h.pending_job_for("a").expect("a listing");
+    h.complete_job(a_job.id);
+    assert_eq!(h.result(refresh_a), Some(Ok(())));
+    let (request, watch_path, recursive) = h.take_registration("c").expect("c registration");
+    let root_job = h.pending_job_for("").expect("root listing");
+    h.complete_job(root_job.id);
+    assert_eq!(h.result(refresh_root), Some(Err(Error::RootUnavailable)));
+    assert_eq!(h.result(load_c), Some(Err(Error::RootUnavailable)));
+    assert_eq!(fs.watch_count(), 0);
+    h.complete_registration(request, &watch_path, recursive);
+    assert_eq!(fs.watch_count(), 0, "unwatched {:?}", h.unwatched());
+}
+
+#[test]
+fn a_refresh_recovering_an_initial_scan_path_traverses_the_subtree_it_hid() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.mkdir("a/c");
+    fs.create_file("a/c/f", 1);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    fs.fail("a/c", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert!(matches!(h.health().initial_scan, InitialScanState::Degraded { .. }), "{:?}", h.health().initial_scan);
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert_eq!(h.entry("a/c").and_then(|e| e.load_state()), Some(LoadState::Loading));
+    let failed = match h.health().initial_scan {
+        InitialScanState::Degraded { failed, .. } => failed,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(failed.iter().map(|p| p.to_string()).collect::<Vec<String>>(), vec!["a/c".to_string()]);
+    let t = h.command(Command::InitialScanComplete);
+    h.run_until_idle();
+    match h.result(t) {
+        Some(Err(Error::InitialScanDegraded(paths))) => {
+            assert_eq!(paths.iter().map(|p| p.to_string()).collect::<Vec<String>>(), vec!["a/c".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_standalone_registration_landing_after_its_directory_vanishes_releases_the_watch_once() {
+    let fs = populated(WatcherKind::NonRecursive);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert_eq!(fs.watch_count(), 4);
+    h.auto_register = false;
+    h.inject_watcher_event(tree_fucker::fs::WatcherEvent::Failed { message: "backend gone".into() });
+    assert_eq!(fs.watch_count(), 0);
+    for _ in 0..10 {
+        if h.pending_registrations().iter().any(|(_, p, _)| *p == path("c")) {
+            break;
+        }
+        h.advance(Duration::from_secs(5));
+    }
+    let (request, watch_path, recursive) = h.take_registration("c").expect("c restart registration");
+    fs.remove_silently("c");
+    let t = h.command(Command::Refresh(vec![path("")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(!h.paths().contains(&"c".to_string()), "{:?}", h.paths());
+    h.complete_registration(request, &watch_path, recursive);
+    assert_eq!(fs.watch_count(), 0);
+    let t = h.command(Command::Shutdown);
+    assert_eq!(h.result(t), Some(Ok(())));
+    let mut seen = std::collections::HashSet::new();
+    for id in h.unwatched() {
+        assert!(seen.insert(*id), "watch released twice: {id:?} in {:?}", h.unwatched());
+    }
 }

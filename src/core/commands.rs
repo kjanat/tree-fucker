@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::types::*;
-use super::{Command, Coordinator, Output};
+use super::{Command, Coordinator, Output, TerminalOutcome};
 use crate::entry::{LoadState, Shape};
 use crate::error::Error;
 use crate::ids::*;
@@ -308,7 +308,7 @@ impl Coordinator {
         let health = self.compute_health();
         self.outputs.push(Output::Publish(UpdateEvent::Terminal { health }));
         self.outputs.push(Output::CommandFinished { id, result: Ok(()) });
-        self.outputs.push(Output::Stopped);
+        self.outputs.push(Output::Stopped(TerminalOutcome::ShutDown));
     }
 
     pub(super) fn finish_command(&mut self, id: CommandId, result: Result<(), Error>) {
@@ -321,7 +321,10 @@ impl Coordinator {
         let RootState::Available { .. } = self.root else {
             return;
         };
-        let settled = !self.traversal_in_progress() && !self.initial_scan.any_pending();
+        if self.initial_scan.foreground_done && self.initial_scan.waiters.is_empty() {
+            return;
+        }
+        let settled = !self.initial_scan.any_pending() && !self.traversal_in_progress();
         if !settled {
             return;
         }
@@ -331,7 +334,7 @@ impl Coordinator {
             return;
         }
         let result = if self.initial_scan.any_unsatisfied() {
-            Err(Error::InitialScanDegraded(self.initial_scan.failed.clone()))
+            Err(Error::InitialScanDegraded(self.initial_scan.failed_paths()))
         } else {
             Ok(())
         };
@@ -402,7 +405,7 @@ impl Coordinator {
                 }
             }
             CommandState::InvalidatePolicy { remaining } => {
-                if remaining.get(&entry).copied() == job.guards.load_generation {
+                if remaining.get(&entry).copied() == job.target.load_generation() {
                     remaining.remove(&entry);
                 }
                 if remaining.is_empty() {

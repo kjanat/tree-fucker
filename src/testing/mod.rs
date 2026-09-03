@@ -2,6 +2,6 @@ pub mod fake_fs;
 pub mod harness;
 pub mod runtime;
 
-pub use fake_fs::{FailureMode, FakeFileSystem, FakeOp};
+pub use fake_fs::{FailureMode, FakeFileSystem, FakeOp, InjectedPosition};
 pub use harness::{Harness, Ticket};
-pub use runtime::DeterministicRuntime;
+pub use runtime::{BlockingMode, DeterministicRuntime};

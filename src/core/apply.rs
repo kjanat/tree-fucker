@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use super::types::*;
 use super::{Coordinator, Output};
@@ -29,6 +31,37 @@ enum ChildBinding {
     Replaced,
 }
 
+struct Chosen {
+    name: OsString,
+    path: RelativePath,
+    info: EntryInfo,
+}
+
+type CollisionKey<'a> =
+    (&'a OsString, u8, Option<(u64, u64)>, Option<SystemTime>, Option<SystemTime>, Option<u64>, Option<u32>);
+
+fn kind_rank(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::Directory => 0,
+        EntryKind::File => 1,
+        EntryKind::Symlink => 2,
+        EntryKind::Other => 3,
+    }
+}
+
+fn collision_key(candidate: &Chosen) -> CollisionKey<'_> {
+    let metadata = candidate.info.metadata;
+    (
+        &candidate.name,
+        kind_rank(candidate.info.kind),
+        candidate.info.identity.map(|id| (id.device, id.inode)),
+        metadata.modified,
+        metadata.created,
+        metadata.size,
+        metadata.permissions,
+    )
+}
+
 #[derive(Default)]
 pub(super) struct Effects {
     pub new_loading: Vec<(EntryId, RelativePath, Reasons)>,
@@ -46,7 +79,7 @@ impl Coordinator {
         job: &ActiveJob,
         listing: DirectoryListing,
     ) -> Result<(), ListingRejection> {
-        let Some(dir_id) = job.entry else {
+        let Some(dir_id) = job.entry() else {
             return Ok(());
         };
         let Some(dir) = self.snapshot.get_by_id(dir_id).cloned() else {
@@ -55,9 +88,10 @@ impl Coordinator {
         let fields = self.config.metadata_fields;
         let case = self.caps.case;
         let dir_key = self.snapshot.key(&dir.path);
-        let mut seen: HashSet<PathKey> = HashSet::new();
-        let mut children: Vec<(RelativePath, PathKey, EntryInfo)> = Vec::with_capacity(listing.entries.len());
+        let mut order: Vec<PathKey> = Vec::with_capacity(listing.entries.len());
+        let mut chosen: HashMap<PathKey, Chosen> = HashMap::with_capacity(listing.entries.len());
         let mut malformed: Vec<ErrorCause> = Vec::new();
+        let mut duplicates: Vec<OsString> = Vec::new();
         for DirEntry { name, info } in &listing.entries {
             let (path, key) = match (dir.path.join(name), dir_key.child(name, case)) {
                 (Ok(path), Ok(key)) => (path, key),
@@ -66,11 +100,20 @@ impl Coordinator {
                     continue;
                 }
             };
-            if !seen.insert(key.clone()) {
-                malformed.push(ErrorCause::DuplicateName(name.clone()));
-                continue;
+            let candidate = Chosen { name: name.clone(), path, info: *info };
+            match chosen.get_mut(&key) {
+                Some(kept) => {
+                    if collision_key(&candidate) < collision_key(kept) {
+                        duplicates.push(std::mem::replace(kept, candidate).name);
+                    } else {
+                        duplicates.push(candidate.name);
+                    }
+                }
+                None => {
+                    order.push(key.clone());
+                    chosen.insert(key, candidate);
+                }
             }
-            children.push((path, key, *info));
         }
         if !malformed.is_empty() {
             for cause in malformed {
@@ -78,9 +121,11 @@ impl Coordinator {
             }
             return Err(ListingRejection::MalformedNames);
         }
-        if children.len() > self.config.entries_per_directory {
+        if order.len() > self.config.entries_per_directory {
             return Err(ListingRejection::LimitExceeded);
         }
+        let children: Vec<(RelativePath, PathKey, EntryInfo)> =
+            order.into_iter().filter_map(|key| chosen.remove(&key).map(|kept| (kept.path, key, kept.info))).collect();
         let mut builder = self.snapshot.builder();
         let mut effects = Effects::default();
         let was_loading = dir.shape == Shape::Directory(LoadState::Loading);
@@ -109,26 +154,22 @@ impl Coordinator {
             builder.children(dir_id).into_iter().map(|e| (e.path.key(case), e)).collect();
         let mut seen_ids: HashSet<EntryId> = HashSet::new();
         for (path, key, info) in children {
-            match existing.get(&key) {
-                Some(old) => {
-                    seen_ids.insert(old.id);
-                    match self.bind_child(old, &path, &info) {
-                        ChildBinding::Replaced => {
-                            effects.removed.extend(builder.remove_subtree(old.id));
-                            self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
-                        }
-                        ChildBinding::Renamed => {
-                            let _ = builder.rename_subtree(old.id, path.clone());
-                            let observed = Observed { path: &path, info };
-                            self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
-                        }
-                        ChildBinding::Retained => {
-                            let observed = Observed { path: &path, info };
-                            self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
-                        }
-                    }
-                }
-                None => self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit),
+            let Some(old) = existing.get(&key) else {
+                self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
+                continue;
+            };
+            seen_ids.insert(old.id);
+            let bound = match self.bind_child(old, &path, &info) {
+                ChildBinding::Retained => true,
+                ChildBinding::Renamed => builder.rename_subtree(old.id, path.clone()).is_ok(),
+                ChildBinding::Replaced => false,
+            };
+            if bound {
+                let observed = Observed { path: &path, info };
+                self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
+            } else {
+                effects.removed.extend(builder.remove_subtree(old.id));
+                self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
             }
         }
         for old in existing.values() {
@@ -141,6 +182,10 @@ impl Coordinator {
         }
         if builder.len() > self.config.represented_entries {
             return Err(ListingRejection::LimitExceeded);
+        }
+        duplicates.sort();
+        for name in duplicates {
+            self.push_error(dir.path.clone(), Operation::Listing, ErrorCause::DuplicateName(name));
         }
         self.commit(builder, effects, Some(job));
         Ok(())
@@ -414,7 +459,7 @@ impl Coordinator {
     }
 
     pub(super) fn commit_metadata(&mut self, job: &ActiveJob, info: EntryInfo) -> JobOutcome {
-        let Some(id) = job.entry else {
+        let Some(id) = job.entry() else {
             return JobOutcome::Accepted;
         };
         let Some(entry) = self.snapshot.get_by_id(id).cloned() else {
@@ -483,17 +528,13 @@ impl Coordinator {
             if let Some(dir) = self.dir_state_mut(*id) {
                 dir.load_generation = dir.load_generation.next();
                 dir.context = None;
-                dir.last_covered = None;
                 if excluded {
                     dir.override_load = None;
                 }
             }
+            self.entries.mark_unloaded(*id);
             self.set_obligation(*id, ObligationState::Removed);
-            if let Some((_, state)) = self.initial_scan.obligations.get_mut(id)
-                && *state == ScanObligation::Pending
-            {
-                *state = ScanObligation::Removed;
-            }
+            self.initial_scan.resolve_removed(*id);
             self.commands_entry_unloaded(*id, excluded);
         }
         for id in &effects.kind_changed {
@@ -502,20 +543,9 @@ impl Coordinator {
             }
             let now_directory = self.snapshot.get_by_id(*id).map(|e| e.is_directory()).unwrap_or(false);
             self.invalidate_directory_work(*id, current_job);
-            let state = self.entry_state_mut(*id);
-            if now_directory {
-                if state.dir.is_none() {
-                    state.dir = Some(DirState::default());
-                }
-            } else {
-                state.dir = None;
-            }
+            self.entries.set_directory(*id, now_directory);
             self.set_obligation(*id, ObligationState::Removed);
-            if let Some((_, state)) = self.initial_scan.obligations.get_mut(id)
-                && *state == ScanObligation::Pending
-            {
-                *state = ScanObligation::Removed;
-            }
+            self.initial_scan.resolve_removed(*id);
             self.commands_kind_changed(*id, job);
         }
         for id in &effects.loaded {
@@ -523,11 +553,9 @@ impl Coordinator {
             if let Some(dir) = self.dir_state_mut(*id) {
                 dir.load_generation = dir.load_generation.next();
             }
-            if let Some((generation, state)) = self.initial_scan.obligations.get_mut(id)
-                && *state == ScanObligation::Pending
-                && Some(*generation) == previous_generation
-            {
-                *state = ScanObligation::Accepted;
+            self.entries.mark_loaded(*id);
+            if let Some(generation) = previous_generation {
+                self.initial_scan.resolve_accepted(*id, generation);
             }
         }
         for (id, ctx) in effects.contexts {
@@ -540,7 +568,7 @@ impl Coordinator {
             }
         }
         for id in &touched {
-            if self.snapshot.contains_id(*id) && !self.entries.contains_key(id) {
+            if self.snapshot.contains_id(*id) && !self.entries.contains(*id) {
                 let is_dir = self.snapshot.get_by_id(*id).map(|e| e.is_directory()).unwrap_or(false);
                 self.entries.insert(*id, if is_dir { EntryState::directory() } else { EntryState::default() });
             }
@@ -549,17 +577,14 @@ impl Coordinator {
             if removed_ids.contains(&id) {
                 continue;
             }
-            let state = self.entry_state_mut(id);
-            if state.dir.is_none() {
-                state.dir = Some(DirState::default());
-            }
-            if let Some(dir) = state.dir.as_mut() {
+            self.entries.set_directory(id, true);
+            if let Some(dir) = self.dir_state_mut(id) {
                 dir.load_generation = dir.load_generation.next();
                 dir.context = None;
             }
             let load_generation = self.dir_state(id).map(|d| d.load_generation).unwrap_or_default();
             if reasons.initial_scan {
-                self.initial_scan.obligations.insert(id, (load_generation, ScanObligation::Pending));
+                self.initial_scan.record_pending(id, load_generation);
             }
             let mut request_reasons = Reasons::control();
             request_reasons.merge(reasons);
@@ -613,17 +638,16 @@ impl Coordinator {
             self.cancel_job(job_id);
         }
         self.pending.remove(&id);
-        if let Some(state) = self.entries.get_mut(&id) {
-            state.retry = None;
-            state.degraded = None;
-            if let Some(dir) = state.dir.as_mut()
-                && let WatchState::Registered(watch) = dir.watch
-                && self.caps.watcher.is_per_directory()
-            {
-                self.outputs.push(Output::Unwatch(watch));
-                self.watches.retain(|w| *w != watch);
-                dir.watch = WatchState::NotRegistered;
-            }
+        self.entries.clear_retry(id);
+        self.entries.set_degraded(id, None);
+        if let Some(state) = self.entries.get_mut(id)
+            && let Some(dir) = state.dir_mut()
+            && let WatchState::Registered(watch) = dir.watch
+            && self.caps.watcher.is_per_directory()
+        {
+            self.outputs.push(Output::Unwatch(watch));
+            self.watches.retain(|w| *w != watch);
+            dir.watch = WatchState::NotRegistered;
         }
     }
 
@@ -636,8 +660,8 @@ impl Coordinator {
             }
         }
         self.pending.remove(&id);
-        if let Some(state) = self.entries.remove(&id)
-            && let Some(dir) = state.dir
+        if let Some(state) = self.entries.remove(id)
+            && let Some(dir) = state.dir()
             && let WatchState::Registered(watch) = dir.watch
             && self.caps.watcher.is_per_directory()
         {
@@ -645,11 +669,7 @@ impl Coordinator {
             self.watches.retain(|w| *w != watch);
         }
         self.set_obligation(id, ObligationState::Removed);
-        if let Some((_, state)) = self.initial_scan.obligations.get_mut(&id)
-            && *state == ScanObligation::Pending
-        {
-            *state = ScanObligation::Removed;
-        }
+        self.initial_scan.resolve_removed(id);
     }
 
     pub(super) fn root_lost(&mut self) {

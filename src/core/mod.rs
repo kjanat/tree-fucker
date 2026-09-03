@@ -5,6 +5,9 @@ mod scheduler;
 mod types;
 mod watcher;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +74,12 @@ pub enum Input {
     Timer(TimerId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    ShutDown,
+    Terminated,
+}
+
 #[derive(Clone, Debug)]
 pub enum Output {
     StartJob(JobSpec),
@@ -80,7 +89,7 @@ pub enum Output {
     Publish(UpdateEvent),
     CommandFinished { id: CommandId, result: Result<(), Error> },
     SetTimer { id: TimerId, at: MonotonicTime },
-    Stopped,
+    Stopped(TerminalOutcome),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,9 +134,9 @@ pub struct Coordinator {
     root: RootState,
     root_seed: Option<PolicyContext>,
     initial_scan: InitialScan,
-    entries: HashMap<EntryId, EntryState>,
+    entries: EntryStates,
     pending: HashMap<EntryId, PendingRequest>,
-    root_probe: Option<PendingRequest>,
+    root_probe: Option<RootProbe>,
     probe_attempts: u32,
     jobs: HashMap<JobId, ActiveJob>,
     active_by_entry: HashMap<EntryId, JobId>,
@@ -196,7 +205,7 @@ impl Coordinator {
             root: RootState::Unavailable { last: RootIncarnation::new(0) },
             root_seed: None,
             initial_scan: InitialScan::new(),
-            entries: HashMap::new(),
+            entries: EntryStates::default(),
             pending: HashMap::new(),
             root_probe: None,
             probe_attempts: 0,
@@ -283,12 +292,16 @@ impl Coordinator {
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         if self.is_stopped() {
-            if let Input::Command { id, .. } = input {
-                let err = match &self.shutdown {
-                    ShutdownState::Terminated { .. } => Error::TreeTerminated,
-                    _ => Error::Shutdown,
-                };
-                self.outputs.push(Output::CommandFinished { id, result: Err(err) });
+            match input {
+                Input::Command { id, .. } => {
+                    let err = match &self.shutdown {
+                        ShutdownState::Terminated { .. } => Error::TreeTerminated,
+                        _ => Error::Shutdown,
+                    };
+                    self.outputs.push(Output::CommandFinished { id, result: Err(err) });
+                }
+                Input::WatchRegistered { result, .. } => self.release_watch(result.map_err(ErrorCause::Fs)),
+                Input::Watcher(_) | Input::JobCompleted { .. } | Input::WorkerLost(_) | Input::Timer(_) => {}
             }
             return self.take_outputs();
         }
@@ -413,26 +426,22 @@ impl Coordinator {
         let (snapshot, _) = builder.finish(self.snapshot.version().next());
         self.snapshot = snapshot;
         self.entries.insert(id, EntryState::directory());
-        self.initial_scan.obligations.insert(id, (LoadGeneration::new(0), ScanObligation::Pending));
+        self.initial_scan.record_pending(id, LoadGeneration::new(0));
         let mut reasons = Reasons::control();
         reasons.initial_scan = true;
         self.request(id, RelativePath::root(), ReadNeed::Listing, reasons, Vec::new());
     }
 
-    pub(crate) fn entry_state(&self, id: EntryId) -> Option<&EntryState> {
-        self.entries.get(&id)
-    }
-
     fn entry_state_mut(&mut self, id: EntryId) -> &mut EntryState {
-        self.entries.entry(id).or_default()
+        self.entries.entry_mut(id)
     }
 
     fn dir_state(&self, id: EntryId) -> Option<&DirState> {
-        self.entries.get(&id).and_then(|e| e.dir.as_ref())
+        self.entries.get(id).and_then(|e| e.dir())
     }
 
     fn dir_state_mut(&mut self, id: EntryId) -> Option<&mut DirState> {
-        self.entries.get_mut(&id).and_then(|e| e.dir.as_mut())
+        self.entries.get_mut(id).and_then(|e| e.dir_mut())
     }
 
     fn parent_of(&self, id: EntryId) -> Option<EntryId> {
@@ -453,7 +462,7 @@ impl Coordinator {
     }
 
     fn request(&mut self, id: EntryId, path: RelativePath, need: ReadNeed, reasons: Reasons, barriers: Vec<CommandId>) {
-        let request = PendingRequest { path, need, reasons, barriers, designate_for_round: None, not_before: None };
+        let request = PendingRequest { path, need, reasons, barriers, designate_for_round: None };
         self.request_with(id, request);
     }
 
@@ -481,15 +490,7 @@ impl Coordinator {
     }
 
     fn degraded_paths(&self) -> BTreeSet<RelativePath> {
-        let mut paths = BTreeSet::new();
-        for (id, state) in &self.entries {
-            if state.degraded.is_some()
-                && let Some(entry) = self.snapshot.get_by_id(*id)
-            {
-                paths.insert(entry.path.clone());
-            }
-        }
-        paths
+        self.entries.degraded_ids().filter_map(|id| self.snapshot.get_by_id(id).map(|e| e.path.clone())).collect()
     }
 
     fn initial_scan_state(&self) -> InitialScanState {
@@ -498,7 +499,7 @@ impl Coordinator {
             RootState::Available { incarnation, .. } => {
                 let scan = &self.initial_scan;
                 if scan.any_unsatisfied() {
-                    InitialScanState::Degraded { incarnation, failed: scan.failed.clone() }
+                    InitialScanState::Degraded { incarnation, failed: scan.failed_paths() }
                 } else if scan.foreground_done && !scan.any_pending() && !self.traversal_in_progress() {
                     InitialScanState::Complete { incarnation }
                 } else {
@@ -517,9 +518,8 @@ impl Coordinator {
             RootState::Available { incarnation, .. } => RootAvailability::Available { incarnation },
             RootState::Unavailable { last } => RootAvailability::Unavailable { last },
         };
-        let coverage_pending = self.snapshot.loaded_directories().any(|dir| {
-            self.dir_state(dir.id).map(|d| d.last_covered.map(|g| g < self.min_recon).unwrap_or(true)).unwrap_or(true)
-        }) && self.min_recon > ReconciliationGeneration::new(0);
+        let coverage_pending =
+            self.min_recon > ReconciliationGeneration::new(0) && self.entries.coverage_pending(self.min_recon);
         Health {
             initial_scan: self.initial_scan_state(),
             root,
@@ -577,7 +577,7 @@ impl Coordinator {
         self.unwatch_all();
         let health = self.compute_health();
         self.outputs.push(Output::Publish(UpdateEvent::Terminal { health }));
-        self.outputs.push(Output::Stopped);
+        self.outputs.push(Output::Stopped(TerminalOutcome::Terminated));
     }
 
     fn cancel_all_jobs(&mut self) {
@@ -587,7 +587,7 @@ impl Coordinator {
                 if matches!(job.phase, JobPhase::Running | JobPhase::Confirming) {
                     self.outputs.push(Output::CancelJob(id));
                 }
-                if let Some(entry) = job.entry {
+                if let Some(entry) = job.entry() {
                     self.active_by_entry.remove(&entry);
                 }
             }
@@ -595,7 +595,9 @@ impl Coordinator {
         self.probe_job = None;
         self.queue_order.clear();
         self.batch = None;
-        self.registrations.clear();
+        for target in self.registrations.values_mut() {
+            *target = RegistrationTarget::Abandoned;
+        }
     }
 
     fn unwatch_all(&mut self) {
@@ -603,7 +605,7 @@ impl Coordinator {
             self.outputs.push(Output::Unwatch(id));
         }
         for state in self.entries.values_mut() {
-            if let Some(dir) = state.dir.as_mut() {
+            if let Some(dir) = state.dir_mut() {
                 dir.watch = WatchState::NotRegistered;
             }
         }
@@ -620,22 +622,13 @@ impl Coordinator {
         if !self.baseline_due && self.batch.is_none() {
             consider(self.periodic_due);
         }
-        for request in self.pending.values() {
-            if let Some(t) = request.not_before {
-                consider(t);
-            }
-        }
         if let Some(probe) = &self.root_probe
             && let Some(t) = probe.not_before
         {
             consider(t);
         }
-        for state in self.entries.values() {
-            if let Some(retry) = &state.retry
-                && let Some(t) = retry.due
-            {
-                consider(t);
-            }
+        if let Some(t) = self.entries.earliest_retry() {
+            consider(t);
         }
         if let Some(t) = self.watcher_restart_due {
             consider(t);

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,10 +11,12 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::config::{Config, LagMode};
-use crate::core::{Command, Coordinator, Input, JobOperation, JobResult, MonotonicTime, Output, Stats, WorkerLoss};
+use crate::core::{
+    Command, Coordinator, Input, JobOperation, JobResult, MonotonicTime, Output, Stats, TerminalOutcome, WorkerLoss,
+};
 use crate::error::{Error, Result};
 use crate::fs::{FileSystem, FsError, WatcherEvent, WatcherSink};
-use crate::ids::{CommandId, JobId};
+use crate::ids::{CommandId, JobId, WatchId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
 use crate::runtime::{BoxTaskHandle, Runtime};
@@ -24,6 +26,17 @@ use crate::update::{Health, RecoverableError, StreamError, UpdateEvent};
 enum Message {
     Input(Input),
     WatcherReady,
+}
+
+enum RunPhase {
+    Serving,
+    ReleasingRegistrations,
+}
+
+#[derive(Clone, Copy)]
+enum Lifecycle {
+    Running,
+    Stopped(TerminalOutcome),
 }
 
 struct StreamInner {
@@ -138,9 +151,19 @@ struct Shared {
     health: Mutex<Health>,
     stats: Mutex<Stats>,
     replies: Mutex<HashMap<CommandId, oneshot::Sender<Result<()>>>>,
+    lifecycle: Mutex<Lifecycle>,
     next_command: AtomicU64,
     tx: mpsc::UnboundedSender<Message>,
     stream: Arc<Mutex<StreamInner>>,
+}
+
+impl Shared {
+    fn terminal_error(&self) -> Error {
+        match *lock(&self.lifecycle) {
+            Lifecycle::Stopped(TerminalOutcome::Terminated) => Error::TreeTerminated,
+            Lifecycle::Stopped(TerminalOutcome::ShutDown) | Lifecycle::Running => Error::Shutdown,
+        }
+    }
 }
 
 struct Sink {
@@ -202,6 +225,7 @@ struct Actor {
     root: Arc<PathBuf>,
     base: Instant,
     workers: HashMap<JobId, BoxTaskHandle>,
+    registrations: HashSet<WatchRequestId>,
 }
 
 impl Actor {
@@ -209,36 +233,39 @@ impl Actor {
         MonotonicTime(self.runtime.now().saturating_duration_since(self.base))
     }
 
-    fn handle(&mut self, input: Input) -> bool {
+    fn handle(&mut self, input: Input) -> Option<TerminalOutcome> {
         match &input {
             Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => {
                 self.workers.remove(job);
             }
-            _ => {}
+            Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
+                self.registrations.remove(request);
+            }
+            Input::Command { .. } | Input::Watcher(_) | Input::Timer(_) => {}
         }
         let now = self.now();
         let outputs = self.coordinator.handle(input, now);
         self.execute(outputs)
     }
 
-    fn drain_watcher(&mut self) -> bool {
+    fn drain_watcher(&mut self) -> Option<TerminalOutcome> {
         self.sink.signalled.store(false, Ordering::SeqCst);
         loop {
             let next = lock(&self.sink.queue).pop_front();
             let Some(event) = next else { break };
-            if self.handle(Input::Watcher(event)) {
-                return true;
+            if let Some(outcome) = self.handle(Input::Watcher(event)) {
+                return Some(outcome);
             }
         }
         let dropped = self.sink.dropped.swap(0, Ordering::SeqCst);
         if dropped > 0 {
             return self.handle(Input::Watcher(WatcherEvent::Dropped { count: dropped }));
         }
-        false
+        None
     }
 
-    fn execute(&mut self, outputs: Vec<Output>) -> bool {
-        let mut stopped = false;
+    fn execute(&mut self, outputs: Vec<Output>) -> Option<TerminalOutcome> {
+        let mut stopped = None;
         for output in outputs {
             match output {
                 Output::StartJob(spec) => {
@@ -265,15 +292,15 @@ impl Actor {
                     let root = self.root.clone();
                     let sink: Arc<dyn WatcherSink> = self.sink.clone();
                     let guard = WorkerGuard::new(WorkerLoss::WatchRegistration(request), self.shared.tx.clone());
-                    let _ = self.runtime.spawn_blocking(Box::new(move || {
-                        let result = fs.watch(&root, &path, recursive, sink);
-                        guard.finish(Input::WatchRegistered { request, result });
-                    }));
+                    self.registrations.insert(request);
+                    self.runtime
+                        .spawn_blocking(Box::new(move || {
+                            let result = fs.watch(&root, &path, recursive, sink);
+                            guard.finish(Input::WatchRegistered { request, result });
+                        }))
+                        .detach();
                 }
-                Output::Unwatch(id) => {
-                    let fs = self.fs.clone();
-                    let _ = self.runtime.spawn_blocking(Box::new(move || fs.unwatch(id)));
-                }
+                Output::Unwatch(id) => self.unwatch(id),
                 Output::Publish(event) => {
                     match &event {
                         UpdateEvent::Delta(update) => *lock(&self.shared.snapshot) = update.snapshot.clone(),
@@ -299,27 +326,52 @@ impl Actor {
                         let _ = tx.unbounded_send(Message::Input(Input::Timer(id)));
                     }));
                 }
-                Output::Stopped => stopped = true,
+                Output::Stopped(outcome) => {
+                    *lock(&self.shared.lifecycle) = Lifecycle::Stopped(outcome);
+                    stopped = Some(outcome);
+                }
             }
         }
         stopped
     }
 
+    fn unwatch(&self, id: WatchId) {
+        let fs = self.fs.clone();
+        self.runtime.spawn_blocking(Box::new(move || fs.unwatch(id))).detach();
+    }
+
+    fn close_stream_and_fail_pending(&self) {
+        lock(&self.shared.stream).close();
+        let pending: Vec<oneshot::Sender<Result<()>>> = lock(&self.shared.replies).drain().map(|(_, tx)| tx).collect();
+        let error = self.shared.terminal_error();
+        for reply in pending {
+            let _ = reply.send(Err(error.clone()));
+        }
+    }
+
+    fn dispatch(&mut self, message: Message) -> Option<TerminalOutcome> {
+        match message {
+            Message::Input(input) => self.handle(input),
+            Message::WatcherReady => self.drain_watcher(),
+        }
+    }
+
     async fn run(mut self) {
+        let mut phase = RunPhase::Serving;
         while let Some(message) = self.rx.next().await {
-            let stopped = match message {
-                Message::Input(input) => self.handle(input),
-                Message::WatcherReady => self.drain_watcher(),
-            };
-            if stopped {
+            if self.dispatch(message).is_some() {
+                phase = RunPhase::ReleasingRegistrations;
+                self.close_stream_and_fail_pending();
+            }
+            if matches!(phase, RunPhase::ReleasingRegistrations) && self.registrations.is_empty() {
                 break;
             }
         }
-        lock(&self.shared.stream).close();
-        let pending: Vec<oneshot::Sender<Result<()>>> = lock(&self.shared.replies).drain().map(|(_, tx)| tx).collect();
-        for reply in pending {
-            let _ = reply.send(Err(Error::Shutdown));
+        self.rx.close();
+        while let Ok(message) = self.rx.try_recv() {
+            let _ = self.dispatch(message);
         }
+        self.close_stream_and_fail_pending();
     }
 }
 
@@ -360,6 +412,7 @@ impl Tree {
             health: Mutex::new(coordinator.health()),
             stats: Mutex::new(coordinator.stats()),
             replies: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(Lifecycle::Running),
             next_command: AtomicU64::new(1),
             tx: tx.clone(),
             stream: stream.clone(),
@@ -382,18 +435,19 @@ impl Tree {
             root,
             base,
             workers: HashMap::new(),
+            registrations: HashSet::new(),
         };
-        actor.execute(initial);
+        let _ = actor.execute(initial);
         while actor.coordinator.open_gate().is_none() {
             let Some(message) = actor.rx.next().await else {
                 return Err(Error::Shutdown);
             };
             match message {
                 Message::Input(input) => {
-                    actor.handle(input);
+                    let _ = actor.handle(input);
                 }
                 Message::WatcherReady => {
-                    actor.drain_watcher();
+                    let _ = actor.drain_watcher();
                 }
             }
         }
@@ -410,9 +464,11 @@ async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> std::result::Result<T, FsError> + Send + 'static,
 ) -> Result<T> {
     let (tx, rx) = oneshot::channel();
-    let _ = runtime.spawn_blocking(Box::new(move || {
-        let _ = tx.send(work());
-    }));
+    runtime
+        .spawn_blocking(Box::new(move || {
+            let _ = tx.send(work());
+        }))
+        .detach();
     match rx.await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(Error::from(err)),
@@ -444,11 +500,11 @@ impl TreeHandle {
         lock(&self.shared.replies).insert(id, tx);
         if self.shared.tx.unbounded_send(Message::Input(Input::Command { id, command })).is_err() {
             lock(&self.shared.replies).remove(&id);
-            return Err(Error::Shutdown);
+            return Err(self.shared.terminal_error());
         }
         match rx.await {
             Ok(result) => result,
-            Err(_) => Err(Error::Shutdown),
+            Err(_) => Err(self.shared.terminal_error()),
         }
     }
 

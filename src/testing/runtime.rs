@@ -11,6 +11,13 @@ use futures_util::task::{ArcWake, waker_ref};
 
 use crate::runtime::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockingMode {
+    Queued,
+    Discarded,
+    Uninterruptible,
+}
+
 struct BlockingWork {
     work: Box<dyn FnOnce() + Send + 'static>,
     cancelled: Arc<AtomicBool>,
@@ -26,12 +33,28 @@ impl TaskHandle for BlockingHandle {
         self.cancelled.store(true, Ordering::SeqCst);
         self.requests.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn detach(self: Box<Self>) {}
+}
+
+struct UninterruptibleHandle {
+    requests: Arc<AtomicU64>,
+}
+
+impl TaskHandle for UninterruptibleHandle {
+    fn cancel(&self) {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn detach(self: Box<Self>) {}
 }
 
 struct DiscardedHandle;
 
 impl TaskHandle for DiscardedHandle {
     fn cancel(&self) {}
+
+    fn detach(self: Box<Self>) {}
 }
 
 struct Inner {
@@ -40,7 +63,7 @@ struct Inner {
     tasks: VecDeque<BoxFuture<'static, ()>>,
     blocking: VecDeque<BlockingWork>,
     timers: Vec<(Duration, oneshot::Sender<()>)>,
-    discard_blocking: bool,
+    blocking_mode: BlockingMode,
 }
 
 pub struct DeterministicRuntime {
@@ -80,7 +103,7 @@ impl DeterministicRuntime {
                 tasks: VecDeque::new(),
                 blocking: VecDeque::new(),
                 timers: Vec::new(),
-                discard_blocking: false,
+                blocking_mode: BlockingMode::Queued,
             }),
             woken: Arc::new(Flag(AtomicBool::new(false))),
             cancel_requests: Arc::new(AtomicU64::new(0)),
@@ -92,8 +115,8 @@ impl DeterministicRuntime {
         lock(&self.inner).offset
     }
 
-    pub fn discard_blocking(&self, discard: bool) {
-        lock(&self.inner).discard_blocking = discard;
+    pub fn set_blocking_mode(&self, mode: BlockingMode) {
+        lock(&self.inner).blocking_mode = mode;
     }
 
     pub fn cancel_requests(&self) -> u64 {
@@ -204,14 +227,23 @@ impl Runtime for DeterministicRuntime {
 
     fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxTaskHandle {
         let mut inner = lock(&self.inner);
-        if inner.discard_blocking {
-            drop(work);
-            return Box::new(DiscardedHandle);
+        match inner.blocking_mode {
+            BlockingMode::Discarded => {
+                drop(work);
+                Box::new(DiscardedHandle)
+            }
+            BlockingMode::Queued => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                inner.blocking.push_back(BlockingWork { work, cancelled: cancelled.clone() });
+                self.woken.0.store(true, Ordering::SeqCst);
+                Box::new(BlockingHandle { cancelled, requests: self.cancel_requests.clone() })
+            }
+            BlockingMode::Uninterruptible => {
+                inner.blocking.push_back(BlockingWork { work, cancelled: Arc::new(AtomicBool::new(false)) });
+                self.woken.0.store(true, Ordering::SeqCst);
+                Box::new(UninterruptibleHandle { requests: self.cancel_requests.clone() })
+            }
         }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        inner.blocking.push_back(BlockingWork { work, cancelled: cancelled.clone() });
-        self.woken.0.store(true, Ordering::SeqCst);
-        Box::new(BlockingHandle { cancelled, requests: self.cancel_requests.clone() })
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {

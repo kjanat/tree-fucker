@@ -49,19 +49,14 @@ impl Coordinator {
     }
 
     fn probe_ready(&self) -> bool {
-        self.probe_job.is_none()
-            && self.root_probe.as_ref().map(|p| p.not_before.map(|t| t <= self.now).unwrap_or(true)).unwrap_or(false)
+        self.probe_job.is_none() && self.root_probe.as_ref().map(|p| p.ready(self.now)).unwrap_or(false)
     }
 
     fn ready_expedited(&self) -> Vec<EntryId> {
         let mut ready: Vec<(crate::path::PathKey, EntryId)> = self
             .pending
             .iter()
-            .filter(|(id, request)| {
-                !self.active_by_entry.contains_key(id)
-                    && request.not_before.map(|t| t <= self.now).unwrap_or(true)
-                    && self.snapshot.contains_id(**id)
-            })
+            .filter(|(id, _)| !self.active_by_entry.contains_key(id) && self.snapshot.contains_id(**id))
             .map(|(id, request)| (self.snapshot.key(&request.path), *id))
             .collect();
         ready.sort();
@@ -69,49 +64,26 @@ impl Coordinator {
     }
 
     fn materialize_retries(&mut self) {
-        let now = self.now;
-        let due: Vec<EntryId> = self
-            .entries
-            .iter()
-            .filter(|(_, state)| state.retry.as_ref().and_then(|r| r.due).map(|t| t <= now).unwrap_or(false))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in due {
+        for id in self.entries.retries_due(self.now) {
             let Some(entry) = self.snapshot.get_by_id(id).cloned() else {
-                if let Some(state) = self.entries.get_mut(&id) {
-                    state.retry = None;
-                }
+                self.entries.clear_retry(id);
                 continue;
             };
-            let Some(record) = self.entries.get_mut(&id).and_then(|s| s.retry.as_mut()) else {
+            self.entries.disarm_retry(id);
+            let Some(record) = self.entries.retry(id) else {
                 continue;
             };
-            record.due = None;
-            let mut reasons = record.reasons;
-            reasons.retry = true;
-            let need = match record.phase {
-                RetryPhase::Metadata => ReadNeed::Metadata,
-                RetryPhase::Listing | RetryPhase::WatchRegistrationThenListing => ReadNeed::Listing,
-            };
-            if record.phase == RetryPhase::WatchRegistrationThenListing {
-                reasons.control = true;
-            }
+            let phase = record.phase;
+            let reasons = record.admission_reasons();
+            let need = phase.required_need();
             let barriers = record.barriers.clone();
             let still_required = match need {
                 ReadNeed::Listing => matches!(entry.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
                 ReadNeed::Metadata => true,
             };
             if !still_required {
-                if let Some(state) = self.entries.get_mut(&id) {
-                    state.retry = None;
-                }
+                self.entries.clear_retry(id);
                 continue;
-            }
-            if reasons.initial_scan
-                && let Some((_, state)) = self.initial_scan.obligations.get_mut(&id)
-                && *state == ScanObligation::Unsatisfied
-            {
-                *state = ScanObligation::Pending;
             }
             self.request(id, entry.path.clone(), need, reasons, barriers);
         }
@@ -213,7 +185,7 @@ impl Coordinator {
                     .map(|j| {
                         j.dispatch > barrier
                             && j.need == ReadNeed::Listing
-                            && j.guards.load_generation == Some(obligation.load_generation)
+                            && j.target.load_generation() == Some(obligation.load_generation)
                     })
                     .unwrap_or(false);
                 if designatable {
@@ -233,7 +205,6 @@ impl Coordinator {
                             reasons: Reasons::default(),
                             barriers: Vec::new(),
                             designate_for_round: Some(generation),
-                            not_before: None,
                         },
                     );
                 }
@@ -246,12 +217,10 @@ impl Coordinator {
                 reasons: Reasons::default(),
                 barriers: Vec::new(),
                 designate_for_round: None,
-                not_before: None,
             });
             request.need = ReadNeed::Listing;
             request.reasons.baseline = true;
             request.designate_for_round = Some(generation);
-            request.not_before = None;
             let job_id = self.admit(Some(obligation.entry), request);
             members.insert(job_id);
             remaining -= 1;
@@ -277,7 +246,7 @@ impl Coordinator {
     fn admit_expedited(&mut self, slots: usize, ready: Vec<EntryId>, members: &mut HashSet<JobId>) {
         let mut by_class: [Vec<EntryId>; 5] = Default::default();
         for id in ready {
-            if members.iter().any(|j| self.jobs.get(j).map(|job| job.entry == Some(id)).unwrap_or(false)) {
+            if members.iter().any(|j| self.jobs.get(j).map(|job| job.entry() == Some(id)).unwrap_or(false)) {
                 continue;
             }
             let Some(request) = self.pending.get(&id) else {
@@ -338,7 +307,7 @@ impl Coordinator {
                 && take > 0
                 && let Some(probe) = self.root_probe.take()
             {
-                let job_id = self.admit(None, probe);
+                let job_id = self.admit(None, probe.request);
                 members.insert(job_id);
                 take -= 1;
                 probe_pending = false;
@@ -357,6 +326,13 @@ impl Coordinator {
         let id = self.next_job_id();
         let dispatch = self.next_seq();
         let mut reasons = request.reasons;
+        let mut barriers = request.barriers;
+        if let Some(entry_id) = entry {
+            self.merge_retry_record(entry_id, request.need, &mut reasons, &mut barriers);
+            if reasons.initial_scan {
+                self.initial_scan.revive(entry_id);
+            }
+        }
         let mut designated = false;
         let mut recon = None;
         if let (Some(entry_id), Some(round)) = (entry, self.round.as_ref())
@@ -377,24 +353,9 @@ impl Coordinator {
         if designated {
             reasons.baseline = true;
         }
-        let guards = match entry {
-            Some(entry_id) => self.capture_guards(entry_id, request.need),
-            None => Guards {
-                incarnation: self.root.incarnation(),
-                entry_generation: EntryGeneration::new(0),
-                load_generation: None,
-                policy_revision: self.policy.revision(),
-                policy_fence: self.policy_fence,
-                parent_context: None,
-                child_state: None,
-                parent_child_state: None,
-                entry_state: StateGeneration::new(0),
-                change_epoch: ChangeEpoch::new(0),
-            },
-        };
-        let expected_unavailable = match (entry, self.root) {
-            (None, RootState::Unavailable { last }) => Some(last),
-            _ => None,
+        let target = match entry {
+            Some(entry_id) => JobTarget::Entry { id: entry_id, guards: self.capture_guards(entry_id, request.need) },
+            None => JobTarget::RootProbe { expected_unavailable: self.root.incarnation() },
         };
         let needs_registration = entry.map(|e| self.needs_registration(e, request.need)).unwrap_or(false);
         let phase = if needs_registration {
@@ -406,30 +367,18 @@ impl Coordinator {
         } else {
             JobPhase::Queued
         };
-        let mut barriers = request.barriers;
-        if let Some(entry_id) = entry
-            && let Some(record) = self.entries.get(&entry_id).and_then(|s| s.retry.as_ref())
-        {
-            for barrier in &record.barriers {
-                if !barriers.contains(barrier) {
-                    barriers.push(*barrier);
-                }
-            }
-        }
         let job = ActiveJob {
             id,
-            entry,
+            target,
             path: request.path,
             need: request.need,
             phase,
-            guards,
             dispatch,
             recon,
             reasons,
             barriers,
             designated,
             started: None,
-            expected_unavailable,
         };
         if let Some(entry_id) = entry {
             self.active_by_entry.insert(entry_id, id);
@@ -445,6 +394,21 @@ impl Coordinator {
         }
         self.jobs.insert(id, job);
         id
+    }
+
+    fn merge_retry_record(&self, entry: EntryId, need: ReadNeed, reasons: &mut Reasons, barriers: &mut Vec<CommandId>) {
+        let Some(record) = self.entries.retry(entry) else {
+            return;
+        };
+        if need < record.phase.required_need() {
+            return;
+        }
+        reasons.merge(record.reasons);
+        for barrier in &record.barriers {
+            if !barriers.contains(barrier) {
+                barriers.push(*barrier);
+            }
+        }
     }
 
     fn needs_registration(&self, entry: EntryId, need: ReadNeed) -> bool {
@@ -473,16 +437,16 @@ impl Coordinator {
     pub(super) fn capture_guards(&self, entry: EntryId, need: ReadNeed) -> Guards {
         let e = self.snapshot.get_by_id(entry);
         let parent = self.parent_of(entry);
-        let state = self.entries.get(&entry);
+        let state = self.entries.get(entry);
         Guards {
             incarnation: self.root.incarnation(),
             entry_generation: e.map(|e| e.generation).unwrap_or_default(),
-            load_generation: state.and_then(|s| s.dir.as_ref()).map(|d| d.load_generation),
+            load_generation: state.and_then(|s| s.dir()).map(|d| d.load_generation),
             policy_revision: self.policy.revision(),
             policy_fence: self.policy_fence,
             parent_context: parent.and_then(|p| self.dir_state(p)).map(|d| d.context_generation),
             child_state: if need == ReadNeed::Listing {
-                state.and_then(|s| s.dir.as_ref()).map(|d| d.child_state)
+                state.and_then(|s| s.dir()).map(|d| d.child_state)
             } else {
                 None
             },
@@ -493,19 +457,19 @@ impl Coordinator {
     }
 
     pub(super) fn guards_valid(&self, job: &ActiveJob) -> bool {
-        if job.guards.incarnation != self.root.incarnation() {
-            return false;
-        }
-        match job.entry {
-            Some(entry) => {
-                if !self.snapshot.contains_id(entry) {
+        match job.target {
+            JobTarget::Entry { id, guards } => {
+                if guards.incarnation != self.root.incarnation() {
                     return false;
                 }
-                let current = self.capture_guards(entry, job.need);
-                current == job.guards && self.entries.get(&entry).and_then(|s| s.latest_dispatch) == Some(job.dispatch)
+                if !self.snapshot.contains_id(id) {
+                    return false;
+                }
+                let current = self.capture_guards(id, job.need);
+                current == guards && self.entries.get(id).and_then(|s| s.latest_dispatch) == Some(job.dispatch)
             }
-            None => match self.root {
-                RootState::Unavailable { last } => job.expected_unavailable == Some(last),
+            JobTarget::RootProbe { expected_unavailable } => match self.root {
+                RootState::Unavailable { last } => expected_unavailable == last,
                 RootState::Available { .. } => false,
             },
         }
@@ -594,12 +558,10 @@ impl Coordinator {
             .collect();
         let generation = round.generation;
         let started = round.started;
-        for obligation in &round.obligations {
-            if obligation.state == ObligationState::Accepted
-                && let Some(dir) = self.entries.get_mut(&obligation.entry).and_then(|s| s.dir.as_mut())
-            {
-                dir.last_covered = Some(dir.last_covered.map(|g| g.max(generation)).unwrap_or(generation));
-            }
+        let accepted: Vec<EntryId> =
+            round.obligations.iter().filter(|o| o.state == ObligationState::Accepted).map(|o| o.entry).collect();
+        for entry in accepted {
+            self.entries.mark_covered(entry, generation);
         }
         self.last_round = Some((started, self.now.since(started)));
         self.last_round_result =

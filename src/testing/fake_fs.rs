@@ -42,6 +42,12 @@ struct InjectedChild {
     entry: DirEntry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectedPosition {
+    Last,
+    First,
+}
+
 struct Inner {
     nodes: BTreeMap<RelativePath, EntryInfo>,
     root_present: bool,
@@ -49,6 +55,7 @@ struct Inner {
     failures: Vec<Failure>,
     panics: Vec<(RelativePath, FakeOp)>,
     injected: Vec<InjectedChild>,
+    injected_position: InjectedPosition,
     watches: HashMap<WatchId, Watch>,
     next_watch: u64,
     next_inode: u64,
@@ -106,6 +113,7 @@ impl FakeFileSystem {
                 failures: Vec::new(),
                 panics: Vec::new(),
                 injected: Vec::new(),
+                injected_position: InjectedPosition::Last,
                 watches: HashMap::new(),
                 next_watch: 1,
                 next_inode: 2,
@@ -384,6 +392,10 @@ impl FakeFileSystem {
         lock(&self.inner).injected.clear();
     }
 
+    pub fn set_injected_position(&self, position: InjectedPosition) {
+        lock(&self.inner).injected_position = position;
+    }
+
     pub fn drop_events(&self, drop: bool) {
         lock(&self.inner).drop_events = drop;
     }
@@ -546,13 +558,18 @@ impl FileSystem for FakeFileSystem {
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let mut entries: Vec<DirEntry> = inner
+        let real: Vec<DirEntry> = inner
             .nodes
             .iter()
             .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
             .filter_map(|(k, info)| Some(DirEntry { name: k.file_name()?.to_os_string(), info: *info }))
             .collect();
-        entries.extend(inner.injected.iter().filter(|c| c.dir == *path).map(|c| c.entry.clone()));
+        let injected: Vec<DirEntry> =
+            inner.injected.iter().filter(|c| c.dir == *path).map(|c| c.entry.clone()).collect();
+        let entries = match inner.injected_position {
+            InjectedPosition::Last => real.into_iter().chain(injected).collect(),
+            InjectedPosition::First => injected.into_iter().chain(real).collect(),
+        };
         Ok(DirectoryListing { directory, entries })
     }
 

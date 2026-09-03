@@ -6,6 +6,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait TaskHandle: Send + Sync + 'static {
     fn cancel(&self);
+    fn detach(self: Box<Self>);
 }
 
 pub type BoxTaskHandle = Box<dyn TaskHandle>;
@@ -41,6 +42,8 @@ impl TaskHandle for TokioTask {
     fn cancel(&self) {
         self.0.abort();
     }
+
+    fn detach(self: Box<Self>) {}
 }
 
 #[cfg(feature = "tokio")]

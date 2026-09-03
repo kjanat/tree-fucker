@@ -109,7 +109,7 @@ impl Harness {
                     self.results.insert(id, result);
                 }
                 Output::SetTimer { id, at } => self.timer = Some((id, at)),
-                Output::Stopped => self.stopped = true,
+                Output::Stopped(_) => self.stopped = true,
             }
         }
     }
@@ -199,6 +199,17 @@ impl Harness {
 
     pub fn pending_registrations(&self) -> Vec<(WatchRequestId, RelativePath, bool)> {
         self.registrations.iter().cloned().collect()
+    }
+
+    pub fn take_registration(&mut self, p: &str) -> Option<(WatchRequestId, RelativePath, bool)> {
+        let path = FakeFileSystem::path(p);
+        let index = self.registrations.iter().position(|(_, q, _)| *q == path)?;
+        self.registrations.remove(index)
+    }
+
+    pub fn complete_registration(&mut self, request: WatchRequestId, path: &RelativePath, recursive: bool) {
+        let result = self.fs.watch(self.fs.root(), path, recursive, self.sink.clone());
+        self.feed(Input::WatchRegistered { request, result });
     }
 
     pub fn complete_registrations(&mut self) -> usize {

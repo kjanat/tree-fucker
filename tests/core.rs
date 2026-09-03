@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tree_fucker::core::Command;
+use tree_fucker::core::{Command, JobOperation};
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{
     ErrorCause, InitialScanState, Operation, RecoverableError, RootAvailability, RoundResult, UpdateEvent,
@@ -322,7 +322,7 @@ fn invalid_child_name_rejects_the_whole_listing_and_degrades_the_round() {
 }
 
 #[test]
-fn duplicate_child_name_rejects_the_whole_listing_and_degrades_the_round() {
+fn duplicate_child_name_is_skipped_and_reported_without_rejecting_the_listing() {
     let fs = populated(WatcherKind::None);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
     h.run_until_idle();
@@ -330,8 +330,9 @@ fn duplicate_child_name_rejects_the_whole_listing_and_degrades_the_round() {
     fs.remove_silently("a/f2");
     fs.inject_child("a", "b", EntryKind::File);
     h.run_round();
-    assert!(h.paths().contains(&"a/f2".to_string()));
+    assert!(!h.paths().contains(&"a/f2".to_string()));
     assert_eq!(h.entry("a/b").map(|e| e.kind()), Some(EntryKind::Directory));
+    assert!(h.paths().contains(&"a/b/f1".to_string()));
     let duplicate: Vec<&RecoverableError> = h
         .events()
         .iter()
@@ -345,13 +346,11 @@ fn duplicate_child_name_rejects_the_whole_listing_and_degrades_the_round() {
         .collect();
     assert_eq!(duplicate.len(), 1);
     assert_eq!(duplicate[0].path, path("a"));
-    assert_eq!(
-        h.health().reconciliation.last_round,
-        Some(RoundResult::Degraded { unsatisfied: [path("a")].into_iter().collect() })
-    );
-    fs.clear_injected_children();
+    assert_eq!(duplicate[0].operation, Operation::Listing);
+    assert!(h.health().reconciliation.degraded_paths.is_empty());
     h.run_round();
-    assert!(!h.paths().contains(&"a/f2".to_string()));
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+    fs.clear_injected_children();
     h.run_round();
     assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
 }
@@ -468,6 +467,123 @@ fn lost_worker_keeps_the_refresh_barrier_and_completes_it_on_retry() {
     h.advance(Duration::from_secs(60));
     assert_eq!(h.result(t), Some(Ok(())));
     assert!(h.paths().contains(&"c/late".to_string()));
+}
+
+#[test]
+fn a_metadata_read_does_not_satisfy_a_refresh_that_still_needs_a_listing() {
+    let fs = populated(WatcherKind::Recursive);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loading));
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    let job = h.pending_job_for("a").expect("a listing");
+    assert!(h.lose_job(job.id));
+    assert_eq!(h.result(t), None);
+    fs.touch("a");
+    h.deliver_watcher_events();
+    let metadata = h.pending_job_for("a").expect("a metadata read");
+    assert_eq!(metadata.operation, JobOperation::Metadata);
+    h.complete_job(metadata.id);
+    assert_eq!(h.result(t), None);
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loading));
+    h.advance(Duration::from_secs(60));
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert!(h.paths().contains(&"a/b".to_string()));
+}
+
+#[test]
+fn a_lost_metadata_worker_keeps_the_stronger_listing_requirement() {
+    let fs = populated(WatcherKind::Recursive);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    let listing = h.pending_job_for("a").expect("a listing");
+    assert!(h.lose_job(listing.id));
+    fs.touch("a");
+    h.deliver_watcher_events();
+    let metadata = h.pending_job_for("a").expect("a metadata read");
+    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert!(h.lose_job(metadata.id));
+    assert_eq!(h.result(t), None);
+    h.advance(Duration::from_secs(60));
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert!(h.paths().contains(&"a/b".to_string()));
+}
+
+#[test]
+fn a_failed_metadata_read_keeps_the_refresh_barrier_and_the_listing_requirement() {
+    let fs = populated(WatcherKind::Recursive);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loading));
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    let listing = h.pending_job_for("a").expect("a listing");
+    assert!(h.lose_job(listing.id));
+    fs.fail("a", FakeOp::Metadata, FailureMode::Once(FsError::Transient("io".into())));
+    fs.touch("a");
+    h.deliver_watcher_events();
+    let metadata = h.pending_job_for("a").expect("a metadata read");
+    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert!(h.complete_job(metadata.id));
+    assert_eq!(h.result(t), None);
+    h.advance(Duration::from_secs(600));
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert!(h.paths().contains(&"a/b".to_string()));
+}
+
+#[test]
+fn a_failed_metadata_read_keeps_the_initial_scan_recovery_reason() {
+    let fs = populated(WatcherKind::Recursive);
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    assert!(matches!(h.health().initial_scan, InitialScanState::Degraded { .. }));
+    fs.fail("a", FakeOp::Metadata, FailureMode::Once(FsError::Transient("io".into())));
+    fs.touch("a");
+    h.deliver_watcher_events();
+    let metadata = h.pending_job_for("a").expect("a metadata read");
+    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert!(h.complete_job(metadata.id));
+    h.advance(Duration::from_secs(600));
+    assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
+    assert!(h.paths().contains(&"a/b/f1".to_string()));
+    assert!(matches!(h.health().initial_scan, InitialScanState::Complete { .. }));
+}
+
+#[test]
+fn retry_deadlines_stay_armed_through_merge_clearing_and_removal() {
+    let fs = populated(WatcherKind::None);
+    let config = Config { fixed_interval: Some(Duration::from_secs(600)), ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("io".into())));
+    fs.fail("c", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("io".into())));
+    h.run_round();
+    let installed_at = h.now();
+    let installed = h.timer().map(|(_, at)| at).expect("retry timer armed");
+    assert!(installed <= installed_at + Duration::from_secs(3), "{installed:?}");
+    let before = fs.count_ops(FakeOp::ReadDir, "a");
+    h.advance(Duration::from_secs(3));
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), before + 1);
+    let merged_at = h.now();
+    let merged = h.timer().map(|(_, at)| at).expect("merged retry timer armed");
+    assert!(merged.saturating_sub(merged_at) > installed.saturating_sub(installed_at), "{merged:?} {installed:?}");
+    fs.clear_failures();
+    fs.remove_silently("a");
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(!h.paths().contains(&"a".to_string()));
+    let remaining = h.timer().map(|(_, at)| at).expect("periodic timer armed");
+    assert!(remaining > h.now() + Duration::from_secs(300), "{remaining:?}");
+    h.advance(Duration::from_secs(1800));
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
 }
 
 #[test]

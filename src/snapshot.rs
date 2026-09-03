@@ -455,6 +455,22 @@ mod tests {
     }
 
     #[test]
+    fn rename_onto_an_occupied_path_is_rejected_without_moving_anything() {
+        let base = Snapshot::empty(SnapshotVersion::new(0), CaseSensitivity::Sensitive);
+        let mut b = base.builder();
+        b.insert(new_entry(EntryId::new(1), path(""), Shape::Directory(LoadState::Loaded))).expect("root");
+        b.insert(new_entry(EntryId::new(2), path("a"), Shape::Directory(LoadState::Loaded))).expect("a");
+        b.insert(new_entry(EntryId::new(3), path("a/b"), Shape::File)).expect("a/b");
+        b.insert(new_entry(EntryId::new(4), path("z"), Shape::File)).expect("z");
+        let (s1, _) = b.finish(SnapshotVersion::new(1));
+        let mut b = s1.builder();
+        assert_eq!(b.rename_subtree(EntryId::new(2), path("z")), Err(BuildError::DuplicatePath(path("z"))));
+        assert_eq!(b.get(EntryId::new(2)).map(|e| e.path.clone()), Some(path("a")));
+        assert_eq!(b.get(EntryId::new(3)).map(|e| e.path.clone()), Some(path("a/b")));
+        assert_eq!(b.rename_subtree(EntryId::new(9), path("y")), Err(BuildError::UnknownEntry(EntryId::new(9))));
+    }
+
+    #[test]
     fn rename_rebases_descendants() {
         let base = Snapshot::empty(SnapshotVersion::new(0), CaseSensitivity::Sensitive);
         let mut b = base.builder();
