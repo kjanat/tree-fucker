@@ -26,6 +26,7 @@ pub struct Admission {
     pub at: MonotonicTime,
     pub job: JobId,
     pub class: Class,
+    pub operation: JobOperation,
     pub entry: RelativePath,
     pub batch: usize,
     pub reserved: Duration,
@@ -43,13 +44,6 @@ struct Running {
     started: MonotonicTime,
     due: MonotonicTime,
     domain: DomainId,
-}
-
-fn fake_op(operation: JobOperation) -> FakeOp {
-    match operation {
-        JobOperation::Listing => FakeOp::ReadDir,
-        JobOperation::Metadata => FakeOp::Metadata,
-    }
 }
 
 struct Sink {
@@ -200,12 +194,16 @@ impl Harness {
             let Some(class) = self.coordinator.job_class(job) else {
                 continue;
             };
+            let Some(operation) = self.coordinator.job_operation(job) else {
+                continue;
+            };
             self.admitted.insert(job);
             let batch = self.batch_of(job);
             self.admissions.push(Admission {
                 at: grant.admitted,
                 job,
                 class,
+                operation,
                 entry: grant.path.clone(),
                 batch,
                 reserved: grant.reserved,
@@ -225,7 +223,11 @@ impl Harness {
 
     fn begin_work(&mut self, spec: &JobSpec) {
         self.settle_work(spec.id);
-        let cost = self.fs.cost_of(fake_op(spec.operation), &spec.path);
+        let cost = match spec.operation {
+            JobOperation::Listing => self.fs.listing_cost(&spec.path),
+            JobOperation::Metadata => self.fs.cost_of(FakeOp::Metadata, &spec.path),
+            JobOperation::Enrichment { .. } => self.fs.enrichment_cost(&spec.path),
+        };
         let domain = self.fs.domain_of(&spec.path);
         let due = self.now + cost;
         self.job_domain.insert(spec.id, domain);
@@ -325,13 +327,20 @@ impl Harness {
         let Some(spec) = self.jobs.remove(index) else {
             return false;
         };
-        let result = match spec.operation {
-            JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
-            JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
-        };
+        let result = self.perform(&spec);
         self.settle_work(spec.id);
         self.feed(Input::JobCompleted { job: spec.id, result });
         true
+    }
+
+    fn perform(&self, spec: &JobSpec) -> JobResult {
+        match spec.operation {
+            JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
+            JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
+            JobOperation::Enrichment { fields } => {
+                JobResult::Enrichment(self.fs.enrich(self.fs.root(), &spec.path, fields))
+            }
+        }
     }
 
     pub fn complete_job_with(&mut self, id: JobId, result: JobResult) -> bool {
@@ -365,10 +374,7 @@ impl Harness {
         let Some(spec) = self.outstanding.remove(index) else {
             return false;
         };
-        let result = match spec.operation {
-            JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
-            JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
-        };
+        let result = self.perform(&spec);
         self.settle_work(spec.id);
         self.feed(Input::JobCompleted { job: spec.id, result });
         true

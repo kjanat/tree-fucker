@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tree_fucker::testing::{CostScope, FakeFileSystem, FakeOp, Harness};
+use tree_fucker::testing::{CostScope, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::RoundResult;
-use tree_fucker::{Config, EntryKind, FileSystem, LoadAll, RelativePath, WatcherKind};
+use tree_fucker::{
+    Config, EntryKind, FieldSource, FileSystem, FsError, IdentitySource, KindSource, LoadAll, MetadataFields,
+    MetadataSources, ObservationSources, RelativePath, WatcherKind,
+};
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
 const BACKGROUND_BURST_GLOBAL: Duration = Duration::from_millis(500);
@@ -279,7 +282,9 @@ fn random_silent_mutations_converge_after_successful_round() {
             fs.create_file(&file, 1);
             known.push(file);
         }
-        let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+        let config =
+            Config { metadata_fields: MetadataFields { size: true, ..MetadataFields::NONE }, ..Default::default() };
+        let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
         h.run_until_idle();
         for step in 0..40 {
             let dirs = directories(&fs, &known);
@@ -342,5 +347,111 @@ fn random_silent_mutations_converge_after_successful_round() {
                 assert_eq!(entry.kind(), info.kind, "kind of {name} seed {seed}");
             }
         }
+    }
+}
+
+fn enrichment_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
+    let mut rng = Lcg(seed);
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_default_sources(ObservationSources {
+        kind: KindSource::Sometimes,
+        identity: IdentitySource::Inline,
+        metadata: MetadataSources { size: FieldSource::PerChildRead, ..MetadataSources::INLINE },
+    });
+    let mut known: Vec<String> = Vec::new();
+    for i in 0..6 {
+        let name = format!("d{i}");
+        fs.mkdir(&name);
+        known.push(name.clone());
+        let file = format!("{name}/f");
+        fs.create_file(&file, 1);
+        known.push(file);
+    }
+    let config =
+        Config { metadata_fields: MetadataFields { size: true, ..MetadataFields::NONE }, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    for step in 0..40 {
+        let dirs = directories(&fs, &known);
+        let dir = rng.pick(&dirs).cloned().unwrap_or_default();
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        match rng.next() % 6 {
+            0 => {
+                let name = format!("{prefix}n{step}");
+                fs.add_silently(&name, EntryKind::File);
+                known.push(name);
+            }
+            1 => {
+                let name = format!("{prefix}sub{step}");
+                fs.add_silently(&name, EntryKind::Directory);
+                known.push(name);
+            }
+            2 => {
+                if let Some(victim) = rng.pick(&known).cloned() {
+                    fs.remove_silently(&victim);
+                }
+            }
+            3 => {
+                if let Some(target) = rng.pick(&known).cloned() {
+                    fs.fail(&target, FakeOp::Enrich, FailureMode::Times(2, FsError::Transient("enrich".into())));
+                }
+            }
+            4 => {
+                if let Some(target) = rng.pick(&known).cloned()
+                    && reachable(&fs, &target).is_some()
+                {
+                    fs.report_unknown_kind(&target);
+                }
+            }
+            _ => {
+                if step % 13 == 0 {
+                    h.run_round();
+                }
+            }
+        }
+    }
+    (h, fs, known)
+}
+
+#[test]
+fn enrichment_never_changes_membership_and_is_never_required_for_round_success() {
+    for seed in 1..6u64 {
+        let (mut h, fs, known) = enrichment_history(seed);
+        fs.clear_failures();
+        for _ in 0..50 {
+            h.run_round();
+            if h.health().reconciliation.last_round == Some(RoundResult::Successful) && h.pending_jobs().is_empty() {
+                break;
+            }
+        }
+        h.run_round();
+        assert_eq!(
+            h.health().reconciliation.last_round,
+            Some(RoundResult::Successful),
+            "RFC 10.1 and 5.1: round success is a membership property, so a pending or failed enrichment must \
+             never keep a round from succeeding; seed {seed}"
+        );
+
+        let mut expected: Vec<String> = Vec::new();
+        for name in &known {
+            if reachable(&fs, name).is_some() {
+                expected.push(name.clone());
+            }
+        }
+        expected.push(".".into());
+        expected.sort();
+        expected.dedup();
+        let mut actual = h.paths();
+        actual.sort();
+        assert_eq!(actual, expected, "seed {seed}");
+
+        let membership = h.paths();
+        h.run_until_idle();
+        assert_eq!(
+            h.paths(),
+            membership,
+            "RFC 10.1: enrichment is separately admitted metadata work and must never change membership; seed {seed}"
+        );
+        assert!(h.stats().enrichments > 0, "seed {seed} exercised no enrichment, so the property was never tested");
     }
 }

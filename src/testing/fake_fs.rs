@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::entry::{EntryKind, FileIdentity, Metadata};
+use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
-    DirEntry, DirectoryListing, EntryInfo, FileSystem, FsCapabilities, FsError, HintKind, WatcherEvent, WatcherKind,
-    WatcherSink,
+    DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities, FsError, HintKind, IdentitySource,
+    KindSource, Observation, ObservationSources, ObservedKind, WatcherEvent, WatcherKind, WatcherSink,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -15,6 +15,8 @@ use crate::path::{CaseSensitivity, RelativePath};
 pub enum FakeOp {
     Metadata,
     ReadDir,
+    ResolveKind,
+    Enrich,
     Watch,
 }
 
@@ -73,7 +75,8 @@ struct Watch {
 
 struct InjectedChild {
     dir: RelativePath,
-    entry: DirEntry,
+    name: std::ffi::OsString,
+    info: EntryInfo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +104,9 @@ struct Inner {
     root_kind: EntryKind,
     costs: HashMap<(CostScope, FakeOp), Duration>,
     domains: Vec<(RelativePath, DomainId)>,
+    sources: HashMap<DomainId, ObservationSources>,
+    default_sources: ObservationSources,
+    unknown_kinds: BTreeSet<RelativePath>,
 }
 
 pub struct FakeFileSystem {
@@ -161,6 +167,9 @@ impl FakeFileSystem {
                 root_kind: EntryKind::Directory,
                 costs: HashMap::new(),
                 domains: Vec::new(),
+                sources: HashMap::new(),
+                default_sources: ObservationSources::INLINE,
+                unknown_kinds: BTreeSet::new(),
             }),
         }
     }
@@ -410,18 +419,11 @@ impl FakeFileSystem {
         inner.next_inode += 1;
         inner.injected.push(InjectedChild {
             dir,
-            entry: DirEntry {
-                name: name.into(),
-                info: EntryInfo {
-                    kind,
-                    metadata: Metadata {
-                        modified: Some(now),
-                        created: Some(now),
-                        size: Some(0),
-                        permissions: Some(0o644),
-                    },
-                    identity: Some(FileIdentity { device: 1, inode }),
-                },
+            name: name.into(),
+            info: EntryInfo {
+                kind,
+                metadata: Metadata { modified: Some(now), created: Some(now), size: Some(0), permissions: Some(0o644) },
+                identity: Some(FileIdentity { device: 1, inode }),
             },
         });
     }
@@ -458,11 +460,108 @@ impl FakeFileSystem {
     }
 
     pub fn cost_of(&self, op: FakeOp, path: &RelativePath) -> Duration {
+        Self::scoped_cost(&lock(&self.inner), op, path)
+    }
+
+    pub fn set_sources(&self, domain: DomainId, sources: ObservationSources) {
+        lock(&self.inner).sources.insert(domain, sources);
+    }
+
+    pub fn set_default_sources(&self, sources: ObservationSources) {
+        lock(&self.inner).default_sources = sources;
+    }
+
+    pub fn report_unknown_kind(&self, p: &str) {
+        let path = Self::path(p);
+        lock(&self.inner).unknown_kinds.insert(path);
+    }
+
+    pub fn sources_of(&self, path: &RelativePath) -> ObservationSources {
         let inner = lock(&self.inner);
+        Self::sources_for(&inner, path)
+    }
+
+    fn sources_for(inner: &Inner, path: &RelativePath) -> ObservationSources {
+        let domain = Self::domain_for(inner, path);
+        inner.sources.get(&domain).copied().unwrap_or(inner.default_sources)
+    }
+
+    fn enumerated_kind(inner: &Inner, path: &RelativePath, kind: EntryKind) -> ObservedKind {
+        match Self::sources_for(inner, path).kind {
+            KindSource::Always => ObservedKind::Resolved(kind),
+            KindSource::Never => ObservedKind::Unresolved,
+            KindSource::Sometimes => {
+                if inner.unknown_kinds.contains(path) {
+                    ObservedKind::Unresolved
+                } else {
+                    ObservedKind::Resolved(kind)
+                }
+            }
+        }
+    }
+
+    fn observe(inner: &mut Inner, path: &RelativePath, info: EntryInfo) -> (Observation, u32) {
+        let sources = Self::sources_for(inner, path);
+        let identity = match sources.identity {
+            IdentitySource::Inline => info.identity,
+            IdentitySource::PerChildRead | IdentitySource::None => None,
+        };
+        let metadata = info.metadata.project(sources.metadata.inline());
+        let mut operations = 0;
+        let kind = match Self::enumerated_kind(inner, path, info.kind) {
+            ObservedKind::Resolved(kind) => ObservedKind::Resolved(kind),
+            ObservedKind::Unresolved => {
+                operations += 1;
+                inner.ops.push((FakeOp::ResolveKind, path.clone()));
+                match Self::take_failure(inner, path, FakeOp::ResolveKind) {
+                    Some(_) => ObservedKind::Unresolved,
+                    None => match Self::lookup(inner, path) {
+                        Ok(resolved) => ObservedKind::Resolved(resolved.kind),
+                        Err(_) => ObservedKind::Unresolved,
+                    },
+                }
+            }
+        };
+        (Observation { kind, metadata, identity }, operations)
+    }
+
+    pub fn listing_cost(&self, path: &RelativePath) -> Duration {
+        let inner = lock(&self.inner);
+        let mut total = Self::scoped_cost(&inner, FakeOp::ReadDir, path);
+        for child in Self::child_paths(&inner, path) {
+            let kind = inner.nodes.get(&child).map(|info| info.kind).unwrap_or(EntryKind::Other);
+            if Self::enumerated_kind(&inner, &child, kind) == ObservedKind::Unresolved {
+                total += Self::scoped_cost(&inner, FakeOp::ResolveKind, &child);
+            }
+        }
+        total
+    }
+
+    pub fn enrichment_cost(&self, path: &RelativePath) -> Duration {
+        let inner = lock(&self.inner);
+        let mut total = Self::scoped_cost(&inner, FakeOp::Enrich, path);
+        for child in Self::child_paths(&inner, path) {
+            total += Self::scoped_cost(&inner, FakeOp::Enrich, &child);
+        }
+        total
+    }
+
+    fn child_paths(inner: &Inner, path: &RelativePath) -> Vec<RelativePath> {
+        let mut children: Vec<RelativePath> =
+            inner.nodes.keys().filter(|k| k.parent().map(|p| p == *path).unwrap_or(false)).cloned().collect();
+        for injected in inner.injected.iter().filter(|c| c.dir == *path) {
+            if let Ok(child) = path.join(&injected.name) {
+                children.push(child);
+            }
+        }
+        children
+    }
+
+    fn scoped_cost(inner: &Inner, op: FakeOp, path: &RelativePath) -> Duration {
         if let Some(cost) = inner.costs.get(&(CostScope::Path(path.clone()), op)) {
             return *cost;
         }
-        let domain = Self::domain_for(&inner, path);
+        let domain = Self::domain_for(inner, path);
         if let Some(cost) = inner.costs.get(&(CostScope::Domain(domain), op)) {
             return *cost;
         }
@@ -655,19 +754,72 @@ impl FileSystem for FakeFileSystem {
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let real: Vec<DirEntry> = inner
+        let real: Vec<(Option<RelativePath>, std::ffi::OsString, EntryInfo)> = inner
             .nodes
             .iter()
             .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
-            .filter_map(|(k, info)| Some(DirEntry { name: k.file_name()?.to_os_string(), info: *info }))
+            .filter_map(|(k, info)| Some((Some(k.clone()), k.file_name()?.to_os_string(), *info)))
             .collect();
-        let injected: Vec<DirEntry> =
-            inner.injected.iter().filter(|c| c.dir == *path).map(|c| c.entry.clone()).collect();
-        let entries = match inner.injected_position {
+        let injected: Vec<(Option<RelativePath>, std::ffi::OsString, EntryInfo)> = inner
+            .injected
+            .iter()
+            .filter(|c| c.dir == *path)
+            .map(|c| (path.join(&c.name).ok(), c.name.clone(), c.info))
+            .collect();
+        let observed: Vec<(Option<RelativePath>, std::ffi::OsString, EntryInfo)> = match inner.injected_position {
             InjectedPosition::Last => real.into_iter().chain(injected).collect(),
             InjectedPosition::First => injected.into_iter().chain(real).collect(),
         };
-        Ok(DirectoryListing { directory, entries })
+        let mut entries = Vec::with_capacity(observed.len());
+        let mut metadata_operations = 0;
+        for (child, name, info) in observed {
+            let observation = match child {
+                Some(child) => {
+                    let (observation, operations) = Self::observe(&mut inner, &child, info);
+                    metadata_operations += operations;
+                    observation
+                }
+                None => Observation::resolved(info),
+            };
+            entries.push(DirEntry { name, info: observation });
+        }
+        let supplied_fields = Self::sources_for(&inner, path).metadata.inline();
+        Ok(DirectoryListing { directory, entries, supplied_fields, metadata_operations })
+    }
+
+    fn observation_sources(&self, path: &RelativePath) -> ObservationSources {
+        Self::sources_for(&lock(&self.inner), path)
+    }
+
+    fn enrich(&self, _root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError> {
+        let mut inner = lock(&self.inner);
+        inner.ops.push((FakeOp::Enrich, path.clone()));
+        if Self::take_panic(&mut inner, path, FakeOp::Enrich) {
+            drop(inner);
+            panic!("injected enrichment panic for {path}");
+        }
+        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Enrich) {
+            return Err(err);
+        }
+        let own = Self::lookup(&inner, path)?;
+        let mut metadata_operations = 1;
+        let directory = Some(own.metadata.project(fields));
+        let mut children = Vec::new();
+        for child in Self::child_paths(&inner, path) {
+            let Some(name) = child.file_name().map(|n| n.to_os_string()) else {
+                continue;
+            };
+            inner.ops.push((FakeOp::Enrich, child.clone()));
+            metadata_operations += 1;
+            if Self::take_failure(&mut inner, &child, FakeOp::Enrich).is_some() {
+                continue;
+            }
+            let Ok(info) = Self::lookup(&inner, &child) else {
+                continue;
+            };
+            children.push((name, info.metadata.project(fields)));
+        }
+        Ok(Enrichment { directory, children, supplied_fields: fields, metadata_operations })
     }
 
     fn watch(

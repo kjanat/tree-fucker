@@ -17,8 +17,9 @@ pub use config::{ClassWeights, Config, LagMode, WatchRegistrationFailure};
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};
 pub use fs::{
-    DirEntry, DirectoryListing, EntryInfo, FileSystem, FsCapabilities, FsError, HintKind, WatcherEvent, WatcherKind,
-    WatcherSink,
+    DirEntry, DirectoryListing, Enrichment, EntryInfo, FieldSource, FileSystem, FsCapabilities, FsError, HintKind,
+    IdentitySource, KindSource, MetadataSources, Observation, ObservationSources, ObservedKind, WatcherEvent,
+    WatcherKind, WatcherSink,
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,

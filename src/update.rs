@@ -84,6 +84,7 @@ pub enum RoundResult {
 pub struct ReconciliationHealth {
     pub last_round: Option<RoundResult>,
     pub degraded_paths: BTreeSet<RelativePath>,
+    pub metadata_degraded_paths: BTreeSet<RelativePath>,
     pub coverage_pending: bool,
 }
 
@@ -160,6 +161,7 @@ pub enum ErrorCause {
     LimitExceeded,
     InvalidName(std::ffi::OsString),
     DuplicateName(std::ffi::OsString),
+    UnresolvedKind(std::ffi::OsString),
     WatcherLost(String),
     WorkerLost,
     WorkerStuck,
@@ -172,6 +174,7 @@ impl fmt::Display for ErrorCause {
             ErrorCause::LimitExceeded => f.write_str("configured entry limit exceeded"),
             ErrorCause::InvalidName(n) => write!(f, "unrepresentable name {n:?}"),
             ErrorCause::DuplicateName(n) => write!(f, "duplicate name {n:?}"),
+            ErrorCause::UnresolvedKind(n) => write!(f, "unresolved kind for {n:?}"),
             ErrorCause::WatcherLost(m) => write!(f, "watcher lost: {m}"),
             ErrorCause::WorkerLost => f.write_str("filesystem worker lost"),
             ErrorCause::WorkerStuck => f.write_str("filesystem worker stuck"),

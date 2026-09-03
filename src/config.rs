@@ -83,7 +83,7 @@ impl Default for Config {
             fixed_interval: None,
             baseline_share: 0.5,
             class_weights: ClassWeights::default(),
-            metadata_fields: MetadataFields::default(),
+            metadata_fields: MetadataFields::NONE,
             lag_mode: LagMode::Reset,
             jitter_seed: 0,
         }

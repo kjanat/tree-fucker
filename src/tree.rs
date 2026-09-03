@@ -277,6 +277,9 @@ impl Actor {
                         let result = match spec.operation {
                             JobOperation::Listing => JobResult::Listing(fs.read_dir(&root, &spec.path)),
                             JobOperation::Metadata => JobResult::Metadata(fs.metadata(&root, &spec.path)),
+                            JobOperation::Enrichment { fields } => {
+                                JobResult::Enrichment(fs.enrich(&root, &spec.path, fields))
+                            }
                         };
                         guard.finish(Input::JobCompleted { job, result });
                     }));

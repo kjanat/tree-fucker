@@ -21,7 +21,9 @@ impl Coordinator {
             return;
         };
         let fatal = match &result {
-            JobResult::Listing(Err(FsError::Fatal(m))) | JobResult::Metadata(Err(FsError::Fatal(m))) => Some(m.clone()),
+            JobResult::Listing(Err(FsError::Fatal(m)))
+            | JobResult::Metadata(Err(FsError::Fatal(m)))
+            | JobResult::Enrichment(Err(FsError::Fatal(m))) => Some(m.clone()),
             _ => None,
         };
         if let Some(message) = fatal {
@@ -50,6 +52,9 @@ impl Coordinator {
                             ListingRejection::LimitExceeded => JobOutcome::LimitExceeded,
                             ListingRejection::MalformedNames => {
                                 JobOutcome::Failed(FsError::Transient("listing has an unusable child name".into()))
+                            }
+                            ListingRejection::UnresolvedChild => {
+                                JobOutcome::Failed(FsError::Transient("listing has an unresolved child kind".into()))
                             }
                         };
                         self.finish_job(id, outcome)
@@ -101,6 +106,16 @@ impl Coordinator {
             (ReadNeed::Metadata, _, JobResult::Metadata(Ok(info))) => {
                 let outcome = self.commit_metadata(&job, info);
                 self.finish_job(id, outcome);
+            }
+            (ReadNeed::Enrichment(fields), _, JobResult::Enrichment(Ok(read))) => {
+                let outcome = self.commit_enrichment(&job, fields, read);
+                self.finish_job(id, outcome);
+            }
+            (ReadNeed::Enrichment(_), _, JobResult::Enrichment(Err(FsError::Fatal(m)))) => {
+                self.terminate(FsError::Fatal(m));
+            }
+            (ReadNeed::Enrichment(_), _, JobResult::Enrichment(Err(err))) => {
+                self.finish_job(id, JobOutcome::Failed(err))
             }
             (ReadNeed::Metadata, _, JobResult::Metadata(Err(FsError::NotFound))) => self.on_not_found(&job),
             (ReadNeed::Metadata, _, JobResult::Metadata(Err(FsError::NotDirectory))) => {
@@ -194,7 +209,7 @@ impl Coordinator {
                 self.finish_job(job.id, JobOutcome::Accepted);
                 self.schedule_probe(true);
             }
-            JobResult::Listing(_) => {
+            JobResult::Listing(_) | JobResult::Enrichment(_) => {
                 self.finish_job(job.id, JobOutcome::Accepted);
                 self.schedule_probe(true);
             }
@@ -258,9 +273,14 @@ impl Coordinator {
         }
         self.queue_order.retain(|q| *q != id);
         if let Some(entry) = job.entry() {
-            self.settle_obligations(&job, &outcome);
-            self.settle_commands(&job, &outcome);
-            self.settle_retry(entry, &job, &outcome);
+            match job.need {
+                ReadNeed::Enrichment(fields) => self.settle_enrichment(entry, &job, fields, &outcome),
+                ReadNeed::Metadata | ReadNeed::Listing => {
+                    self.settle_obligations(&job, &outcome);
+                    self.settle_commands(&job, &outcome);
+                    self.settle_retry(entry, &job, &outcome);
+                }
+            }
         }
         self.job_terminal(id);
     }
@@ -345,7 +365,7 @@ impl Coordinator {
 
     fn retry_phase(need: ReadNeed) -> RetryPhase {
         match need {
-            ReadNeed::Listing => RetryPhase::Listing,
+            ReadNeed::Listing | ReadNeed::Enrichment(_) => RetryPhase::Listing,
             ReadNeed::Metadata => RetryPhase::Metadata,
         }
     }
@@ -392,7 +412,7 @@ impl Coordinator {
                 let clear = match (self.entries.retry(entry).map(|r| r.phase), job.need) {
                     (Some(_), ReadNeed::Listing) => true,
                     (Some(phase), ReadNeed::Metadata) => phase == RetryPhase::Metadata,
-                    (None, _) => false,
+                    (Some(_), ReadNeed::Enrichment(_)) | (None, _) => false,
                 };
                 if clear {
                     self.entries.clear_retry(entry);
@@ -532,8 +552,57 @@ impl Coordinator {
     fn still_required(current: &crate::entry::Entry, need: ReadNeed) -> bool {
         match need {
             ReadNeed::Listing => matches!(current.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
+            ReadNeed::Enrichment(_) => current.is_loaded(),
             ReadNeed::Metadata => true,
         }
+    }
+
+    fn settle_enrichment(
+        &mut self,
+        entry: EntryId,
+        job: &ActiveJob,
+        fields: crate::entry::MetadataFields,
+        outcome: &JobOutcome,
+    ) {
+        match outcome {
+            JobOutcome::Accepted => {}
+            JobOutcome::Removed | JobOutcome::Cancelled => {
+                self.pending_enrichment.remove(&entry);
+            }
+            JobOutcome::Stale => {
+                let reasons = job.reasons;
+                self.request_enrichment(entry, fields, reasons);
+            }
+            JobOutcome::Failed(err) => {
+                self.enrichment_failures += 1;
+                self.push_error(job.path.clone(), Operation::Metadata, err.clone());
+                self.retry_enrichment(entry, job, fields);
+            }
+            JobOutcome::LimitExceeded
+            | JobOutcome::WatcherRegistrationFailed
+            | JobOutcome::WorkerLost
+            | JobOutcome::Stuck => {
+                self.enrichment_failures += 1;
+                self.retry_enrichment(entry, job, fields);
+            }
+        }
+    }
+
+    fn retry_enrichment(&mut self, entry: EntryId, job: &ActiveJob, fields: crate::entry::MetadataFields) {
+        let Some(current) = self.snapshot.get_by_id(entry).cloned() else {
+            return;
+        };
+        if !current.is_loaded() {
+            self.pending_enrichment.remove(&entry);
+            return;
+        }
+        self.entries.set_metadata_degraded(entry, Some(DegradedCause::Enrichment));
+        let attempts = self.pending_enrichment.get(&entry).map(|r| r.attempts + 1).unwrap_or(1);
+        let due = self.now + self.backoff(attempts);
+        let mut reasons = job.reasons;
+        reasons.retry = true;
+        self.pending_enrichment
+            .insert(entry, EnrichmentRequest { path: current.path.clone(), fields, reasons, attempts, due: Some(due) });
     }
 
     fn abandon_registration(&mut self, request: WatchRequestId) {

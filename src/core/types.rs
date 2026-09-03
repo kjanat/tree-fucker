@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Add;
 use std::time::Duration;
 
+use crate::entry::MetadataFields;
 use crate::fs::FsError;
 use crate::ids::*;
 use crate::path::{PathKey, RelativePath};
@@ -122,6 +123,28 @@ impl Reasons {
 pub enum ReadNeed {
     Metadata,
     Listing,
+    Enrichment(MetadataFields),
+}
+
+impl ReadNeed {
+    pub fn observes_children(self) -> bool {
+        matches!(self, ReadNeed::Listing | ReadNeed::Enrichment(_))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EnrichmentRequest {
+    pub path: RelativePath,
+    pub fields: MetadataFields,
+    pub reasons: Reasons,
+    pub attempts: u32,
+    pub due: Option<MonotonicTime>,
+}
+
+impl EnrichmentRequest {
+    pub fn ready(&self, now: MonotonicTime) -> bool {
+        self.due.map(|at| at <= now).unwrap_or(true)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +315,7 @@ pub enum DegradedCause {
     Unsupported,
     LimitExceeded,
     WatcherRegistration,
+    Enrichment,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,6 +365,7 @@ pub struct EntryState {
     pub transient_failures: u32,
     retry: Option<RetryRecord>,
     degraded: Option<DegradedCause>,
+    metadata_degraded: Option<DegradedCause>,
     dir: Option<DirState>,
 }
 
@@ -371,6 +396,7 @@ pub struct EntryStates {
     states: HashMap<EntryId, EntryState>,
     due: BTreeMap<MonotonicTime, BTreeSet<EntryId>>,
     degraded: BTreeSet<EntryId>,
+    metadata_degraded: BTreeSet<EntryId>,
     uncovered: usize,
     covered: BTreeMap<ReconciliationGeneration, usize>,
 }
@@ -405,6 +431,7 @@ impl EntryStates {
         } else {
             self.degraded.remove(&id);
         }
+        self.metadata_degraded.remove(&id);
         self.acquire_coverage(coverage);
         Self::index(&mut self.due, due, id);
     }
@@ -413,6 +440,7 @@ impl EntryStates {
         let previous = self.states.remove(&id)?;
         Self::unindex(&mut self.due, previous.retry.as_ref().and_then(|r| r.due), id);
         self.degraded.remove(&id);
+        self.metadata_degraded.remove(&id);
         self.release_coverage(previous.coverage());
         Some(previous)
     }
@@ -421,8 +449,28 @@ impl EntryStates {
         self.states.clear();
         self.due.clear();
         self.degraded.clear();
+        self.metadata_degraded.clear();
         self.uncovered = 0;
         self.covered.clear();
+    }
+
+    pub fn set_metadata_degraded(&mut self, id: EntryId, cause: Option<DegradedCause>) {
+        let Some(state) = self.states.get_mut(&id) else {
+            return;
+        };
+        state.metadata_degraded = cause;
+        match cause {
+            Some(_) => {
+                self.metadata_degraded.insert(id);
+            }
+            None => {
+                self.metadata_degraded.remove(&id);
+            }
+        }
+    }
+
+    pub fn metadata_degraded_ids(&self) -> impl Iterator<Item = EntryId> {
+        self.metadata_degraded.iter().copied()
     }
 
     pub fn set_degraded(&mut self, id: EntryId, cause: Option<DegradedCause>) {
@@ -815,6 +863,7 @@ impl RootState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListingRejection {
     MalformedNames,
+    UnresolvedChild,
     LimitExceeded,
 }
 

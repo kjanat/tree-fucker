@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::entry::{EntryKind, FileIdentity, Metadata};
-use crate::fs::{DirEntry, DirectoryListing, EntryInfo, FileSystem, FsCapabilities, FsError, WatcherKind, WatcherSink};
+use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
+use crate::fs::{
+    DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities, FsError, IdentitySource, KindSource,
+    MetadataSources, Observation, ObservationSources, ObservedKind, WatcherKind, WatcherSink,
+};
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
 
@@ -32,9 +35,8 @@ impl Default for StdFileSystem {
     }
 }
 
-fn info_from(metadata: &std::fs::Metadata) -> EntryInfo {
-    let file_type = metadata.file_type();
-    let kind = if file_type.is_symlink() {
+fn kind_of(file_type: std::fs::FileType) -> EntryKind {
+    if file_type.is_symlink() {
         EntryKind::Symlink
     } else if file_type.is_dir() {
         EntryKind::Directory
@@ -42,9 +44,23 @@ fn info_from(metadata: &std::fs::Metadata) -> EntryInfo {
         EntryKind::File
     } else {
         EntryKind::Other
-    };
+    }
+}
+
+#[cfg(unix)]
+fn inline_identity(directory: &std::fs::Metadata, item: &std::fs::DirEntry) -> Option<FileIdentity> {
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+    Some(FileIdentity { device: directory.dev(), inode: item.ino() })
+}
+
+#[cfg(not(unix))]
+fn inline_identity(_directory: &std::fs::Metadata, _item: &std::fs::DirEntry) -> Option<FileIdentity> {
+    None
+}
+
+fn info_from(metadata: &std::fs::Metadata) -> EntryInfo {
     EntryInfo {
-        kind,
+        kind: kind_of(metadata.file_type()),
         metadata: Metadata {
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
@@ -100,16 +116,57 @@ impl FileSystem for StdFileSystem {
             return Err(FsError::NotDirectory);
         }
         let mut entries = Vec::new();
+        let mut metadata_operations = 0;
         for item in std::fs::read_dir(&full)? {
             let item = item?;
-            let metadata = match item.metadata() {
-                Ok(m) => m,
+            let kind = match item.file_type() {
+                Ok(file_type) => ObservedKind::Resolved(kind_of(file_type)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    metadata_operations += 1;
+                    match std::fs::symlink_metadata(item.path()) {
+                        Ok(metadata) => ObservedKind::Resolved(kind_of(metadata.file_type())),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => ObservedKind::Unresolved,
+                    }
+                }
+            };
+            let info = Observation { kind, metadata: Metadata::default(), identity: inline_identity(&own, &item) };
+            entries.push(DirEntry { name: item.file_name(), info });
+        }
+        Ok(DirectoryListing {
+            directory,
+            entries,
+            supplied_fields: MetadataSources::PER_CHILD_READ.inline(),
+            metadata_operations,
+        })
+    }
+
+    fn observation_sources(&self, _path: &RelativePath) -> ObservationSources {
+        ObservationSources {
+            kind: KindSource::Sometimes,
+            identity: if cfg!(unix) { IdentitySource::Inline } else { IdentitySource::None },
+            metadata: MetadataSources::PER_CHILD_READ,
+        }
+    }
+
+    fn enrich(&self, root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError> {
+        let full = path.under(root);
+        let own = std::fs::symlink_metadata(&full)?;
+        let mut metadata_operations = 1;
+        let directory = Some(info_from(&own).metadata.project(fields));
+        let mut children = Vec::new();
+        for item in std::fs::read_dir(&full)? {
+            let item = item?;
+            metadata_operations += 1;
+            let metadata = match std::fs::symlink_metadata(item.path()) {
+                Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
-            entries.push(DirEntry { name: item.file_name(), info: info_from(&metadata) });
+            children.push((item.file_name(), info_from(&metadata).metadata.project(fields)));
         }
-        Ok(DirectoryListing { directory, entries })
+        Ok(Enrichment { directory, children, supplied_fields: fields, metadata_operations })
     }
 
     fn watch(

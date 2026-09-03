@@ -7,11 +7,16 @@ use tree_fucker::update::{
     ErrorCause, InitialScanState, Operation, RecoverableError, RootAvailability, RoundResult, UpdateEvent,
 };
 use tree_fucker::{
-    Config, EntryKind, Error, FsError, LoadAll, LoadDepth, LoadState, PathChange, RelativePath, WatcherKind,
+    Config, EntryKind, Error, FsError, LoadAll, LoadDepth, LoadState, MetadataFields, PathChange, RelativePath,
+    WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
+}
+
+fn sizes() -> Config {
+    Config { metadata_fields: MetadataFields { size: true, ..MetadataFields::NONE }, ..Default::default() }
 }
 
 fn populated(watcher: WatcherKind) -> Arc<FakeFileSystem> {
@@ -28,7 +33,7 @@ fn populated(watcher: WatcherKind) -> Arc<FakeFileSystem> {
 #[test]
 fn initial_scan_builds_tree() {
     let fs = populated(WatcherKind::None);
-    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), sizes()).expect("open");
     h.run_until_idle();
     assert_eq!(h.paths(), [".", "a", "a/b", "a/b/f1", "a/f2", "c", "root.txt"]);
     assert!(matches!(h.health().initial_scan, InitialScanState::Complete { .. }));
@@ -66,7 +71,7 @@ fn depth_policy_leaves_deeper_directories_unloaded_until_loaded() {
 #[test]
 fn reconciliation_round_detects_changes_without_events_or_mtime() {
     let fs = populated(WatcherKind::None);
-    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), sizes()).expect("open");
     h.run_until_idle();
     let mtime = fs.mtime("a").expect("mtime");
     fs.add_silently("a/new", EntryKind::File);
@@ -116,7 +121,7 @@ fn dropped_watcher_events_are_repaired_by_reconciliation() {
 #[test]
 fn refresh_target_resolution() {
     let fs = populated(WatcherKind::None);
-    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadDepth { depth: 1 }));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadDepth { depth: 1 }), sizes()).expect("open");
     h.run_until_idle();
     let t = h.command(Command::Refresh(vec![path("missing/deeper")]));
     h.run_until_idle();
@@ -154,7 +159,7 @@ fn refresh_of_removed_entry_commits_removal() {
 #[test]
 fn path_changes_follow_canonical_order() {
     let fs = populated(WatcherKind::None);
-    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), sizes()).expect("open");
     h.run_until_idle();
     h.take_events();
     fs.remove_silently("a/b");

@@ -19,9 +19,9 @@ use types::*;
 pub use types::{Class, MonotonicTime};
 
 use crate::config::Config;
-use crate::entry::{LoadState, Shape};
+use crate::entry::{LoadState, MetadataFields, Shape};
 use crate::error::Error;
-use crate::fs::{DirectoryListing, EntryInfo, FsCapabilities, FsError, WatcherEvent, WatcherKind};
+use crate::fs::{DirectoryListing, Enrichment, EntryInfo, FsCapabilities, FsError, WatcherEvent, WatcherKind};
 use crate::ids::*;
 use crate::path::RelativePath;
 use crate::policy::{PolicyContext, ScanPolicy};
@@ -46,6 +46,7 @@ pub enum Command {
 pub enum JobOperation {
     Listing,
     Metadata,
+    Enrichment { fields: MetadataFields },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub struct JobSpec {
 pub enum JobResult {
     Listing(Result<DirectoryListing, FsError>),
     Metadata(Result<EntryInfo, FsError>),
+    Enrichment(Result<Enrichment, FsError>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -139,6 +141,13 @@ pub struct Stats {
     pub last_listing_duration: Option<Duration>,
     pub last_listing_children: Option<usize>,
     pub degraded_paths: BTreeSet<RelativePath>,
+    pub metadata_degraded_paths: BTreeSet<RelativePath>,
+    pub metadata_operations: u64,
+    pub kind_resolutions: u64,
+    pub unresolved_listings: u64,
+    pub enrichments: u64,
+    pub enrichment_failures: u64,
+    pub pending_enrichments: usize,
 }
 
 pub struct Coordinator {
@@ -160,6 +169,7 @@ pub struct Coordinator {
     initial_scan: InitialScan,
     entries: EntryStates,
     pending: HashMap<EntryId, PendingRequest>,
+    pending_enrichment: HashMap<EntryId, EnrichmentRequest>,
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
     jobs: HashMap<JobId, ActiveJob>,
@@ -197,6 +207,11 @@ pub struct Coordinator {
     listing_failures: u64,
     stale_results: u64,
     lost_workers: u64,
+    metadata_operations: u64,
+    kind_resolutions: u64,
+    unresolved_listings: u64,
+    enrichments: u64,
+    enrichment_failures: u64,
     last_listing_duration: Option<Duration>,
     last_listing_children: Option<usize>,
 }
@@ -235,6 +250,7 @@ impl Coordinator {
             initial_scan: InitialScan::new(),
             entries: EntryStates::default(),
             pending: HashMap::new(),
+            pending_enrichment: HashMap::new(),
             root_probe: None,
             probe_attempts: 0,
             jobs: HashMap::new(),
@@ -276,6 +292,11 @@ impl Coordinator {
             listing_failures: 0,
             stale_results: 0,
             lost_workers: 0,
+            metadata_operations: 0,
+            kind_resolutions: 0,
+            unresolved_listings: 0,
+            enrichments: 0,
+            enrichment_failures: 0,
             last_listing_duration: None,
             last_listing_children: None,
         };
@@ -313,6 +334,18 @@ impl Coordinator {
 
     pub fn job_class(&self, id: JobId) -> Option<Class> {
         self.jobs.get(&id).map(|job| job.reasons.class())
+    }
+
+    pub fn job_operation(&self, id: JobId) -> Option<JobOperation> {
+        self.jobs.get(&id).map(|job| Coordinator::operation_for(job.need))
+    }
+
+    pub(super) fn operation_for(need: ReadNeed) -> JobOperation {
+        match need {
+            ReadNeed::Listing => JobOperation::Listing,
+            ReadNeed::Metadata => JobOperation::Metadata,
+            ReadNeed::Enrichment(fields) => JobOperation::Enrichment { fields },
+        }
     }
 
     pub fn grants(&self) -> Vec<Grant> {
@@ -446,6 +479,13 @@ impl Coordinator {
             last_listing_duration: self.last_listing_duration,
             last_listing_children: self.last_listing_children,
             degraded_paths: self.degraded_paths(),
+            metadata_degraded_paths: self.metadata_degraded_paths(),
+            metadata_operations: self.metadata_operations,
+            kind_resolutions: self.kind_resolutions,
+            unresolved_listings: self.unresolved_listings,
+            enrichments: self.enrichments,
+            enrichment_failures: self.enrichment_failures,
+            pending_enrichments: self.pending_enrichment.len(),
         }
     }
 
@@ -615,6 +655,13 @@ impl Coordinator {
         self.entries.degraded_ids().filter_map(|id| self.snapshot.get_by_id(id).map(|e| e.path.clone())).collect()
     }
 
+    fn metadata_degraded_paths(&self) -> BTreeSet<RelativePath> {
+        self.entries
+            .metadata_degraded_ids()
+            .filter_map(|id| self.snapshot.get_by_id(id).map(|e| e.path.clone()))
+            .collect()
+    }
+
     fn initial_scan_state(&self) -> InitialScanState {
         match self.root {
             RootState::Unavailable { .. } => InitialScanState::Unavailable,
@@ -649,6 +696,7 @@ impl Coordinator {
             reconciliation: ReconciliationHealth {
                 last_round: self.last_round_result.clone(),
                 degraded_paths: self.degraded_paths(),
+                metadata_degraded_paths: self.metadata_degraded_paths(),
                 coverage_pending,
             },
             resource: self.resource_health(),
@@ -763,6 +811,9 @@ impl Coordinator {
             consider(t);
         }
         if let Some(t) = self.entries.earliest_retry() {
+            consider(t);
+        }
+        if let Some(t) = self.pending_enrichment.values().filter_map(|r| r.due).min() {
             consider(t);
         }
         if let Some(t) = self.watcher_restart_due {

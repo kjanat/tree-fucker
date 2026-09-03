@@ -15,6 +15,7 @@ impl Coordinator {
         }
         let periodic = self.baseline_due;
         self.materialize_retries();
+        self.materialize_enrichment();
         if periodic {
             self.ensure_round();
             self.materialize_priority();
@@ -72,15 +73,31 @@ impl Coordinator {
         self.probe_job.is_none() && self.root_probe.as_ref().map(|p| p.ready(self.now)).unwrap_or(false)
     }
 
-    fn ready_expedited(&self) -> Vec<EntryId> {
-        let mut ready: Vec<(crate::path::PathKey, EntryId)> = self
+    fn ready_expedited(&self) -> Vec<Ready> {
+        let mut reads: Vec<(crate::path::PathKey, EntryId)> = self
             .pending
             .iter()
             .filter(|(id, _)| !self.active_by_entry.contains_key(id) && self.snapshot.contains_id(**id))
             .map(|(id, request)| (self.snapshot.key(&request.path), *id))
             .collect();
-        ready.sort();
-        ready.into_iter().map(|(_, id)| id).collect()
+        reads.sort();
+        let mut enrichments: Vec<(crate::path::PathKey, EntryId)> = self
+            .pending_enrichment
+            .iter()
+            .filter(|(id, request)| {
+                !self.active_by_entry.contains_key(id)
+                    && !self.pending.contains_key(id)
+                    && self.snapshot.get_by_id(**id).map(|e| e.is_loaded()).unwrap_or(false)
+                    && request.ready(self.now)
+            })
+            .map(|(id, request)| (self.snapshot.key(&request.path), *id))
+            .collect();
+        enrichments.sort();
+        reads
+            .into_iter()
+            .map(|(_, id)| Ready::Read(id))
+            .chain(enrichments.into_iter().map(|(_, id)| Ready::Enrich(id)))
+            .collect()
     }
 
     fn materialize_retries(&mut self) {
@@ -99,6 +116,7 @@ impl Coordinator {
             let barriers = record.barriers.clone();
             let still_required = match need {
                 ReadNeed::Listing => matches!(entry.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
+                ReadNeed::Enrichment(_) => entry.is_loaded(),
                 ReadNeed::Metadata => true,
             };
             if !still_required {
@@ -106,6 +124,15 @@ impl Coordinator {
                 continue;
             }
             self.request(id, entry.path.clone(), need, reasons, barriers);
+        }
+    }
+
+    fn materialize_enrichment(&mut self) {
+        let now = self.now;
+        for request in self.pending_enrichment.values_mut() {
+            if request.due.is_some_and(|at| at <= now) {
+                request.due = None;
+            }
         }
     }
 
@@ -267,18 +294,23 @@ impl Coordinator {
         }
     }
 
-    fn admit_expedited(&mut self, slots: usize, ready: Vec<EntryId>, members: &mut HashSet<JobId>) -> bool {
-        let mut by_class: [Vec<EntryId>; 5] = Default::default();
-        for id in ready {
+    fn admit_expedited(&mut self, slots: usize, ready: Vec<Ready>, members: &mut HashSet<JobId>) -> bool {
+        let mut by_class: [Vec<Ready>; 5] = Default::default();
+        for candidate in ready {
+            let id = candidate.entry();
             if members.iter().any(|j| self.jobs.get(j).map(|job| job.entry() == Some(id)).unwrap_or(false)) {
                 continue;
             }
-            let Some(request) = self.pending.get(&id) else {
+            let reasons = match candidate {
+                Ready::Read(id) => self.pending.get(&id).map(|request| request.reasons),
+                Ready::Enrich(id) => self.pending_enrichment.get(&id).map(|request| request.reasons),
+            };
+            let Some(reasons) = reasons else {
                 continue;
             };
-            let class = request.reasons.expedited_class();
+            let class = reasons.expedited_class();
             let slot = EXPEDITED_CLASSES.iter().position(|c| *c == class).unwrap_or(0);
-            by_class[slot].push(id);
+            by_class[slot].push(candidate);
         }
         let mut probe_pending = self.probe_ready();
         let weights = [
@@ -344,15 +376,33 @@ impl Coordinator {
                     }
                 }
             }
-            for id in by_class[i].iter().take(take) {
-                let Some(request) = self.pending.get(id).cloned() else {
+            for candidate in by_class[i].clone().into_iter().take(take) {
+                let request = match candidate {
+                    Ready::Read(id) => self.pending.get(&id).cloned(),
+                    Ready::Enrich(id) => self.pending_enrichment.get(&id).map(|request| PendingRequest {
+                        path: request.path.clone(),
+                        need: ReadNeed::Enrichment(request.fields),
+                        reasons: request.reasons,
+                        barriers: Vec::new(),
+                        designate_for_round: None,
+                    }),
+                };
+                let Some(request) = request else {
                     continue;
                 };
-                let Some(grant) = self.try_grant(Some(*id), request.need, &request.path) else {
+                let id = candidate.entry();
+                let Some(grant) = self.try_grant(Some(id), request.need, &request.path) else {
                     return false;
                 };
-                self.pending.remove(id);
-                let job_id = self.admit(grant, Some(*id), request);
+                match candidate {
+                    Ready::Read(id) => {
+                        self.pending.remove(&id);
+                    }
+                    Ready::Enrich(id) => {
+                        self.pending_enrichment.remove(&id);
+                    }
+                }
+                let job_id = self.admit(grant, Some(id), request);
                 members.insert(job_id);
             }
         }
@@ -432,6 +482,9 @@ impl Coordinator {
     }
 
     fn merge_retry_record(&self, entry: EntryId, need: ReadNeed, reasons: &mut Reasons, barriers: &mut Vec<CommandId>) {
+        if matches!(need, ReadNeed::Enrichment(_)) {
+            return;
+        }
         let Some(record) = self.entries.retry(entry) else {
             return;
         };
@@ -480,7 +533,7 @@ impl Coordinator {
             policy_revision: self.policy.revision(),
             policy_fence: self.policy_fence,
             parent_context: parent.and_then(|p| self.dir_state(p)).map(|d| d.context_generation),
-            child_state: if need == ReadNeed::Listing {
+            child_state: if need.observes_children() {
                 state.and_then(|s| s.dir()).map(|d| d.child_state)
             } else {
                 None
@@ -531,10 +584,7 @@ impl Coordinator {
                 self.finish_job(id, JobOutcome::Cancelled);
                 continue;
             }
-            let operation = match job.need {
-                ReadNeed::Listing => JobOperation::Listing,
-                ReadNeed::Metadata => JobOperation::Metadata,
-            };
+            let operation = Coordinator::operation_for(job.need);
             let now = self.now;
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.phase = JobPhase::Running(now);
@@ -618,4 +668,18 @@ type RelativePathOwned = crate::path::RelativePath;
 pub(super) struct JobGrant {
     pub id: JobId,
     pub registration: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ready {
+    Read(EntryId),
+    Enrich(EntryId),
+}
+
+impl Ready {
+    fn entry(self) -> EntryId {
+        match self {
+            Ready::Read(id) | Ready::Enrich(id) => id,
+        }
+    }
 }

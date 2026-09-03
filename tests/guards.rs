@@ -4,11 +4,16 @@ use tree_fucker::core::{Command, JobResult};
 use tree_fucker::testing::{FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{RoundResult, UpdateEvent};
 use tree_fucker::{
-    EntryKind, FileSystem, FsError, LoadAll, LoadState, PathPredicate, RelativePath, ScanDecision, WatcherKind,
+    Config, EntryKind, FileSystem, FsError, LoadAll, LoadState, MetadataFields, PathPredicate, RelativePath,
+    ScanDecision, WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
+}
+
+fn sizes() -> Config {
+    Config { metadata_fields: MetadataFields { size: true, ..MetadataFields::NONE }, ..Default::default() }
 }
 
 fn populated() -> Arc<FakeFileSystem> {
@@ -23,7 +28,7 @@ fn populated() -> Arc<FakeFileSystem> {
 }
 
 fn scanned(fs: &Arc<FakeFileSystem>) -> Harness {
-    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), sizes()).expect("open");
     h.run_until_idle();
     h
 }

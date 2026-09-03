@@ -71,9 +71,18 @@ impl Metadata {
             permissions: if fields.permissions { self.permissions } else { None },
         }
     }
+
+    pub fn merged(&self, supplied: Metadata, fields: MetadataFields) -> Metadata {
+        Metadata {
+            modified: if fields.modified { supplied.modified } else { self.modified },
+            created: if fields.created { supplied.created } else { self.created },
+            size: if fields.size { supplied.size } else { self.size },
+            permissions: if fields.permissions { supplied.permissions } else { self.permissions },
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MetadataFields {
     pub modified: bool,
     pub created: bool,
@@ -85,11 +94,27 @@ impl MetadataFields {
     pub const NONE: MetadataFields =
         MetadataFields { modified: false, created: false, size: false, permissions: false };
     pub const ALL: MetadataFields = MetadataFields { modified: true, created: true, size: true, permissions: true };
-}
 
-impl Default for MetadataFields {
-    fn default() -> Self {
-        MetadataFields { modified: true, created: false, size: true, permissions: false }
+    pub const fn any(self) -> bool {
+        self.modified || self.created || self.size || self.permissions
+    }
+
+    pub const fn intersect(self, other: MetadataFields) -> MetadataFields {
+        MetadataFields {
+            modified: self.modified && other.modified,
+            created: self.created && other.created,
+            size: self.size && other.size,
+            permissions: self.permissions && other.permissions,
+        }
+    }
+
+    pub const fn without(self, other: MetadataFields) -> MetadataFields {
+        MetadataFields {
+            modified: self.modified && !other.modified,
+            created: self.created && !other.created,
+            size: self.size && !other.size,
+            permissions: self.permissions && !other.permissions,
+        }
     }
 }
 

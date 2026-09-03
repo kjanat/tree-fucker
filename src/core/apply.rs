@@ -5,9 +5,9 @@ use std::time::SystemTime;
 
 use super::types::*;
 use super::{Coordinator, Output};
-use crate::entry::{Entry, EntryKind, LoadState, Shape};
+use crate::entry::{Entry, EntryKind, LoadState, Metadata, MetadataFields, Shape};
 use crate::error::Error;
-use crate::fs::{DirEntry, DirectoryListing, EntryInfo};
+use crate::fs::{DirEntry, DirectoryListing, Enrichment, EntryInfo, Observation};
 use crate::ids::*;
 use crate::path::{PathKey, RelativePath};
 use crate::policy::{PolicyContext, ScanDecision};
@@ -17,6 +17,12 @@ use crate::update::{ErrorCause, Operation, PathChange};
 pub(super) struct Observed<'a> {
     pub path: &'a RelativePath,
     pub info: EntryInfo,
+}
+
+pub(super) struct Classification<'a> {
+    pub ctx: &'a PolicyContext,
+    pub inherit: Reasons,
+    pub fields: MetadataFields,
 }
 
 enum IdentityMatch {
@@ -86,13 +92,19 @@ impl Coordinator {
             return Ok(());
         };
         let fields = self.config.metadata_fields;
+        let observed_fields = fields.intersect(listing.supplied_fields);
         let case = self.caps.case;
         let dir_key = self.snapshot.key(&dir.path);
         let mut order: Vec<PathKey> = Vec::with_capacity(listing.entries.len());
         let mut chosen: HashMap<PathKey, Chosen> = HashMap::with_capacity(listing.entries.len());
         let mut malformed: Vec<ErrorCause> = Vec::new();
         let mut duplicates: Vec<OsString> = Vec::new();
+        let mut unresolved: Vec<OsString> = Vec::new();
         for DirEntry { name, info } in &listing.entries {
+            let Some(info) = info.info() else {
+                unresolved.push(name.clone());
+                continue;
+            };
             let (path, key) = match (dir.path.join(name), dir_key.child(name, case)) {
                 (Ok(path), Ok(key)) => (path, key),
                 _ => {
@@ -100,7 +112,7 @@ impl Coordinator {
                     continue;
                 }
             };
-            let candidate = Chosen { name: name.clone(), path, info: *info };
+            let candidate = Chosen { name: name.clone(), path, info };
             match chosen.get_mut(&key) {
                 Some(kept) => {
                     if collision_key(&candidate) < collision_key(kept) {
@@ -114,6 +126,14 @@ impl Coordinator {
                     chosen.insert(key, candidate);
                 }
             }
+        }
+        if !unresolved.is_empty() {
+            self.unresolved_listings += 1;
+            unresolved.sort();
+            for name in unresolved {
+                self.push_error(dir.path.clone(), Operation::Listing, ErrorCause::UnresolvedKind(name));
+            }
+            return Err(ListingRejection::UnresolvedChild);
         }
         if !malformed.is_empty() {
             for cause in malformed {
@@ -130,6 +150,8 @@ impl Coordinator {
         let mut effects = Effects::default();
         let was_loading = dir.shape == Shape::Directory(LoadState::Loading);
         let new_metadata = listing.directory.metadata.project(fields);
+        self.metadata_operations += u64::from(listing.metadata_operations);
+        self.kind_resolutions += u64::from(listing.metadata_operations);
         if was_loading || dir.metadata != new_metadata || dir.identity != listing.directory.identity {
             let _ = builder.update(dir_id, |e| {
                 e.metadata = new_metadata;
@@ -150,12 +172,13 @@ impl Coordinator {
             effects.contexts.push((dir_id, ctx.clone()));
         }
         let inherit = Reasons { initial_scan: job.reasons.initial_scan, ..Default::default() };
+        let classification = Classification { ctx: &ctx, inherit, fields: observed_fields };
         let existing: HashMap<PathKey, Arc<Entry>> =
             builder.children(dir_id).into_iter().map(|e| (e.path.key(case), e)).collect();
         let mut seen_ids: HashSet<EntryId> = HashSet::new();
         for (path, key, info) in children {
             let Some(old) = existing.get(&key) else {
-                self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
+                self.insert_new(&mut builder, &mut effects, path, info, &classification);
                 continue;
             };
             seen_ids.insert(old.id);
@@ -166,10 +189,10 @@ impl Coordinator {
             };
             if bound {
                 let observed = Observed { path: &path, info };
-                self.reconcile_existing(&mut builder, &mut effects, old, observed, &ctx, inherit);
+                self.reconcile_existing(&mut builder, &mut effects, old, observed, &classification);
             } else {
                 effects.removed.extend(builder.remove_subtree(old.id));
-                self.insert_new(&mut builder, &mut effects, path, info, &ctx, inherit);
+                self.insert_new(&mut builder, &mut effects, path, info, &classification);
             }
         }
         for old in existing.values() {
@@ -188,7 +211,87 @@ impl Coordinator {
             self.push_error(dir.path.clone(), Operation::Listing, ErrorCause::DuplicateName(name));
         }
         self.commit(builder, effects, Some(job));
+        self.request_enrichment(dir_id, fields.without(listing.supplied_fields), job.reasons);
         Ok(())
+    }
+
+    pub(super) fn request_enrichment(&mut self, dir: EntryId, fields: MetadataFields, origin: Reasons) {
+        if !fields.any() {
+            self.pending_enrichment.remove(&dir);
+            return;
+        }
+        let Some(entry) = self.snapshot.get_by_id(dir) else {
+            return;
+        };
+        if !entry.is_loaded() {
+            return;
+        }
+        let path = entry.path.clone();
+        let mut reasons = origin;
+        reasons.baseline = false;
+        reasons.initial_scan = false;
+        match self.pending_enrichment.get_mut(&dir) {
+            Some(existing) => {
+                existing.path = path;
+                existing.fields = fields;
+                existing.reasons.merge(reasons);
+                existing.due = None;
+            }
+            None => {
+                self.pending_enrichment
+                    .insert(dir, EnrichmentRequest { path, fields, reasons, attempts: 0, due: None });
+            }
+        }
+    }
+
+    pub(super) fn commit_enrichment(
+        &mut self,
+        job: &ActiveJob,
+        fields: MetadataFields,
+        read: Enrichment,
+    ) -> JobOutcome {
+        let Some(dir_id) = job.entry() else {
+            return JobOutcome::Accepted;
+        };
+        let Some(dir) = self.snapshot.get_by_id(dir_id).cloned() else {
+            return JobOutcome::Stale;
+        };
+        self.metadata_operations += u64::from(read.metadata_operations);
+        self.enrichments += 1;
+        let supplied = fields.intersect(read.supplied_fields);
+        let case = self.caps.case;
+        let mut builder = self.snapshot.builder();
+        let mut effects = Effects::default();
+        if let Some(metadata) = read.directory {
+            let merged = dir.metadata.merged(metadata, supplied);
+            if merged != dir.metadata {
+                let _ = builder.update(dir_id, |e| e.metadata = merged);
+            }
+        }
+        let by_key: HashMap<PathKey, Metadata> = read
+            .children
+            .into_iter()
+            .filter_map(|(name, metadata)| Some((self.snapshot.key(&dir.path).child(&name, case).ok()?, metadata)))
+            .collect();
+        let ctx = self.context_for_children(dir_id).unwrap_or_else(PolicyContext::unit);
+        let children: Vec<Arc<Entry>> = builder.children(dir_id);
+        for child in children {
+            let Some(metadata) = by_key.get(&child.path.key(case)).copied() else {
+                continue;
+            };
+            let merged = child.metadata.merged(metadata, supplied);
+            if merged == child.metadata {
+                continue;
+            }
+            let _ = builder.update(child.id, |e| e.metadata = merged);
+            let info = EntryInfo { kind: child.kind(), metadata: merged, identity: child.identity };
+            let current = Entry { metadata: merged, ..(*child).clone() };
+            let decision = self.policy.classify(&ctx, &child.path, &info);
+            self.apply_decision(&mut builder, &mut effects, &current, decision, Reasons::default());
+        }
+        self.commit(builder, effects, Some(job));
+        self.entries.set_metadata_degraded(dir_id, None);
+        JobOutcome::Accepted
     }
 
     fn identity_match(&self, old: &Entry, info: &EntryInfo) -> IdentityMatch {
@@ -217,9 +320,9 @@ impl Coordinator {
         effects: &mut Effects,
         path: RelativePath,
         info: EntryInfo,
-        ctx: &PolicyContext,
-        inherit: Reasons,
+        classification: &Classification<'_>,
     ) {
+        let Classification { ctx, inherit, fields } = *classification;
         let decision = self.policy.classify(ctx, &path, &info);
         let shape = match info.kind {
             EntryKind::Directory => match decision {
@@ -236,7 +339,7 @@ impl Coordinator {
         };
         let id = self.next_entry_id();
         let mut entry = new_entry(id, path.clone(), shape);
-        entry.metadata = info.metadata.project(self.config.metadata_fields);
+        entry.metadata = info.metadata.project(fields);
         entry.identity = info.identity;
         if builder.insert(entry).is_ok() && shape == Shape::Directory(LoadState::Loading) {
             effects.new_loading.push((id, path, inherit));
@@ -249,14 +352,14 @@ impl Coordinator {
         effects: &mut Effects,
         old: &Entry,
         observed: Observed<'_>,
-        ctx: &PolicyContext,
-        inherit: Reasons,
+        classification: &Classification<'_>,
     ) {
+        let Classification { ctx, inherit, fields } = *classification;
         let Observed { path, info } = observed;
-        let metadata = info.metadata.project(self.config.metadata_fields);
+        let metadata = old.metadata.merged(info.metadata, fields);
         let current = Entry { path: path.clone(), metadata, identity: info.identity, ..old.clone() };
         if old.kind() != info.kind {
-            self.change_kind(builder, effects, &current, info, ctx, inherit);
+            self.change_kind(builder, effects, &current, info, classification);
             return;
         }
         let metadata_changed = old.metadata != metadata || old.identity != info.identity;
@@ -276,9 +379,9 @@ impl Coordinator {
         effects: &mut Effects,
         old: &Entry,
         info: EntryInfo,
-        ctx: &PolicyContext,
-        inherit: Reasons,
+        classification: &Classification<'_>,
     ) {
+        let Classification { ctx, inherit, fields } = *classification;
         let decision = self.policy.classify(ctx, &old.path, &info);
         if old.is_directory() {
             for child in builder.child_ids(old.id) {
@@ -299,7 +402,7 @@ impl Coordinator {
                 Shape::from_kind(other, LoadState::Unloaded)
             }
         };
-        let metadata = info.metadata.project(self.config.metadata_fields);
+        let metadata = old.metadata.merged(info.metadata, fields);
         let _ = builder.update(old.id, |e| {
             e.shape = shape;
             e.metadata = metadata;
@@ -373,21 +476,25 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn listing_view(builder: &SnapshotBuilder, dir: &Entry) -> DirectoryListing {
+    pub(super) fn listing_view(
+        builder: &SnapshotBuilder,
+        dir: &Entry,
+        supplied_fields: MetadataFields,
+    ) -> DirectoryListing {
         let entries = builder
             .children(dir.id)
             .into_iter()
             .filter_map(|child| {
                 let name = child.path.file_name()?.to_os_string();
-                Some(DirEntry {
-                    name,
-                    info: EntryInfo { kind: child.kind(), metadata: child.metadata, identity: child.identity },
-                })
+                let info = EntryInfo { kind: child.kind(), metadata: child.metadata, identity: child.identity };
+                Some(DirEntry { name, info: Observation::resolved(info) })
             })
             .collect();
         DirectoryListing {
             directory: EntryInfo { kind: dir.kind(), metadata: dir.metadata, identity: dir.identity },
             entries,
+            supplied_fields,
+            metadata_operations: 0,
         }
     }
 
@@ -406,7 +513,7 @@ impl Coordinator {
                 if child.shape != Shape::Directory(LoadState::Loaded) {
                     continue;
                 }
-                let view = Self::listing_view(builder, &child);
+                let view = Self::listing_view(builder, &child, self.config.metadata_fields);
                 let child_ctx = self.policy.child_context(&parent_ctx, &child.path, &view);
                 let changed = self
                     .dir_state(child.id)
@@ -476,7 +583,8 @@ impl Coordinator {
                 return JobOutcome::Removed;
             }
             let was_directory = entry.is_directory();
-            self.change_kind(&mut builder, &mut effects, &entry, info, &parent_ctx, inherit);
+            let classification = Classification { ctx: &parent_ctx, inherit, fields: self.config.metadata_fields };
+            self.change_kind(&mut builder, &mut effects, &entry, info, &classification);
             self.commit(builder, effects, Some(job));
             return if was_directory { JobOutcome::Removed } else { JobOutcome::Accepted };
         }
@@ -638,8 +746,10 @@ impl Coordinator {
             self.cancel_job(job_id);
         }
         self.pending.remove(&id);
+        self.pending_enrichment.remove(&id);
         self.entries.clear_retry(id);
         self.entries.set_degraded(id, None);
+        self.entries.set_metadata_degraded(id, None);
         if let Some(state) = self.entries.get_mut(id)
             && let Some(dir) = state.dir_mut()
             && let WatchState::Registered(watch) = dir.watch
@@ -660,6 +770,7 @@ impl Coordinator {
             }
         }
         self.pending.remove(&id);
+        self.pending_enrichment.remove(&id);
         if let Some(state) = self.entries.remove(id)
             && let Some(dir) = state.dir()
             && let WatchState::Registered(watch) = dir.watch
@@ -684,6 +795,7 @@ impl Coordinator {
         self.root = RootState::Unavailable { last: incarnation };
         self.entries.clear();
         self.pending.clear();
+        self.pending_enrichment.clear();
         self.round = None;
         self.cancel_all_jobs();
         self.unwatch_all();

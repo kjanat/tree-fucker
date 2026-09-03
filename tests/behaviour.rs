@@ -8,8 +8,8 @@ use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness, InjectedPosition};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RoundResult, UpdateEvent, WatcherHealth};
 use tree_fucker::{
-    CaseSensitivity, Config, EntryKind, Error, FsError, LoadAll, LoadState, PathChange, PathPredicate, PolicyRevision,
-    RelativePath, WatchRegistrationFailure, WatcherKind,
+    CaseSensitivity, Config, EntryKind, Error, FsError, LoadAll, LoadState, MetadataFields, PathChange, PathPredicate,
+    PolicyRevision, RelativePath, WatchRegistrationFailure, WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
@@ -415,7 +415,9 @@ fn repeated_name_survivor(inject_before_create: bool) -> Option<u64> {
         fs.create_file("src/readme.md", 7);
         fs.inject_child("src", "readme.md", EntryKind::File);
     }
-    let mut h = Harness::open_default(fs, Arc::new(LoadAll));
+    let config =
+        Config { metadata_fields: MetadataFields { size: true, ..MetadataFields::NONE }, ..Default::default() };
+    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     h.entry("src/readme.md").expect("collision survivor").metadata.size
 }
