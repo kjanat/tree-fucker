@@ -203,13 +203,15 @@ impl Harness {
     }
 
     fn record_grants(&mut self) {
-        for grant in self.coordinator.grants() {
+        let admitted = &self.admitted;
+        let fresh = self.coordinator.new_grants(&|id, lease| match id.job() {
+            Some(job) => admitted.contains(&(job, lease)),
+            None => true,
+        });
+        for grant in fresh {
             let Some(job) = grant.id.job() else {
                 continue;
             };
-            if self.admitted.contains(&(job, grant.lease)) {
-                continue;
-            }
             let Some(class) = self.coordinator.job_class(job) else {
                 continue;
             };

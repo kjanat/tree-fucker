@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use governor::Governor;
-pub use governor::{AdmissionDecision, DomainAccount, GovernorView, Grant, GrantId};
+pub use governor::{AdmissionDecision, DomainAccount, DomainView, GovernorView, Grant, GrantId, LatencySummary};
 use types::*;
 pub use types::{Class, MonotonicTime};
 
@@ -49,7 +49,7 @@ pub struct CrossingEvent {
     pub mode: DomainCrossing,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DomainStat {
     pub id: StorageDomainId,
     pub identity: DomainIdentity,
@@ -60,6 +60,29 @@ pub struct DomainStat {
     pub paths_unwatched_by_cap: usize,
     pub granted: Duration,
     pub charged: Duration,
+    pub capacity: Duration,
+    pub level: Duration,
+    pub debt: Duration,
+    pub window: usize,
+    pub ceiling: usize,
+    pub in_flight: usize,
+    pub stuck: usize,
+    pub estimate: Duration,
+    pub latency: LatencySummary,
+    pub throttled_jobs: u64,
+    pub throttled_duration: Duration,
+    pub effective_duty: f64,
+    pub resource: ResourceHealth,
+    pub listings: u64,
+    pub metadata_operations: u64,
+    pub entries_enumerated: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DomainOps {
+    pub listings: u64,
+    pub metadata_operations: u64,
+    pub entries_enumerated: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +323,7 @@ pub struct Coordinator {
     domain_records: BTreeMap<StorageDomainId, DomainRecord>,
     unknown_domain: Option<StorageDomainId>,
     crossing_events: VecDeque<CrossingEvent>,
+    domain_ops: BTreeMap<StorageDomainId, DomainOps>,
     domain_resolutions: u64,
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
@@ -395,6 +419,7 @@ impl Coordinator {
             domain_records: BTreeMap::new(),
             unknown_domain: None,
             crossing_events: VecDeque::new(),
+            domain_ops: BTreeMap::new(),
             domain_resolutions: 0,
             root_probe: None,
             probe_attempts: 0,
@@ -501,6 +526,20 @@ impl Coordinator {
         self.identity_reads += u64::from(cost.identity_reads);
         self.entries_enumerated += cost.entries_enumerated;
         self.session_bytes.insert(job, cost.bytes);
+        let domain = self.jobs.get(&job).and_then(|job| job.domain);
+        if let Some(domain) = domain {
+            let ops = self.domain_ops.entry(domain).or_default();
+            ops.listings += u64::from(cost.listing_operations);
+            ops.metadata_operations += u64::from(cost.metadata_operations);
+            ops.entries_enumerated += cost.entries_enumerated;
+        }
+    }
+
+    pub(super) fn record_domain_metadata(&mut self, entry: EntryId, operations: u32) {
+        let Some(domain) = self.domain_of(entry) else {
+            return;
+        };
+        self.domain_ops.entry(domain).or_default().metadata_operations += u64::from(operations);
     }
 
     pub(super) fn release_session_bytes(&mut self, job: JobId) {
@@ -527,6 +566,10 @@ impl Coordinator {
 
     pub fn grants(&self) -> Vec<Grant> {
         self.governor.grants().cloned().collect()
+    }
+
+    pub fn new_grants(&self, seen: &dyn Fn(GrantId, u32) -> bool) -> Vec<Grant> {
+        self.governor.grants().filter(|grant| !seen(grant.id, grant.lease)).cloned().collect()
     }
 
     pub fn governor(&self) -> GovernorView {
@@ -564,7 +607,7 @@ impl Coordinator {
                 let now = self.now;
                 if let Some(probe) = reported_domain(result) {
                     let binding = self.bind_domain(&probe);
-                    self.governor.attribute(GrantId::Job(*job), binding.id);
+                    self.governor.attribute(GrantId::Job(*job), binding.id, now);
                 }
                 if let JobResult::Listing(step) = result
                     && let Some(blocking) = step.cost.blocking
@@ -632,6 +675,9 @@ impl Coordinator {
         let loaded = self.entries.loaded_directories();
         let priority_len = self.priority.paths.len();
         let watches = self.entries.watch_accounts();
+        let view = self.governor.view(self.now);
+        let resource = self.domain_resource_health();
+        let domains = self.domain_stats(&view.domains, &resource);
         Stats {
             version: self.snapshot.version(),
             initial_scan: self.initial_scan_state(),
@@ -658,9 +704,11 @@ impl Coordinator {
                     })
                 })
                 .collect(),
-            governor: self.governor.view(self.now),
             grants: self.governor.grants().cloned().collect(),
-            resource: self.resource_health(),
+            resource: self.resource_health(&resource),
+            reported_blocking: view.reported_blocking,
+            lease_grants: view.lease_grants,
+            governor: view,
             blocking_slots_held: blocking_slots.len(),
             blocking_slots,
             pending_requests: self.pending.len() + usize::from(self.root_probe.is_some()),
@@ -684,32 +732,34 @@ impl Coordinator {
             entries_enumerated: self.entries_enumerated,
             listing_bytes: self.listing_bytes,
             in_flight_listing_bytes: self.session_bytes.values().sum(),
-            reported_blocking: self.governor.view(self.now).reported_blocking,
             kind_resolutions: self.kind_resolutions,
             identity_reads: self.identity_reads,
             unresolved_listings: self.unresolved_listings,
             suspended_sessions: self.jobs.values().filter(|j| j.phase == JobPhase::Suspended).count(),
-            lease_grants: self.governor.view(self.now).lease_grants,
             cancelled_sessions: self.cancelled_sessions,
             resource_limits: self.resource_limits.iter().cloned().collect(),
             enrichments: self.enrichments,
             enrichment_failures: self.enrichment_failures,
             pending_enrichments: self.pending_enrichment.len(),
-            domains: self.domain_stats(),
+            domains,
             crossings: self.crossing_events.iter().cloned().collect(),
             domain_resolutions: self.domain_resolutions,
             pending_domain_resolutions: self.pending_domain.len(),
         }
     }
 
-    fn domain_stats(&self) -> Vec<DomainStat> {
-        let accounts = self.governor.view(self.now).domains;
+    fn domain_stats(
+        &self,
+        accounts: &BTreeMap<StorageDomainId, DomainView>,
+        resource: &BTreeMap<StorageDomainId, ResourceHealth>,
+    ) -> Vec<DomainStat> {
         let watches = self.entries.watch_accounts();
         self.domain_records
             .iter()
             .map(|(id, record)| {
-                let account = accounts.get(id).copied().unwrap_or_default();
                 let watch = watches.get(&Some(*id)).copied().unwrap_or_default();
+                let ops = self.domain_ops.get(id).copied().unwrap_or_default();
+                let account = accounts.get(id);
                 DomainStat {
                     id: *id,
                     identity: record.identity.clone(),
@@ -718,8 +768,24 @@ impl Coordinator {
                     watcher_health: self.domain_watcher_health(*id, record.watcher),
                     paths_watched: watch.watched,
                     paths_unwatched_by_cap: watch.unwatched_by_cap,
-                    granted: account.granted,
-                    charged: account.charged,
+                    granted: account.map(|view| view.granted).unwrap_or_default(),
+                    charged: account.map(|view| view.charged).unwrap_or_default(),
+                    capacity: account.map(|view| view.capacity).unwrap_or_default(),
+                    level: account.map(|view| view.level).unwrap_or_default(),
+                    debt: account.map(|view| view.debt).unwrap_or_default(),
+                    window: account.map(|view| view.window).unwrap_or_default(),
+                    ceiling: account.map(|view| view.ceiling).unwrap_or_default(),
+                    in_flight: account.map(|view| view.in_flight).unwrap_or_default(),
+                    stuck: account.map(|view| view.stuck).unwrap_or_default(),
+                    estimate: account.map(|view| view.estimate).unwrap_or_default(),
+                    latency: account.map(|view| view.latency).unwrap_or_default(),
+                    throttled_jobs: account.map(|view| view.throttled_jobs).unwrap_or_default(),
+                    throttled_duration: account.map(|view| view.throttled_duration).unwrap_or_default(),
+                    effective_duty: account.map(|view| view.effective_duty()).unwrap_or_default(),
+                    resource: resource.get(id).copied().unwrap_or(ResourceHealth::Nominal),
+                    listings: ops.listings,
+                    metadata_operations: ops.metadata_operations,
+                    entries_enumerated: ops.entries_enumerated,
                 }
             })
             .collect()
@@ -741,6 +807,8 @@ impl Coordinator {
             }
         };
         let watcher = resolve_watcher(capabilities.watcher, self.caps.watcher);
+        let now = self.now;
+        self.governor.register_domain(id, &capabilities, now);
         self.domain_records.insert(id, DomainRecord { identity, capabilities, watcher });
         DomainBinding { id, probe: probe.clone() }
     }
@@ -913,25 +981,89 @@ impl Coordinator {
     }
 
     fn declare_stuck_workers(&mut self) {
-        for grant in self.governor.newly_stuck(self.now) {
-            self.governor.mark_stuck(grant);
+        let now = self.now;
+        for grant in self.governor.newly_stuck(now) {
+            self.governor.mark_stuck(grant, now);
             let Some(job) = grant.job() else {
                 continue;
             };
+            let domain = self.jobs.get(&job).and_then(|job| job.domain);
             if self.jobs.contains_key(&job) {
                 self.finish_job(job, JobOutcome::Stuck);
             }
+            self.release_quarantined(domain);
         }
     }
 
-    fn resource_health(&self) -> ResourceHealth {
-        if let Some(resume) = self.governor.resume_at(self.now) {
-            return ResourceHealth::Throttled { cause: ThrottleCause::DutyBudget, resume: Some(resume) };
+    fn release_quarantined(&mut self, domain: Option<StorageDomainId>) {
+        if !self.governor.quarantined(domain) {
+            return;
+        }
+        let waiting: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.phase.started().is_none())
+            .filter(|(_, job)| job.domain == domain)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            self.cancel_job(id);
+        }
+    }
+
+    fn resource_health(&self, domains: &BTreeMap<StorageDomainId, ResourceHealth>) -> ResourceHealth {
+        if let Some((cause, resume)) = self.governor.throttle(self.now) {
+            return ResourceHealth::Throttled { cause, resume };
         }
         if self.blocking_slots.len() >= self.config.max_in_flight && !self.queue_order.is_empty() {
             return ResourceHealth::Throttled { cause: ThrottleCause::Concurrency, resume: None };
         }
-        ResourceHealth::Nominal
+        domains.values().copied().find(|health| health.is_throttled()).unwrap_or(ResourceHealth::Nominal)
+    }
+
+    fn queued_domains(&self) -> BTreeSet<StorageDomainId> {
+        self.queue_order.iter().filter_map(|id| self.jobs.get(id)).filter_map(|job| job.domain).collect()
+    }
+
+    fn domain_resource_health(&self) -> BTreeMap<StorageDomainId, ResourceHealth> {
+        let queued = self.queued_domains();
+        self.domain_records
+            .keys()
+            .map(|id| {
+                let health = match self.governor.domain_health(*id, self.now, queued.contains(id)) {
+                    Some((cause, resume)) => ResourceHealth::Throttled { cause, resume },
+                    None => ResourceHealth::Nominal,
+                };
+                (*id, health)
+            })
+            .collect()
+    }
+
+    pub(super) fn next_admissible(&self) -> Option<MonotonicTime> {
+        let Some(round) = self.round.as_ref() else {
+            return self.governor.resume_at(self.now);
+        };
+        let mut seen: Vec<Option<StorageDomainId>> = Vec::new();
+        let mut earliest: Option<MonotonicTime> = None;
+        for obligation in round.obligations.iter() {
+            if obligation.state != ObligationState::Pending {
+                continue;
+            }
+            let domain = self.domain_of(obligation.entry);
+            if seen.contains(&domain) {
+                continue;
+            }
+            seen.push(domain);
+            let at = self.governor.admissible_at(domain, self.now)?;
+            earliest = Some(match earliest {
+                Some(previous) => previous.min(at),
+                None => at,
+            });
+        }
+        match earliest {
+            Some(at) => Some(at),
+            None => self.governor.resume_at(self.now),
+        }
     }
 
     fn next_seq(&mut self) -> Sequence {
@@ -1086,6 +1218,7 @@ impl Coordinator {
     }
 
     fn compute_health(&self) -> Health {
+        let resource_domains = self.domain_resource_health();
         let root = match self.root {
             RootState::Available { incarnation, .. } => RootAvailability::Available { incarnation },
             RootState::Unavailable { last } => RootAvailability::Unavailable { last },
@@ -1103,7 +1236,8 @@ impl Coordinator {
                 metadata_degraded_paths: self.metadata_degraded_paths(),
                 coverage_pending,
             },
-            resource: self.resource_health(),
+            resource: self.resource_health(&resource_domains),
+            resource_domains,
             shutdown: self.shutdown.clone(),
         }
     }
@@ -1198,7 +1332,7 @@ impl Coordinator {
             });
         };
         if !self.baseline_due && self.batch.is_none() {
-            let due = match self.governor.resume_at(self.now) {
+            let due = match self.next_admissible() {
                 Some(at) => self.periodic_due.max(at),
                 None => self.periodic_due.min(self.now + self.config.maximum_period),
             };

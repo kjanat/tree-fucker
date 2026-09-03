@@ -311,6 +311,7 @@ pub struct ActiveJob {
     pub id: JobId,
     pub target: JobTarget,
     pub path: RelativePath,
+    pub domain: Option<StorageDomainId>,
     pub need: ReadNeed,
     pub phase: JobPhase,
     pub dispatch: Sequence,

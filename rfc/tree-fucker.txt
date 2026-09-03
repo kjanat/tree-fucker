@@ -1929,10 +1929,18 @@ Abstract
    work on that domain, retries included, and the domain's resource
    state reports StuckWorker. The quarantine lifts when every stuck
    worker on the domain has returned. Other domains are unaffected
-   because closed-batch completion counts the logical outcome. A dead
-   mount therefore costs exactly the workers that were already inside
-   it when it died, never more, and degrades one domain instead of
-   exhausting the host's blocking pool.
+   because closed-batch completion counts the logical outcome, because
+   the stuck worker's further occupancy is charged to its domain bucket
+   alone (Section 15.3), and because a baseline obligation on a
+   quarantined domain is resolved Unsatisfied when the cursor reaches
+   it, so the round can end and healthy domains keep receiving baseline
+   coverage. Jobs already admitted on the quarantined domain that have
+   not started are cancelled so the closed batch can complete. The
+   round result for a quarantined obligation is Degraded; the quarantine
+   adds no path to the degraded set, and the domain's resource state
+   names StuckWorker as the cause. A dead mount therefore costs exactly
+   the workers that were already inside it when it died, never more, and
+   degrades one domain instead of exhausting the host's blocking pool.
 
 13.6.  Capacity Exhaustion
 
@@ -2142,7 +2150,10 @@ Abstract
    7. Resource limits MAY delay convergence and MAY hold the tree in a
       throttled state indefinitely. They MUST NOT produce a false claim
       of successful reconciliation. A round whose obligations were never
-      admitted remains open; it is neither Successful nor Degraded.
+      admitted remains open; it is neither Successful nor Degraded. The
+      one exception is an obligation on a quarantined domain, which
+      Section 13.5 resolves Unsatisfied so that a dead mount cannot hold
+      a round open for every healthy domain of the tree.
 
    8. A labelled property of storage, such as a filesystem type or a bus
       type, MAY lower a resource ceiling or choose a more conservative
@@ -2219,6 +2230,16 @@ Abstract
    MUST NOT ignore any part of a job's actual occupancy. Per-domain
    fairness comes from the per-domain buckets and windows, not from
    discounting the global meter.
+
+   A worker declared stuck under Section 13.5 is the one exception to
+   charging the global bucket. From the moment of declaration its further
+   occupancy is charged to its domain bucket alone, and the overshoot it
+   had already charged to the global bucket beyond its reservation is
+   refunded there, because an occupancy that never ends would otherwise
+   hold the global bucket in a debt no duty rate can repay and stop every
+   domain of the process for as long as the call is outstanding. The
+   global meter of Section 16 still reports the full occupancy, and a
+   worker that returns is charged in full against both buckets.
 
    The enforceable bound, which a conforming implementation MUST uphold,
    is stated on admission rather than on completion: over any window of

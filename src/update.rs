@@ -98,6 +98,7 @@ impl ReconciliationHealth {
 pub enum ThrottleCause {
     DutyBudget,
     Concurrency,
+    StuckWorker,
 }
 
 impl fmt::Display for ThrottleCause {
@@ -105,6 +106,7 @@ impl fmt::Display for ThrottleCause {
         match self {
             ThrottleCause::DutyBudget => f.write_str("duty budget"),
             ThrottleCause::Concurrency => f.write_str("concurrency window"),
+            ThrottleCause::StuckWorker => f.write_str("stuck worker"),
         }
     }
 }
@@ -167,6 +169,7 @@ pub struct Health {
     pub watcher_domains: BTreeMap<crate::domain::StorageDomainId, WatcherHealth>,
     pub reconciliation: ReconciliationHealth,
     pub resource: ResourceHealth,
+    pub resource_domains: BTreeMap<crate::domain::StorageDomainId, ResourceHealth>,
     pub shutdown: ShutdownState,
 }
 

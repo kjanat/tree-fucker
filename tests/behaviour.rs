@@ -16,6 +16,20 @@ fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
 }
 
+fn warm_window(h: &mut Harness) {
+    let files = vec![path("root.txt"), path("a/f2"), path("a/b/f1")];
+    let t = h.command(Command::Refresh(files));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let domains = h.stats().domains;
+    assert!(
+        domains.iter().all(|domain| domain.window >= 4),
+        "RFC 15.5: the tree's storage domain must reach a window of four before this test dispatches four \
+         concurrent listings; it reports {:?}",
+        domains.iter().map(|domain| domain.window).collect::<Vec<_>>()
+    );
+}
+
 fn populated(watcher: WatcherKind) -> Arc<FakeFileSystem> {
     let fs = Arc::new(FakeFileSystem::new(watcher));
     fs.mkdir("a");
@@ -216,7 +230,7 @@ fn priority_set_larger_than_batch_does_not_starve_baseline() {
         fs.mkdir(&format!("p{i:02}"));
     }
     fs.mkdir("zz");
-    let config = Config { batch_size: 4, max_in_flight: 2, ..Default::default() };
+    let config = Config { batch_size: 4, max_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     let priority: Vec<RelativePath> = (0..12).map(|i| path(&format!("p{i:02}"))).collect();
@@ -235,6 +249,7 @@ fn pre_barrier_listing_does_not_satisfy_refresh() {
     let fs = populated(WatcherKind::None);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
     h.run_until_idle();
+    warm_window(&mut h);
     fs.add_silently("c/first", EntryKind::File);
     h.fire_timer_only();
     let first = h.pending_job_for("c").expect("baseline listing of c in flight");
@@ -255,8 +270,8 @@ fn closed_batch_admits_nothing_until_every_member_settles() {
     }
     let config = Config { batch_size: 3, max_in_flight: 8, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
-    let root_job = h.pending_job_for("").expect("root listing");
-    h.complete_job(root_job.id);
+    h.run_until_idle();
+    h.fire_timer_only();
     let pending = h.pending_jobs();
     assert_eq!(pending.len(), 3);
     h.complete_job(pending[2].id);
@@ -264,6 +279,8 @@ fn closed_batch_admits_nothing_until_every_member_settles() {
     h.complete_job(pending[0].id);
     assert_eq!(h.pending_jobs().len(), 1);
     h.complete_job(pending[1].id);
+    assert!(h.pending_jobs().is_empty());
+    h.fire_timer_only();
     assert_eq!(h.pending_jobs().len(), 3);
     h.run_until_idle();
     assert_eq!(h.paths().len(), 7);

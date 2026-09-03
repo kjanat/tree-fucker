@@ -51,6 +51,10 @@ pub struct Config {
     pub root_reappearance_monitoring: bool,
     pub background_duty: f64,
     pub background_burst: Duration,
+    pub domain_background_duty: f64,
+    pub domain_background_burst: Duration,
+    pub per_domain_concurrency: usize,
+    pub failure_surcharge: Duration,
     pub initial_cost_estimate: Duration,
     pub stuck_threshold: Duration,
     pub minimum_period: Duration,
@@ -84,6 +88,10 @@ impl Default for Config {
             root_reappearance_monitoring: true,
             background_duty: 0.02,
             background_burst: Duration::from_millis(500),
+            domain_background_duty: 0.02,
+            domain_background_burst: Duration::from_millis(500),
+            per_domain_concurrency: 4,
+            failure_surcharge: Duration::from_millis(20),
             initial_cost_estimate: Duration::from_millis(20),
             stuck_threshold: Duration::from_secs(30),
             minimum_period: Duration::from_secs(1),
@@ -116,6 +124,19 @@ impl Config {
         }
         if self.background_burst.is_zero() {
             return Err("background_burst must be greater than zero".into());
+        }
+        if !self.domain_background_duty.is_finite() || self.domain_background_duty <= 0.0 {
+            return Err("domain_background_duty must be finite, greater than zero and at most max_in_flight".into());
+        }
+        let domain_duty = Duration::try_from_secs_f64(self.domain_background_duty).unwrap_or(Duration::MAX);
+        if domain_duty > Duration::from_secs(u64::try_from(self.max_in_flight).unwrap_or(u64::MAX)) {
+            return Err("domain_background_duty must be finite, greater than zero and at most max_in_flight".into());
+        }
+        if self.domain_background_burst.is_zero() {
+            return Err("domain_background_burst must be greater than zero".into());
+        }
+        if self.per_domain_concurrency < 1 || self.per_domain_concurrency > self.max_in_flight {
+            return Err("per_domain_concurrency must be at least 1 and at most max_in_flight".into());
         }
         if self.initial_cost_estimate.is_zero() {
             return Err("initial_cost_estimate must be greater than zero".into());

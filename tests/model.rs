@@ -584,6 +584,12 @@ fn domained_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
                 }
             }
         }
+        for stat in h.stats().domains {
+            assert!(
+                stat.in_flight <= stat.window,
+                "RFC 15.3 and 17.5: physical in-flight workers never exceed the per-domain window, stuck workers                  included; seed {seed} step {step} reports {stat:?}"
+            );
+        }
     }
     for _ in 0..50 {
         h.run_round();
@@ -638,6 +644,54 @@ fn a_random_history_over_several_domains_converges_and_every_operation_carries_a
             "RFC 16: every domain entered must report the worker time granted against it; seed {seed} reports \
              {domains:?}"
         );
+    }
+}
+
+fn worst_window_of(admissions: &[tree_fucker::testing::Admission], window: Duration) -> Duration {
+    let mut worst = Duration::ZERO;
+    let mut oldest = 0;
+    let mut total = Duration::ZERO;
+    for index in 0..admissions.len() {
+        let end = admissions[index].at;
+        total += admissions[index].reserved;
+        while admissions[oldest].at.0 + window <= end.0 {
+            total -= admissions[oldest].reserved;
+            oldest += 1;
+        }
+        worst = worst.max(total);
+    }
+    worst
+}
+
+#[test]
+fn reserved_worker_time_of_a_multi_domain_history_stays_within_each_domains_envelope() {
+    let config = Config::default();
+    let global = envelope(config.background_duty, config.background_burst, MAXIMUM_PERIOD);
+    let per_domain = envelope(config.domain_background_duty, config.domain_background_burst, MAXIMUM_PERIOD);
+    for seed in 1..6u64 {
+        let (h, _fs, _known) = domained_history(seed);
+        let admissions = h.admissions();
+        let worst = worst_window_of(&admissions, MAXIMUM_PERIOD);
+        assert!(
+            worst <= global,
+            "RFC 15.3: seed {seed} reserved {worst:?} of background worker time over a {MAXIMUM_PERIOD:?} window \
+             against a global budget of {global:?}"
+        );
+        let mut domains: BTreeMap<tree_fucker::StorageDomainId, Vec<tree_fucker::testing::Admission>> = BTreeMap::new();
+        for admission in &admissions {
+            if let Some(domain) = admission.domain {
+                domains.entry(domain).or_default().push(admission.clone());
+            }
+        }
+        assert!(domains.len() >= 4, "seed {seed} admitted work on {} domains", domains.len());
+        for (domain, admitted) in &domains {
+            let worst = worst_window_of(admitted, MAXIMUM_PERIOD);
+            assert!(
+                worst <= per_domain,
+                "RFC 15.3: seed {seed} reserved {worst:?} against {domain} over a {MAXIMUM_PERIOD:?} window, \
+                 above its own rate times window plus capacity of {per_domain:?}"
+            );
+        }
     }
 }
 

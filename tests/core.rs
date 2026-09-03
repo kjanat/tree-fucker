@@ -266,7 +266,7 @@ fn a_cancelled_worker_keeps_its_physical_slot_until_it_returns() {
     fs.mkdir("d0");
     fs.mkdir("d1");
     fs.mkdir("d2");
-    let config = Config { batch_size: 4, max_in_flight: 2, ..Default::default() };
+    let config = Config { batch_size: 4, max_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     let t = h.command(Command::Refresh(vec![path("d0"), path("d1"), path("d2")]));

@@ -273,6 +273,7 @@ impl Coordinator {
             return;
         };
         job.cancel.cancel();
+        self.settle_domain_cost(&job, &outcome);
         self.release_session_bytes(id);
         if job.session_open || (outcome == JobOutcome::Cancelled && job.phase.started().is_some()) {
             self.outputs.push(Output::CancelJob(id));
@@ -316,6 +317,41 @@ impl Coordinator {
             }
         }
         self.job_terminal(id);
+    }
+
+    fn settle_domain_cost(&mut self, job: &ActiveJob, outcome: &JobOutcome) {
+        let domain = job.domain;
+        let now = self.now;
+        if job.phase.started().is_some()
+            && job.need == ReadNeed::Metadata
+            && let Some(entry) = job.entry()
+        {
+            self.record_domain_metadata(entry, 1);
+        }
+        let surcharged = matches!(
+            outcome,
+            JobOutcome::Failed(_)
+                | JobOutcome::Rejected(_)
+                | JobOutcome::Cancelled
+                | JobOutcome::WorkerLost
+                | JobOutcome::Stuck
+        );
+        if surcharged {
+            self.governor.charge_surcharge(domain, now);
+        }
+        match outcome {
+            JobOutcome::Accepted => self.governor.record_outcome(domain, false, now),
+            JobOutcome::Failed(_)
+            | JobOutcome::Rejected(_)
+            | JobOutcome::AncestorNotDirectory
+            | JobOutcome::WorkerLost
+            | JobOutcome::Stuck => self.governor.record_outcome(domain, true, now),
+            JobOutcome::Removed
+            | JobOutcome::ResultMismatch
+            | JobOutcome::WatcherRegistrationFailed
+            | JobOutcome::Stale
+            | JobOutcome::Cancelled => {}
+        }
     }
 
     fn settle_obligations(&mut self, job: &ActiveJob, outcome: &JobOutcome) {

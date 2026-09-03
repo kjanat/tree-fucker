@@ -33,6 +33,20 @@ fn scanned(fs: &Arc<FakeFileSystem>) -> Harness {
     h
 }
 
+fn warm_window(h: &mut Harness) {
+    let files = vec![path("root.txt"), path("a/f2"), path("a/b/f1")];
+    let t = h.command(Command::Refresh(files));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let domains = h.stats().domains;
+    assert!(
+        domains.iter().all(|domain| domain.window >= 4),
+        "RFC 15.5: the tree's storage domain must reach a window of four before this test dispatches four \
+         concurrent listings; it reports {:?}",
+        domains.iter().map(|domain| domain.window).collect::<Vec<_>>()
+    );
+}
+
 fn load_everything() -> Arc<PathPredicate<impl Fn(&RelativePath, EntryKind) -> ScanDecision + Send + Sync>> {
     Arc::new(PathPredicate::new(|_p: &RelativePath, _k| ScanDecision::Eligible { initially_loaded: true }))
 }
@@ -63,6 +77,7 @@ fn policy_revision_bump_stales_the_designated_round_listing_and_degrades_the_rou
     let policy = load_everything();
     let mut h = Harness::open_default(fs.clone(), policy.clone());
     h.run_until_idle();
+    warm_window(&mut h);
     h.fire_timer_only();
     let c_job = h.pending_job_for("c").expect("c job");
     policy.bump_revision();
@@ -120,6 +135,7 @@ fn wide_initial_scan_lists_every_sibling_once_without_stale_retries() {
 fn sibling_metadata_load_and_descendant_changes_leave_sibling_guards_valid() {
     let fs = populated();
     let mut h = scanned(&fs);
+    warm_window(&mut h);
     h.fire_timer_only();
     let root_job = h.pending_job_for("").expect("root job");
     let a_job = h.pending_job_for("a").expect("a job");
@@ -141,6 +157,7 @@ fn sibling_metadata_load_and_descendant_changes_leave_sibling_guards_valid() {
 fn membership_changes_invalidate_containing_directory_binding_guards() {
     let fs = populated();
     let mut h = scanned(&fs);
+    warm_window(&mut h);
     h.fire_timer_only();
     let root_job = h.pending_job_for("").expect("root job");
     let a_job = h.pending_job_for("a").expect("a job");
@@ -236,6 +253,7 @@ fn replacement_during_delayed_child_listing_never_resurrects_old_subtree() {
 fn later_dispatch_stales_only_its_own_target() {
     let fs = populated();
     let mut h = scanned(&fs);
+    warm_window(&mut h);
     h.fire_timer_only();
     let a_job = h.pending_job_for("a").expect("a job");
     let c_job = h.pending_job_for("c").expect("c job");
@@ -258,6 +276,7 @@ fn later_dispatch_stales_only_its_own_target() {
 fn fatal_completion_terminates_even_when_guards_are_stale() {
     let fs = populated();
     let mut h = scanned(&fs);
+    warm_window(&mut h);
     h.fire_timer_only();
     let root_job = h.pending_job_for("").expect("root job");
     let a_job = h.pending_job_for("a").expect("a job");

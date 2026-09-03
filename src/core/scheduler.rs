@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use super::governor::{GrantId, Reservation};
 use super::types::*;
 use super::{Coordinator, JobSpec, ListingWork, Output, WatchDecision, WatchScope, Work};
+use crate::domain::StorageDomainId;
 use crate::entry::{LoadState, Shape};
 use crate::fs::{CancellationToken, Lease};
 use crate::ids::*;
@@ -63,6 +64,15 @@ impl Coordinator {
     }
 
     fn try_grant(&mut self, entry: Option<EntryId>, need: ReadNeed, path: &RelativePathOwned) -> Option<JobGrant> {
+        self.try_grant_on(entry, need, path).ok()
+    }
+
+    fn try_grant_on(
+        &mut self,
+        entry: Option<EntryId>,
+        need: ReadNeed,
+        path: &RelativePathOwned,
+    ) -> Result<JobGrant, Denied> {
         let id = self.next_job_id;
         let decision = match entry {
             Some(entry) => self.registration_decision(entry, need),
@@ -90,9 +100,12 @@ impl Coordinator {
         match self.governor.try_admit(reservation, now) {
             Ok(_) => {
                 self.next_job_id = id.next();
-                Some(JobGrant { id, registration })
+                Ok(JobGrant { id, registration, domain })
             }
-            Err(_) => None,
+            Err(_) => match self.governor.global_exhausted(domain) {
+                true => Err(Denied::Globally),
+                false => Err(Denied::OnDomain(domain)),
+            },
         }
     }
 
@@ -114,7 +127,7 @@ impl Coordinator {
             }
             let now = self.now;
             let lease = job.leases;
-            let domain = job.entry().and_then(|entry| self.domain_of(entry));
+            let domain = job.domain;
             let reservation =
                 Reservation { id: GrantId::Job(id), path: job.path.clone(), reads: 1, registrations: 0, lease, domain };
             if self.governor.try_admit(reservation, now).is_err() {
@@ -296,6 +309,11 @@ impl Coordinator {
 
     fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) -> bool {
         let mut remaining = slots;
+        let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
+        let mut index = match self.round.as_ref() {
+            Some(round) => round.cursor,
+            None => return true,
+        };
         loop {
             if remaining == 0 {
                 break;
@@ -303,15 +321,18 @@ impl Coordinator {
             let Some(round) = self.round.as_ref() else {
                 break;
             };
-            if round.wrapped() {
+            if index >= round.obligations.len() {
                 break;
             }
-            let cursor = round.cursor;
-            let obligation = round.obligations[cursor].clone();
+            let at_cursor = index == round.cursor;
+            let obligation = round.obligations[index].clone();
             let generation = round.generation;
             let barrier = round.barrier;
+            index += 1;
             if obligation.state != ObligationState::Pending {
-                self.advance_cursor();
+                if at_cursor {
+                    self.advance_cursor();
+                }
                 continue;
             }
             let dir_ok = self
@@ -321,7 +342,9 @@ impl Coordinator {
                 && self.snapshot.get_by_id(obligation.entry).map(|e| e.is_loaded()).unwrap_or(false);
             if !dir_ok {
                 self.set_obligation(obligation.entry, ObligationState::Removed);
-                self.advance_cursor();
+                if at_cursor {
+                    self.advance_cursor();
+                }
                 continue;
             }
             if let Some(job_id) = self.active_by_entry.get(&obligation.entry).copied() {
@@ -354,11 +377,29 @@ impl Coordinator {
                         },
                     );
                 }
-                self.advance_cursor();
+                if at_cursor {
+                    self.advance_cursor();
+                }
                 continue;
             }
-            let Some(grant) = self.try_grant(Some(obligation.entry), ReadNeed::Listing, &obligation.path) else {
-                return false;
+            let domain = self.domain_of(obligation.entry);
+            if self.governor.quarantined(domain) {
+                self.set_obligation(obligation.entry, ObligationState::Unsatisfied);
+                if at_cursor {
+                    self.advance_cursor();
+                }
+                continue;
+            }
+            if denied.contains(&domain) {
+                continue;
+            }
+            let grant = match self.try_grant_on(Some(obligation.entry), ReadNeed::Listing, &obligation.path) {
+                Ok(grant) => grant,
+                Err(Denied::Globally) => return false,
+                Err(Denied::OnDomain(domain)) => {
+                    denied.insert(domain);
+                    continue;
+                }
             };
             let mut request = self.pending.remove(&obligation.entry).unwrap_or(PendingRequest {
                 path: obligation.path.clone(),
@@ -373,7 +414,9 @@ impl Coordinator {
             let job_id = self.admit(grant, Some(obligation.entry), request);
             members.insert(job_id);
             remaining -= 1;
-            self.advance_cursor();
+            if at_cursor {
+                self.advance_cursor();
+            }
         }
         true
     }
@@ -457,6 +500,7 @@ impl Coordinator {
             }
         }
         self.class_rotation = (rotation + 1) % 5;
+        let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
         for i in 0..5 {
             let mut take = quota[i];
             if i == 0
@@ -499,8 +543,16 @@ impl Coordinator {
                     continue;
                 };
                 let id = candidate.entry();
-                let Some(grant) = self.try_grant(Some(id), request.need, &request.path) else {
-                    return false;
+                if denied.contains(&self.domain_of(id)) {
+                    continue;
+                }
+                let grant = match self.try_grant_on(Some(id), request.need, &request.path) {
+                    Ok(grant) => grant,
+                    Err(Denied::Globally) => return false,
+                    Err(Denied::OnDomain(domain)) => {
+                        denied.insert(domain);
+                        continue;
+                    }
                 };
                 match candidate {
                     Ready::Read(id) => {
@@ -572,6 +624,7 @@ impl Coordinator {
             id,
             target,
             path: request.path,
+            domain: grant.domain,
             need: request.need,
             phase,
             dispatch,
@@ -669,6 +722,7 @@ impl Coordinator {
         if self.shutdown != ShutdownState::Running {
             return;
         }
+        let mut deferred: Vec<JobId> = Vec::new();
         loop {
             if self.blocking_slots.len() >= self.config.max_in_flight {
                 break;
@@ -686,6 +740,14 @@ impl Coordinator {
                 self.cancel_job(id);
                 continue;
             }
+            let domain = job.domain;
+            if self.governor.may_start(domain, self.blocking_slots.len()).is_err() {
+                deferred.push(id);
+                continue;
+            }
+            let Some(job) = self.jobs.get(&id) else {
+                continue;
+            };
             let work = self.work_for(job);
             let now = self.now;
             if let Some(job) = self.jobs.get_mut(&id) {
@@ -693,6 +755,9 @@ impl Coordinator {
             }
             self.governor.start(GrantId::Job(id), now);
             self.dispatch_job(id, work);
+        }
+        for id in deferred.into_iter().rev() {
+            self.queue_order.push_front(id);
         }
     }
 
@@ -763,9 +828,16 @@ impl Coordinator {
 type RelativePathOwned = crate::path::RelativePath;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Denied {
+    Globally,
+    OnDomain(Option<StorageDomainId>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct JobGrant {
     pub id: JobId,
     pub registration: Option<WatchScope>,
+    pub domain: Option<StorageDomainId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
