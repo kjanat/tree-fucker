@@ -20,10 +20,6 @@ impl DeclaredProbe {
         DeclaredProbe { directory_case, ..self }
     }
 
-    pub fn identity(&self) -> &DomainIdentity {
-        &self.identity
-    }
-
     pub fn capabilities(&self) -> &DomainCapabilities {
         &self.capabilities
     }

@@ -471,7 +471,7 @@ impl Tree {
         governor: HostGovernor,
     ) -> Result<(TreeHandle, UpdateStream)> {
         config.validate().map_err(Error::InvalidConfig)?;
-        governor.reject_raised_limits(&config).map_err(Error::InvalidConfig)?;
+        governor.limits().validate().map_err(Error::InvalidConfig)?;
         let caps = filesystem.capabilities();
         let base = governor.base(runtime.now());
         let root = {

@@ -1,3 +1,6 @@
+//! tree-fucker maintains an immutable, diffable representation of a filesystem
+//! tree, specified by `rfc/tree-fucker.txt`.
+
 pub mod config;
 pub mod core;
 pub mod domain;
@@ -14,9 +17,9 @@ pub mod testing;
 pub mod tree;
 pub mod update;
 
-pub use core::{HostGovernor, HostGovernorError, host_governor};
+pub use core::{HostGovernor, HostGovernorError, Stats, host_governor};
 
-pub use config::{ClassWeights, Config, LagMode, WatchRegistrationFailure};
+pub use config::{ClassWeights, Config, HostConfig, LagMode, WatchRegistrationFailure};
 pub use domain::{
     AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
     DomainCrossing, DomainIdentity, DomainKey, DomainProbe, FilesystemSemantics, IdentityReliability, IdentitySource,
@@ -36,6 +39,7 @@ pub use ids::{
 };
 pub use path::{CaseSensitivity, PathError, PathKey, RelativePath};
 pub use policy::{LoadAll, LoadDepth, PathPredicate, PolicyContext, ScanDecision, ScanPolicy};
+pub use runtime::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle};
 pub use snapshot::Snapshot;
 pub use tree::{Tree, TreeHandle, UpdateStream};
 pub use update::{

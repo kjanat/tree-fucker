@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tree_fucker::core::{Class, Command, DomainStat, JobResult, JobSpec, MonotonicTime};
 use tree_fucker::testing::{Admission, CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{ErrorCause, ResourceHealth, ResourceLimit, RoundResult, ThrottleCause, UpdateEvent};
+use tree_fucker::update::{
+    ErrorCause, InitialScanState, ResourceHealth, ResourceLimit, RoundResult, ThrottleCause, UpdateEvent,
+};
 use tree_fucker::{
     AccessTopology, CancellationToken, Ceilings, Config, Continuation, DomainCapabilities, DomainCrossing,
-    DomainIdentity, EntryKind, FileSystem, FsError, HintKind, Lease, LoadAll, MediaHint, RelativePath, SessionOutcome,
-    SessionStep, TransportHint, WatcherKind,
+    DomainIdentity, EntryKind, FileSystem, FsError, HintKind, HostConfig, Lease, LoadAll, MediaHint, RelativePath,
+    SessionOutcome, SessionStep, TransportHint, WatcherKind,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -100,9 +102,21 @@ fn dispatched_job_under(h: &mut Harness, prefix: &str) -> JobSpec {
 }
 
 fn scanned(fs: Arc<FakeFileSystem>, config: Config) -> Harness {
-    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+    scanned_under(fs, HostConfig::default(), config)
+}
+
+fn scanned_under(fs: Arc<FakeFileSystem>, host: HostConfig, config: Config) -> Harness {
+    let mut h = Harness::open_with_host(fs, Arc::new(LoadAll), host, config).expect("open");
     h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
     h
+}
+
+fn stuck_after(threshold: Duration) -> HostConfig {
+    HostConfig { stuck_threshold: threshold, ..Default::default() }
+}
+
+fn one_worker() -> HostConfig {
+    HostConfig { maximum_in_flight: 1, per_domain_concurrency: 1, ..Default::default() }
 }
 
 fn follow() -> Config {
@@ -176,8 +190,8 @@ fn a_running_worker_is_charged_its_occupancy_before_it_completes() {
     let fs = tree(&["held"]);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
     fs.set_cost(CostScope::path("held"), FakeOp::ReadDir, Duration::from_secs(36_000));
-    let config = Config { stuck_threshold: Duration::from_secs(36_000), ..Default::default() };
-    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    let host = stuck_after(Duration::from_secs(36_000));
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), host, Config::default()).expect("open");
     let started = dispatched_job(&mut h, "held");
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
     let start = h.now();
@@ -675,8 +689,9 @@ fn a_slow_domain_does_not_delay_the_fast_domains_baseline_coverage() {
     fs.set_domain("", HOME);
     fs.set_domain("slow", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let config = Config { max_in_flight: 2, batch_size: 8, per_domain_concurrency: 2, ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let host = HostConfig { maximum_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
+    let config = Config { batch_size: 8, ..follow() };
+    let mut h = scanned_under(fs.clone(), host, config);
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(120));
 
     let slow_job = dispatched_job_under(&mut h, "slow");
@@ -795,8 +810,7 @@ fn a_domain_that_becomes_fast_again_converges_within_one_round() {
     fs.set_domain("media", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(60));
-    let config = Config { stuck_threshold: Duration::from_secs(300), ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let mut h = scanned_under(fs.clone(), stuck_after(Duration::from_secs(300)), follow());
     run_one_round(&mut h);
 
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_millis(5));
@@ -818,16 +832,23 @@ fn a_simulated_day_of_reconciliation_costs_no_real_time() {
     let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
 
     let day = Duration::from_secs(86_400);
-    let started = Instant::now();
     h.run_jobs_until(MonotonicTime::ZERO + day);
-    let elapsed = started.elapsed();
 
     assert_eq!(h.now(), MonotonicTime::ZERO + day);
+    assert_eq!(
+        h.injected(),
+        day,
+        "RFC 17.5: no test may depend on wall-clock sleeps; every second of the simulated day must come from an \
+         injected advance, and {:?} of the {day:?} did",
+        h.injected()
+    );
     assert!(h.charged_work() > Duration::from_secs(1), "the simulated day charged {:?}", h.charged_work());
     assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
     assert!(
-        elapsed < Duration::from_secs(1),
-        "RFC 17.5: no test may depend on wall-clock sleeps; a simulated day took {elapsed:?} of real time"
+        h.real_elapsed() < Duration::from_secs(10),
+        "the injected-advance total above is the invariant; this is a loose sanity bound and a simulated day took \
+         {:?} of real time",
+        h.real_elapsed()
     );
 }
 
@@ -899,8 +920,8 @@ fn a_session_suspended_between_leases_holds_no_worker_slot() {
     let fs = wide(8);
     fs.set_chunk_size(1);
     fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
-    let config = Config { entries_per_lease: 2, max_in_flight: 1, per_domain_concurrency: 1, ..Default::default() };
-    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    let config = Config { entries_per_lease: 2, ..Default::default() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), one_worker(), config).expect("open");
     assert!(h.advance_to_next_completion(), "the root listing never ran");
     let big = h.pending_job_for("aaa").expect("the wide listing started");
     assert!(
@@ -1128,8 +1149,9 @@ fn a_throttled_periodic_timer_waits_for_the_governor_beyond_the_maximum_period()
     let fs = tree(&["slow"]);
     fs.set_cost(CostScope::path("slow"), FakeOp::ReadDir, Duration::from_secs(30));
     let maximum = Duration::from_secs(60);
-    let config = Config { maximum_period: maximum, stuck_threshold: Duration::from_secs(300), ..Default::default() };
-    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+    let config = Config { maximum_period: maximum, ..Default::default() };
+    let host = stuck_after(Duration::from_secs(300));
+    let mut h = Harness::open_with_host(fs, Arc::new(LoadAll), host, config).expect("open");
     h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(60));
 
     assert!(h.governor().debt > Duration::ZERO, "the slow listing left no debt, so nothing throttles the timer");
@@ -1183,8 +1205,8 @@ fn the_coordinator_records_reported_blocking_and_the_bytes_a_session_holds() {
     fs.set_chunk_size(1);
     fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
     fs.set_cost(CostScope::path("aaa"), FakeOp::Chunk, Duration::from_millis(10));
-    let config = Config { entries_per_lease: 2, max_in_flight: 1, per_domain_concurrency: 1, ..Default::default() };
-    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    let config = Config { entries_per_lease: 2, ..Default::default() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), one_worker(), config).expect("open");
     assert!(h.advance_to_next_completion(), "the root listing never ran");
     let big = h.pending_job_for("aaa").expect("the wide listing started");
     assert!(h.advance_to_next_completion(), "the first lease never returned");
@@ -1236,8 +1258,8 @@ fn a_suspended_session_whose_guards_go_stale_is_discarded_and_holds_no_session()
     let fs = wide(8);
     fs.set_chunk_size(1);
     fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
-    let config = Config { entries_per_lease: 2, max_in_flight: 1, per_domain_concurrency: 1, ..Default::default() };
-    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    let config = Config { entries_per_lease: 2, ..Default::default() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), one_worker(), config).expect("open");
     assert!(h.advance_to_next_completion(), "the root listing never ran");
     let big = h.pending_job_for("aaa").expect("the wide listing started");
     assert!(h.advance_to_next_completion(), "the first lease never returned");
@@ -1286,16 +1308,18 @@ fn indebted_media(cost: Duration) -> (Arc<FakeFileSystem>, Harness) {
     fs.set_domain("", HOME);
     fs.set_domain("media", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let config = Config {
+    let host = HostConfig {
         background_duty: 1.0,
         background_burst: Duration::from_secs(300),
+        domain_background_duty: 0.02,
+        domain_background_burst: Duration::from_millis(500),
         foreground_duty: 1.0,
         foreground_burst: Duration::from_secs(300),
         domain_foreground_duty: 0.02,
         stuck_threshold: Duration::from_secs(3600),
-        ..follow()
+        ..Default::default()
     };
-    let mut h = scanned(fs.clone(), config);
+    let mut h = scanned_under(fs.clone(), host, follow());
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, cost);
     h.run_jobs_until(h.now() + cost + Duration::from_secs(30));
     (fs, h)
@@ -1382,8 +1406,7 @@ fn a_labelled_domain_that_measures_slow_converges_to_a_window_of_one() {
         },
     );
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(1));
-    let config = Config { stuck_threshold: Duration::from_secs(3600), ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let mut h = scanned_under(fs.clone(), stuck_after(Duration::from_secs(3600)), follow());
     let warm = domain_stat(&h, MEDIA);
     assert!(
         warm.window > 1,
@@ -1440,8 +1463,9 @@ fn a_window_never_exceeds_the_ceiling_whatever_labels_say() {
         },
     );
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(1));
-    let config = Config { per_domain_concurrency: 3, stuck_threshold: Duration::from_secs(3600), ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let host =
+        HostConfig { per_domain_concurrency: 3, stuck_threshold: Duration::from_secs(3600), ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, follow());
     for _ in 0..8 {
         run_one_round(&mut h);
     }
@@ -1521,8 +1545,7 @@ fn convergence_resumes_when_capacity_returns() {
     let fs = tree(&["media", "media/inner"]);
     fs.set_domain("media", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let config = Config { stuck_threshold: Duration::from_secs(3600), ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let mut h = scanned_under(fs.clone(), stuck_after(Duration::from_secs(3600)), follow());
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(60));
     h.run_jobs_until(h.now() + Duration::from_secs(90));
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_millis(10));
@@ -1558,8 +1581,12 @@ fn a_repeatedly_failing_target_is_admitted_later_each_time_and_its_domain_carrie
         let fs = tree(&["media", "media/inner"]);
         fs.set_domain("media", MEDIA);
         fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-        let config = Config { failure_surcharge: surcharge, stuck_threshold: Duration::from_secs(3600), ..follow() };
-        let mut h = scanned(fs.clone(), config);
+        let host = HostConfig {
+            failure_surcharge: surcharge,
+            stuck_threshold: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let mut h = scanned_under(fs.clone(), host, follow());
         let charged = domain_stat(&h, MEDIA).charged;
         fs.fail("media/inner", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("blip".into())));
         let from = h.now();
@@ -1621,8 +1648,8 @@ fn a_dead_domain_never_gains_a_second_stuck_worker() {
         },
     );
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let config = Config { per_domain_concurrency: 1, ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let host = HostConfig { per_domain_concurrency: 1, ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, follow());
     assert_eq!(
         domain_stat(&h, MEDIA).window,
         1,
@@ -1647,7 +1674,12 @@ fn resource_health_names_the_domain_the_cause_and_the_resume_time() {
     fs.set_domain("media", MEDIA);
     fs.set_capabilities(MEDIA, DomainCapabilities { topology: AccessTopology::Remote, ..DomainCapabilities::inline() });
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let mut h = scanned(fs.clone(), follow());
+    let host = HostConfig {
+        domain_background_duty: 0.5,
+        domain_background_burst: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let mut h = scanned_under(fs.clone(), host, follow());
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(36_000));
     h.run_jobs_until(h.now() + Duration::from_secs(600));
 
@@ -1680,8 +1712,7 @@ fn per_domain_statistics_report_window_bucket_latency_and_counts() {
     fs.set_domain("media", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(20));
-    let config = Config { stuck_threshold: Duration::from_secs(3600), ..follow() };
-    let mut h = scanned(fs.clone(), config);
+    let mut h = scanned_under(fs.clone(), stuck_after(Duration::from_secs(3600)), follow());
     h.run_jobs_until(h.now() + Duration::from_secs(300));
 
     for stat in h.stats().domains {
@@ -1741,4 +1772,377 @@ fn a_domain_in_debt_is_not_admitted_before_the_reported_resume_time() {
         "RFC 15.3: admission resumes once the reported refill time passes; the tree is at {:?} against a          reported resume of {resume:?}",
         h.now()
     );
+}
+
+#[test]
+fn dropped_watcher_events_under_throttling_are_repaired_by_the_next_admitted_round() {
+    let names = numbered("d", 12);
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::Recursive));
+    for name in &names {
+        fs.mkdir(name);
+        fs.create_file(&format!("{name}/f"), 1);
+    }
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let config = Config { watcher_path_limit: 4, ..Default::default() };
+    let mut h = scanned(fs.clone(), config);
+
+    fs.set_cost(CostScope::path("d0"), FakeOp::ReadDir, Duration::from_secs(120));
+    let slow = dispatched_job(&mut h, "d0");
+    h.run_jobs_until(h.now() + Duration::from_secs(180));
+    assert!(h.charges().iter().any(|c| c.job == slow.id), "the slow listing never returned");
+    assert!(h.stats().resource.is_throttled(), "the slow listing left the tree unthrottled, so nothing is dropped");
+    fs.set_cost(CostScope::path("d0"), FakeOp::ReadDir, Duration::from_millis(10));
+
+    let dropped_before = h.stats().dropped_hints;
+    let admitted_before = h.admissions().len();
+    for name in &names {
+        fs.add_silently(&format!("{name}/late"), EntryKind::File);
+    }
+    let hints = fs.emit_storm(&borrowed(&names), HintKind::Modify, 4);
+    assert_eq!(h.deliver_watcher_events_capped(4), 4, "the coordinator did not receive the storm");
+    assert!(
+        h.stats().dropped_hints > dropped_before,
+        "RFC 13.6: hints beyond the configured watcher path limit are dropped after counting"
+    );
+    let admitted = h.admissions().len() - admitted_before;
+    assert!(
+        admitted < hints,
+        "RFC 15.1 item 3: a storm under throttling must admit no more work than the envelope allows; {hints} hints \
+         admitted {admitted} jobs"
+    );
+
+    for _ in 0..40 {
+        run_one_round(&mut h);
+        if names.iter().all(|name| h.paths().contains(&format!("{name}/late"))) {
+            break;
+        }
+    }
+    for name in &names {
+        assert!(
+            h.paths().contains(&format!("{name}/late")),
+            "RFC 5.3 and 17.5: suppressing watcher events under throttling must not invalidate the directory \
+             guarantee; {name}/late never converged"
+        );
+    }
+}
+
+#[test]
+fn a_retry_during_throttling_keeps_its_record_and_is_admitted_once_capacity_returns() {
+    let fs = tree(&["fast", "flaky"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let mut h = scanned(fs.clone(), Config::default());
+
+    fs.fail("flaky", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("blip".into())));
+    for _ in 0..20 {
+        run_one_round(&mut h);
+        if h.health().reconciliation.degraded_paths.contains(&path("flaky")) {
+            break;
+        }
+    }
+    assert!(
+        h.health().reconciliation.degraded_paths.contains(&path("flaky")),
+        "RFC 13.1: a transient failure degrades the round on its first attempt and retains retry work"
+    );
+    fs.clear_failures();
+
+    fs.set_cost(CostScope::path("fast"), FakeOp::ReadDir, Duration::from_secs(120));
+    let slow = dispatched_job(&mut h, "fast");
+    h.run_jobs_until(h.now() + Duration::from_secs(180));
+    assert!(h.charges().iter().any(|c| c.job == slow.id), "the slow listing never returned");
+    fs.set_cost(CostScope::path("fast"), FakeOp::ReadDir, Duration::from_millis(10));
+    assert!(h.stats().resource.is_throttled(), "the slow listing left the tree unthrottled");
+
+    let throttled_at = h.now();
+    let resume = h.governor().next_admissible.expect("a throttled governor names its resume time");
+    assert!(resume > throttled_at, "the governor reported an immediate resume while in debt");
+    let half = throttled_at + (resume.saturating_sub(throttled_at) / 2);
+    h.run_jobs_until(half);
+    let during: Vec<Admission> = h.admissions().into_iter().filter(|a| a.at > throttled_at && a.at <= half).collect();
+    assert!(
+        during.is_empty(),
+        "RFC 15.1 item 6 and 15.3: a retry under throttling must not be admitted before its budget refills; {} were",
+        during.len()
+    );
+    assert!(
+        h.health().reconciliation.degraded_paths.contains(&path("flaky")),
+        "RFC 15.3: denial changes no retry record, so the degraded path is still retained"
+    );
+
+    fs.add_silently("flaky/late", EntryKind::File);
+    for _ in 0..40 {
+        run_one_round(&mut h);
+        if h.paths().contains(&"flaky/late".to_string()) {
+            break;
+        }
+    }
+    assert!(
+        h.paths().contains(&"flaky/late".to_string()),
+        "RFC 5.2 and 17.5: a retry deferred by the governor is admitted once its buckets refill"
+    );
+    assert!(
+        !h.health().reconciliation.degraded_paths.contains(&path("flaky")),
+        "RFC 13.1: an accepted recovery read clears the path's degradation"
+    );
+}
+
+#[test]
+fn a_resource_limit_reached_while_the_publication_guards_go_stale_publishes_nothing() {
+    let fs = wide(8);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    let config = Config { entries_per_directory: 3, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
+
+    let version = h.stats().version;
+    let paths = h.paths();
+    let limits_before = h.stats().resource_limits.len();
+    let stale_before = h.stats().stale_results;
+    let over = dispatched_job(&mut h, "aaa");
+
+    h.command(Command::InvalidatePolicy(vec![RelativePath::root()]));
+    h.run_jobs_until(h.now() + Duration::from_secs(30));
+    assert!(h.charges().iter().any(|c| c.job == over.id), "the over-limit listing never returned");
+
+    assert!(
+        h.stats().stale_results > stale_before,
+        "RFC 11.4: a result whose publication guard went stale is discarded in full before its outcome is read"
+    );
+    assert_eq!(
+        h.stats().resource_limits.len(),
+        limits_before,
+        "RFC 11.4: a discarded result records nothing, not even its resource limit"
+    );
+    assert_eq!(h.stats().version, version, "RFC 15.6 and 17.5: a listing over a ceiling publishes nothing");
+    assert_eq!(h.paths(), paths, "RFC 15.6 and 17.5: a listing over a ceiling publishes nothing");
+
+    for _ in 0..200 {
+        h.run_jobs_until(h.now() + Duration::from_secs(600));
+        if h.stats().resource_limits.len() > limits_before {
+            break;
+        }
+    }
+    let event = h
+        .stats()
+        .resource_limits
+        .last()
+        .cloned()
+        .expect("RFC 13.1: the requeued listing reaches the ceiling again and records its event");
+    assert_eq!(event.path, path("aaa"));
+    assert_eq!(event.limited.limit, ResourceLimit::EntriesPerDirectory);
+    assert!(
+        h.health().reconciliation.degraded_paths.contains(&path("aaa")),
+        "RFC 15.6: the path is reported degraded with a resource-limit cause"
+    );
+    assert!(
+        !h.paths().contains(&"aaa/f0".to_string()),
+        "RFC 20: a directory over its limit is degraded, not truncated"
+    );
+}
+
+#[test]
+fn a_subtree_whose_domain_changes_in_place_under_load_charges_the_new_domain_and_converges() {
+    let fs = tree(&["moving", "moving/inner", "other"]);
+    fs.set_domain("", HOME);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let mut h = scanned(fs.clone(), follow());
+    let home_before = domain_stat(&h, HOME).charged;
+
+    let flooded =
+        h.flood_hints_until(&["moving", "moving/inner", "other"], HintKind::Modify, h.now() + Duration::from_secs(30));
+    assert!(flooded > 0, "the load generated no watcher hints");
+    fs.remount("moving", MEDIA);
+    fs.add_silently("moving/inner/late", EntryKind::File);
+    h.flood_hints_until(&["moving", "moving/inner"], HintKind::Modify, h.now() + Duration::from_secs(60));
+
+    for _ in 0..40 {
+        run_one_round(&mut h);
+        if h.paths().contains(&"moving/inner/late".to_string()) {
+            break;
+        }
+    }
+    assert!(
+        h.paths().contains(&"moving/inner/late".to_string()),
+        "RFC 5.2 and 17.5: a subtree whose domain changes in place under load still converges"
+    );
+    let media = domain_stat(&h, MEDIA);
+    assert!(
+        media.charged > Duration::ZERO,
+        "RFC 15.2 and 17.5: a listing under a remounted path is charged to the new domain, {media:?}"
+    );
+    assert!(media.listings > 0, "RFC 16: the new domain reports the listings it performed, {media:?}");
+    assert!(domain_stat(&h, HOME).charged >= home_before, "RFC 15.3: charged worker time is monotone per domain");
+}
+
+#[test]
+fn cancellation_between_chunks_with_a_domain_change_commits_nothing_and_relists_under_the_new_domain() {
+    let fs = wide(8);
+    fs.set_domain("", HOME);
+    fs.set_chunk_size(1);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    let config = Config { entries_per_lease: 2, ..follow() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), one_worker(), config).expect("open");
+    assert!(h.advance_to_next_completion(), "the root listing never ran");
+    let big = h.pending_job_for("aaa").expect("the wide listing started");
+    assert!(h.advance_to_next_completion(), "the first lease never returned");
+    assert_eq!(h.stats().suspended_sessions, 1, "the first lease did not leave the session suspended");
+
+    let version = h.stats().version;
+    let cancelled_before = h.stats().cancelled_sessions;
+    let stale_before = h.stats().stale_results;
+    fs.remount("aaa", MEDIA);
+    h.command(Command::InvalidatePolicy(vec![RelativePath::root()]));
+
+    assert!(
+        h.cancelled().contains(&big.id),
+        "RFC 10.2: a suspended session whose job ends is cancelled so its handle and buffer are released"
+    );
+    assert_eq!(h.held_listing_sessions(), 0, "RFC 10.2: no session outlives its job");
+    assert!(
+        h.stats().cancelled_sessions + h.stats().stale_results > cancelled_before + stale_before,
+        "RFC 10.2 and 11.4: the interrupted session ended without carrying children"
+    );
+    assert_eq!(h.stats().version, version, "RFC 10.2: only a Complete outcome carries children, so nothing commits");
+    assert!(!h.paths().contains(&"aaa/f0".to_string()), "RFC 11.5: a cancelled session commits nothing");
+
+    for _ in 0..60 {
+        run_one_round(&mut h);
+        if h.paths().contains(&"aaa/f0".to_string()) {
+            break;
+        }
+    }
+    assert!(
+        h.paths().contains(&"aaa/f0".to_string()),
+        "RFC 5.2 and 17.5: the cancelled listing is scheduled again and converges"
+    );
+    let media = domain_stat(&h, MEDIA);
+    assert!(
+        media.charged > Duration::ZERO && media.listings > 0,
+        "RFC 14.3 and 15.2: the relisting is charged to the domain the subtree now belongs to, {media:?}"
+    );
+}
+
+#[test]
+fn an_initial_scan_larger_than_the_budget_takes_longer_and_never_exceeds_the_envelope() {
+    let names = numbered("d", 60);
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    for name in &names {
+        fs.mkdir(name);
+        fs.mkdir(&format!("{name}/inner"));
+        fs.create_file(&format!("{name}/inner/f"), 1);
+    }
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(200));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+
+    let window = MAXIMUM_PERIOD;
+    h.run_jobs_until(MonotonicTime::ZERO + window);
+    assert!(
+        matches!(h.health().initial_scan, InitialScanState::Running { .. }),
+        "RFC 11.1 and 17.5: a tree larger than the budget permits takes longer to scan, it does not scan faster; \
+         the scan reported {:?} within {window:?}",
+        h.health().initial_scan
+    );
+    let (at, worst) = h.worst_reserved_window(window);
+    let budget = envelope(BACKGROUND_DUTY_GLOBAL, BACKGROUND_BURST_GLOBAL, window);
+    assert!(
+        worst <= budget,
+        "RFC 11.1 and 15.3: the initial scan is background work admitted under the same envelope; the {window:?} \
+         window ending at {at:?} reserved {worst:?} against a budget of {budget:?}"
+    );
+
+    for _ in 0..400 {
+        if matches!(h.health().initial_scan, InitialScanState::Complete { .. }) {
+            break;
+        }
+        h.run_jobs_until(h.now() + Duration::from_secs(600));
+    }
+    assert!(
+        matches!(h.health().initial_scan, InitialScanState::Complete { .. }),
+        "RFC 5.2: the scan converges once the budget permits, it reported {:?}",
+        h.health().initial_scan
+    );
+    let (at, worst) = h.worst_reserved_window(window);
+    assert!(
+        worst <= budget,
+        "RFC 15.3: the bound holds over every window; the {window:?} window ending at {at:?} reserved {worst:?} \
+         against a budget of {budget:?}"
+    );
+}
+
+#[test]
+fn a_governor_denial_changes_no_obligation_cursor_barrier_or_retry_state() {
+    let fs = tree(&["a", "b", "flaky"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let host = HostConfig {
+        foreground_duty: BACKGROUND_DUTY_GLOBAL,
+        foreground_burst: BACKGROUND_BURST_GLOBAL,
+        domain_foreground_duty: 0.01,
+        domain_foreground_burst: Duration::from_millis(250),
+        stuck_threshold: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let mut h = scanned_under(fs.clone(), host, Config::default());
+    fs.fail("flaky", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("blip".into())));
+    for _ in 0..20 {
+        run_one_round(&mut h);
+        if h.health().reconciliation.degraded_paths.contains(&path("flaky")) {
+            break;
+        }
+    }
+    let degraded = h.health().reconciliation.degraded_paths.clone();
+    assert!(degraded.contains(&path("flaky")), "the fixture produced no retry record");
+
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_secs(120));
+    h.run_jobs_until(h.now() + Duration::from_secs(1200));
+    assert!(h.governor().debt > Duration::ZERO, "the fixture left the background bucket solvent");
+    let first = h.command(Command::Refresh(vec![path("a")]));
+    for _ in 0..200 {
+        h.run_jobs_until(h.now() + Duration::from_secs(60));
+        if h.result(first).is_some() {
+            break;
+        }
+    }
+    assert_eq!(h.result(first), Some(Ok(())), "the fixture's foreground read never completed");
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    assert!(h.governor().debt > Duration::ZERO, "the fixture repaid the background bucket");
+    assert!(h.governor().foreground_debt > Duration::ZERO, "the fixture left the foreground bucket solvent");
+
+    let ticket = h.command(Command::Refresh(vec![path("b")]));
+    let before = h.stats();
+    let denials_before = before.governor.denials;
+    let throttled_at = h.now();
+    let resume = h.governor().next_admissible.expect("a throttled governor names its resume time");
+    let half = throttled_at + (resume.saturating_sub(throttled_at) / 2);
+    h.run_jobs_until(half);
+    let after = h.stats();
+
+    let admitted: Vec<Admission> = h.admissions().into_iter().filter(|a| a.at > throttled_at).collect();
+    assert!(
+        admitted.is_empty(),
+        "RFC 15.3: no admission may occur while both buckets are in debt, {} were",
+        admitted.len()
+    );
+    assert!(after.governor.denials > denials_before, "RFC 15.3: the fixture recorded no denial to observe");
+    assert_eq!(
+        (after.baseline_cursor, after.obligations),
+        (before.baseline_cursor, before.obligations),
+        "RFC 15.3: denial leaves every obligation and the cursor unchanged"
+    );
+    assert_eq!(after.version, before.version, "RFC 15.3: a denied job performs no I/O and publishes nothing");
+    assert_eq!(h.result(ticket), None, "RFC 15.3: a command barrier attached to a denied job remains attached");
+    assert_eq!(
+        h.health().reconciliation.degraded_paths,
+        degraded,
+        "RFC 15.3: denial keeps a retry record's phase, reasons and barriers"
+    );
+
+    fs.clear_failures();
+    for _ in 0..400 {
+        h.run_jobs_until(h.now() + Duration::from_secs(600));
+        if h.result(ticket).is_some() {
+            break;
+        }
+    }
+    assert_eq!(h.result(ticket), Some(Ok(())), "RFC 5.2: the deferred command completes once capacity returns");
 }

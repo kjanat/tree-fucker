@@ -30,10 +30,6 @@ impl PolicyContext {
         PolicyContext::new(0, ())
     }
 
-    pub fn fingerprint(&self) -> u64 {
-        self.fingerprint
-    }
-
     pub fn get<T: Any>(&self) -> Option<&T> {
         self.value.downcast_ref::<T>()
     }

@@ -5,7 +5,8 @@ use tree_fucker::core::{Command, MonotonicTime, WorkOrigin};
 use tree_fucker::testing::{Admission, CostScope, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ResourceHealth, ResourceLimit, ThrottleCause};
 use tree_fucker::{
-    Config, EntryKind, Error, HostGovernor, HostGovernorError, LoadAll, RelativePath, Tree, WatcherKind, entry_bytes,
+    Config, EntryKind, Error, HostConfig, HostGovernor, HostGovernorError, LoadAll, RelativePath, Tree, WatcherKind,
+    entry_bytes,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -47,26 +48,45 @@ fn envelope(duty: f64, burst: Duration, window: Duration) -> Duration {
 }
 
 fn scanned(fs: Arc<FakeFileSystem>, config: Config) -> Harness {
-    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+    scanned_under(fs, HostConfig::default(), config)
+}
+
+fn scanned_under(fs: Arc<FakeFileSystem>, host: HostConfig, config: Config) -> Harness {
+    let mut h = Harness::open_with_host(fs, Arc::new(LoadAll), host, config).expect("open");
     h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
     h
 }
 
-fn foreground(config: Config) -> Config {
-    Config {
-        fixed_interval: Some(Duration::from_secs(86_400)),
+fn quiet(config: Config) -> Config {
+    Config { fixed_interval: Some(Duration::from_secs(86_400)), ..config }
+}
+
+fn foreground_host() -> HostConfig {
+    HostConfig {
         foreground_duty: 0.05,
         foreground_burst: Duration::from_millis(200),
         domain_foreground_duty: 0.05,
         domain_foreground_burst: Duration::from_millis(200),
-        ..config
+        ..Default::default()
+    }
+}
+
+fn wide_foreground_host() -> HostConfig {
+    HostConfig {
+        maximum_in_flight: 1,
+        per_domain_concurrency: 1,
+        foreground_duty: 1.0,
+        foreground_burst: Duration::from_secs(30),
+        domain_foreground_duty: 1.0,
+        domain_foreground_burst: Duration::from_secs(30),
+        ..Default::default()
     }
 }
 
 #[test]
 fn a_refresh_storm_stays_within_the_foreground_envelope_and_never_touches_the_background_bucket() {
     let fs = tree(&["a", "b", "c"]);
-    let mut h = scanned(fs.clone(), foreground(Config::default()));
+    let mut h = scanned_under(fs.clone(), foreground_host(), quiet(Config::default()));
     let start = h.now();
     for _ in 0..200 {
         h.command(Command::Refresh(vec![path("a"), path("b"), path("c")]));
@@ -100,17 +120,8 @@ fn a_refresh_storm_stays_within_the_foreground_envelope_and_never_touches_the_ba
 fn a_command_past_its_foreground_ceiling_fails_with_resource_limited_rather_than_admitting_more() {
     let fs = tree(&["a", "b"]);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(500));
-    let config = Config {
-        max_in_flight: 1,
-        per_domain_concurrency: 1,
-        foreground_ceiling_per_command: Duration::from_millis(300),
-        foreground_duty: 1.0,
-        foreground_burst: Duration::from_secs(30),
-        domain_foreground_duty: 1.0,
-        domain_foreground_burst: Duration::from_secs(30),
-        ..foreground(Config::default())
-    };
-    let mut h = scanned(fs.clone(), config);
+    let config = Config { foreground_ceiling_per_command: Duration::from_millis(300), ..quiet(Config::default()) };
+    let mut h = scanned_under(fs.clone(), wide_foreground_host(), config);
     let ticket = h.command(Command::Refresh(vec![path("a"), path("b")]));
     for _ in 0..200 {
         if h.result(ticket).is_some() {
@@ -140,16 +151,7 @@ fn a_command_past_its_foreground_ceiling_fails_with_resource_limited_rather_than
 fn a_foreground_read_still_counts_in_the_shared_physical_ceilings() {
     let fs = tree(&["a", "b", "c"]);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(50));
-    let config = Config {
-        max_in_flight: 1,
-        per_domain_concurrency: 1,
-        foreground_duty: 1.0,
-        foreground_burst: Duration::from_secs(30),
-        domain_foreground_duty: 1.0,
-        domain_foreground_burst: Duration::from_secs(30),
-        ..foreground(Config::default())
-    };
-    let mut h = scanned(fs.clone(), config);
+    let mut h = scanned_under(fs.clone(), wide_foreground_host(), quiet(Config::default()));
     h.command(Command::Refresh(vec![path("a"), path("b"), path("c")]));
     let mut peak = 0;
     for _ in 0..40 {
@@ -170,13 +172,20 @@ fn two_trees_under_one_host_governor_share_its_envelope_and_two_governors_do_not
     let window = Duration::from_secs(300);
     let budget = envelope(BACKGROUND_DUTY_GLOBAL, BACKGROUND_BURST_GLOBAL, window);
     let config = Config::default();
-    let shared = HostGovernor::independent(&config);
+    let host = HostConfig {
+        domain_background_duty: BACKGROUND_DUTY_GLOBAL,
+        domain_background_burst: BACKGROUND_BURST_GLOBAL,
+        ..Default::default()
+    };
+    let shared = HostGovernor::independent(&host);
     let mut one =
         Harness::open_under(costed(&["a", "b", "c"]), Arc::new(LoadAll), config.clone(), shared.clone()).expect("open");
     let mut two =
         Harness::open_under(costed(&["d", "e", "f"]), Arc::new(LoadAll), config.clone(), shared.clone()).expect("open");
-    let mut alone_one = Harness::open(costed(&["a", "b", "c"]), Arc::new(LoadAll), config.clone()).expect("open");
-    let mut alone_two = Harness::open(costed(&["d", "e", "f"]), Arc::new(LoadAll), config.clone()).expect("open");
+    let mut alone_one =
+        Harness::open_with_host(costed(&["a", "b", "c"]), Arc::new(LoadAll), host, config.clone()).expect("open");
+    let mut alone_two =
+        Harness::open_with_host(costed(&["d", "e", "f"]), Arc::new(LoadAll), host, config.clone()).expect("open");
     let horizon = MonotonicTime::ZERO + window;
     for step in 1..=60 {
         let target = MonotonicTime::ZERO + Duration::from_secs(5 * step);
@@ -211,7 +220,8 @@ fn memory_pressure_reports_throttled_memory_with_no_resume_time() {
     let leased = Config { entries_per_lease: 8, ..Default::default() };
     let probe = scanned(fs.clone(), leased.clone());
     let ceiling = probe.stats().snapshot_bytes + 1500;
-    let mut h = scanned(fs.clone(), Config { accounted_memory_ceiling: ceiling, ..leased });
+    let host = HostConfig { accounted_memory_ceiling: ceiling, ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, leased);
     assert!(h.paths().contains(&"a/f".to_string()), "the scan completes under the memory ceiling");
     for i in 0..100 {
         fs.add_silently(&format!("a/w{i}"), EntryKind::File);
@@ -278,7 +288,8 @@ fn a_listing_over_the_accounted_memory_ceiling_is_rejected_in_full_and_reports_t
     let fs = tree(&["big"]);
     let probe = scanned(fs.clone(), Config::default());
     let ceiling = probe.stats().snapshot_bytes;
-    let mut h = scanned(fs.clone(), Config { accounted_memory_ceiling: ceiling, ..Default::default() });
+    let host = HostConfig { accounted_memory_ceiling: ceiling, ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, Config::default());
     let before = h.stats().version;
     fs.add_silently("big/extra", EntryKind::File);
     h.run_round();
@@ -297,7 +308,8 @@ fn a_listing_over_the_in_flight_byte_ceiling_ends_the_session_resource_limited()
     let fs = wide(20);
     let child = entry_bytes(std::ffi::OsStr::new("f0"));
     let ceiling = child * 4;
-    let h = scanned(fs.clone(), Config { in_flight_listing_bytes: ceiling, ..Default::default() });
+    let host = HostConfig { in_flight_listing_bytes: ceiling, ..Default::default() };
+    let h = scanned_under(fs.clone(), host, Config::default());
     assert!(h.paths().contains(&"zzz/f".to_string()), "the narrow directories still list under the byte ceiling");
     assert!(
         !h.paths().contains(&"aaa/f0".to_string()),
@@ -409,33 +421,58 @@ fn a_listing_over_the_represented_entry_ceiling_is_rejected_in_full_and_reports_
 }
 
 #[test]
-fn a_tree_that_raises_a_host_limit_is_rejected_before_any_tree_state_exists() {
-    let host = HostGovernor::independent(&Config::default());
-    let raised =
-        Config { accounted_memory_ceiling: Config::default().accounted_memory_ceiling + 1, ..Default::default() };
-    let opened = Harness::open_under(tree(&["a"]), Arc::new(LoadAll), raised, host.clone());
+fn a_tree_reads_the_host_ceilings_and_cannot_carry_one_of_its_own() {
+    let host = HostGovernor::independent(&HostConfig {
+        maximum_in_flight: 2,
+        per_domain_concurrency: 1,
+        accounted_memory_ceiling: 4096,
+        in_flight_listing_bytes: 2048,
+        ..Default::default()
+    });
+    let one = Harness::open_under(tree(&["a"]), Arc::new(LoadAll), Config::default(), host.clone()).expect("open");
+    let two = Harness::open_under(
+        tree(&["b"]),
+        Arc::new(LoadAll),
+        Config { batch_size: 8, entries_per_directory: 4, ..Default::default() },
+        host.clone(),
+    )
+    .expect("open");
+    for h in [&one, &two] {
+        let view = h.stats().governor;
+        assert_eq!(
+            (view.memory_ceiling, view.in_flight_bytes_ceiling),
+            (4096, 2048),
+            "RFC 9.2 and 15.9: the host governor owns every physical ceiling and a tree reads them from it"
+        );
+    }
     assert!(
-        matches!(opened, Err(Error::InvalidConfig(_))),
-        "RFC 9.2: a tree MUST NOT raise a host limit, and opening one that does must fail with InvalidConfig"
+        HostGovernor::install(HostConfig { per_domain_concurrency: 9, ..Default::default() }).is_err(),
+        "RFC 9.2: per_domain_concurrency above maximum_in_flight is InvalidConfig"
     );
-    let tighter = Config { accounted_memory_ceiling: 1024, per_domain_concurrency: 1, ..Default::default() };
     assert!(
-        Harness::open_under(tree(&["a"]), Arc::new(LoadAll), tighter, host).is_ok(),
-        "RFC 9.2: a tree MAY impose a subordinate limit that is tighter than the host's"
+        Harness::open_with_host(
+            tree(&["c"]),
+            Arc::new(LoadAll),
+            HostConfig { accounted_memory_ceiling: 0, ..Default::default() },
+            Config::default()
+        )
+        .is_err(),
+        "RFC 9.2: `open` rejects InvalidConfig before creating tree state"
     );
 }
 
 #[test]
 fn the_process_governor_is_installed_once_before_its_first_use() {
-    let raised = Config {
-        max_in_flight: 16,
+    let raised = HostConfig {
+        maximum_in_flight: 16,
         per_domain_concurrency: 8,
         accounted_memory_ceiling: 1024 * 1024 * 1024,
         ..Default::default()
     };
-    let installed = HostGovernor::install(raised.clone()).expect("the process governor is installed before first use");
-    assert!(
-        installed.reject_raised_limits(&raised).is_ok(),
+    let installed = HostGovernor::install(raised).expect("the process governor is installed before first use");
+    assert_eq!(
+        *installed.limits(),
+        raised,
         "RFC 9.2: the host governor owns the physical ceilings, and an installed host may hold more than the defaults"
     );
 
@@ -443,23 +480,111 @@ fn the_process_governor_is_installed_once_before_its_first_use() {
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let fs = tree(&["a"]);
     let (handle, _stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), raised.clone(), rt.clone()))
-        .expect("RFC 9.2: a tree at the installed host limits opens");
+        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt.clone()))
+        .expect("RFC 9.2: a tree opens under the installed host limits");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
-
-    let above = Config { max_in_flight: 32, ..raised.clone() };
-    let opened = runtime.block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), above, rt));
-    assert!(
-        matches!(opened, Err(Error::InvalidConfig(_))),
-        "RFC 9.2: a tree MUST NOT raise a host limit, whatever the host was installed with"
+    assert_eq!(
+        handle.stats().governor.memory_ceiling,
+        1024 * 1024 * 1024,
+        "RFC 15.9: `open` uses the process-wide governor, so the tree accounts against the installed ceiling"
     );
 
     assert!(
-        matches!(HostGovernor::install(Config::default()), Err(HostGovernorError::AlreadyInstalled)),
+        matches!(HostGovernor::install(HostConfig::default()), Err(HostGovernorError::AlreadyInstalled)),
         "RFC 15.9: the host governor is one per process, so a second installation fails"
     );
-    assert!(
-        tree_fucker::host_governor().reject_raised_limits(&raised).is_ok(),
+    assert_eq!(
+        *tree_fucker::host_governor().limits(),
+        raised,
         "RFC 15.9: opening another tree changes no host limit, and neither does a refused installation"
     );
+}
+
+#[test]
+fn the_default_configuration_equals_the_rfc_9_2_table() {
+    let host = HostConfig::default();
+    let rows: Vec<(&str, String, String)> = vec![
+        ("maximum in-flight jobs", format!("{:?}", host.maximum_in_flight), format!("{:?}", 8usize)),
+        ("per-domain concurrency ceiling", format!("{:?}", host.per_domain_concurrency), format!("{:?}", 4usize)),
+        ("background duty, per domain", format!("{:?}", host.domain_background_duty), format!("{:?}", 0.01f64)),
+        ("background duty, global", format!("{:?}", host.background_duty), format!("{:?}", 0.02f64)),
+        (
+            "background burst, per domain",
+            format!("{:?}", host.domain_background_burst),
+            format!("{:?}", Duration::from_millis(250)),
+        ),
+        (
+            "background burst, global",
+            format!("{:?}", host.background_burst),
+            format!("{:?}", Duration::from_millis(500)),
+        ),
+        ("foreground duty", format!("{:?}", host.foreground_duty), format!("{:?}", 0.25f64)),
+        ("foreground burst", format!("{:?}", host.foreground_burst), format!("{:?}", Duration::from_secs(2))),
+        ("bootstrap allowance", format!("{:?}", host.bootstrap_allowance), format!("{:?}", Duration::from_millis(500))),
+        (
+            "aggregate accounted-memory ceiling",
+            format!("{:?}", host.accounted_memory_ceiling),
+            format!("{:?}", 512u64 * 1024 * 1024),
+        ),
+        (
+            "in-flight listing byte ceiling",
+            format!("{:?}", host.in_flight_listing_bytes),
+            format!("{:?}", 32u64 * 1024 * 1024),
+        ),
+        (
+            "initial cost estimate",
+            format!("{:?}", host.initial_cost_estimate),
+            format!("{:?}", Duration::from_millis(20)),
+        ),
+        ("stuck worker threshold", format!("{:?}", host.stuck_threshold), format!("{:?}", Duration::from_secs(30))),
+    ];
+    for (row, actual, expected) in rows {
+        assert_eq!(actual, expected, "RFC 9.2 host governor default `{row}`");
+    }
+
+    let tree = Config::default();
+    let rows: Vec<(&str, String, String)> = vec![
+        ("batch size", format!("{:?}", tree.batch_size), format!("{:?}", 64usize)),
+        ("pending command capacity", format!("{:?}", tree.command_capacity), format!("{:?}", 1024usize)),
+        ("paths per command limit", format!("{:?}", tree.paths_per_command), format!("{:?}", 65536usize)),
+        ("priority-set path limit", format!("{:?}", tree.priority_set_limit), format!("{:?}", 4096usize)),
+        ("update-stream capacity", format!("{:?}", tree.update_stream_capacity), format!("{:?}", 256usize)),
+        ("coalesced watcher-path limit", format!("{:?}", tree.watcher_path_limit), format!("{:?}", 16384usize)),
+        ("entries per directory limit", format!("{:?}", tree.entries_per_directory), format!("{:?}", 250_000usize)),
+        ("represented entry limit", format!("{:?}", tree.represented_entries), format!("{:?}", 1_000_000usize)),
+        ("snapshot byte ceiling", format!("{:?}", tree.snapshot_bytes), format!("{:?}", 256u64 * 1024 * 1024)),
+        (
+            "foreground ceiling per command",
+            format!("{:?}", tree.foreground_ceiling_per_command),
+            format!("{:?}", Duration::from_secs(30)),
+        ),
+        ("metadata fields", format!("{:?}", tree.metadata_fields), format!("{:?}", tree_fucker::MetadataFields::NONE)),
+        (
+            "domain crossing",
+            format!("{:?}", tree.domain_crossing),
+            format!("{:?}", tree_fucker::DomainCrossing::LoadOnDemand),
+        ),
+        ("transient degrade threshold", format!("{:?}", tree.transient_degrade_threshold), format!("{:?}", 3u32)),
+        ("retry maximum delay", format!("{:?}", tree.retry_maximum_delay), format!("{:?}", Duration::from_secs(300))),
+        (
+            "watch registration failure",
+            format!("{:?}", tree.watch_registration_failure_mode),
+            format!("{:?}", tree_fucker::WatchRegistrationFailure::ReconcileOnly),
+        ),
+        ("root reappearance monitoring", format!("{:?}", tree.root_reappearance_monitoring), format!("{:?}", true)),
+        ("minimum_period (RFC 12)", format!("{:?}", tree.minimum_period), format!("{:?}", Duration::from_secs(1))),
+        ("maximum_period (RFC 12)", format!("{:?}", tree.maximum_period), format!("{:?}", Duration::from_secs(300))),
+        ("baseline_share (RFC 11.3)", format!("{:?}", tree.baseline_share), format!("{:?}", 0.5f64)),
+        (
+            "class weights (RFC 11.3)",
+            format!("{:?}", tree.class_weights),
+            format!("{:?}", tree_fucker::ClassWeights { control: 4, refresh: 4, watcher: 2, retry: 1, priority: 2 }),
+        ),
+    ];
+    for (row, actual, expected) in rows {
+        assert_eq!(actual, expected, "RFC 9.2 tree default `{row}`");
+    }
+
+    assert!(host.validate().is_ok(), "RFC 9.2: the host defaults satisfy every InvalidConfig condition");
+    assert!(tree.validate().is_ok(), "RFC 9.2: the tree defaults satisfy every InvalidConfig condition");
 }

@@ -6,8 +6,8 @@ use tree_fucker::core::JobOperation;
 use tree_fucker::testing::{CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::RoundResult;
 use tree_fucker::{
-    Config, DomainCapabilities, DomainCrossing, EntryKind, FileSystem, FsError, KindSource, LoadAll, MetadataFields,
-    MetadataSource, MetadataSources, RelativePath, WatcherKind,
+    Config, DomainCapabilities, DomainCrossing, EntryKind, FileSystem, FsError, HostConfig, KindSource, LoadAll,
+    MetadataFields, MetadataSource, MetadataSources, RelativePath, WatcherKind,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -665,9 +665,9 @@ fn worst_window_of(admissions: &[tree_fucker::testing::Admission], window: Durat
 
 #[test]
 fn reserved_worker_time_of_a_multi_domain_history_stays_within_each_domains_envelope() {
-    let config = Config::default();
-    let global = envelope(config.background_duty, config.background_burst, MAXIMUM_PERIOD);
-    let per_domain = envelope(config.domain_background_duty, config.domain_background_burst, MAXIMUM_PERIOD);
+    let host = HostConfig::default();
+    let global = envelope(host.background_duty, host.background_burst, MAXIMUM_PERIOD);
+    let per_domain = envelope(host.domain_background_duty, host.domain_background_burst, MAXIMUM_PERIOD);
     for seed in 1..6u64 {
         let (h, _fs, _known) = domained_history(seed);
         let admissions = h.admissions();
@@ -874,9 +874,9 @@ fn mixed_origin_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>
 
 #[test]
 fn a_random_history_of_mixed_foreground_and_background_work_holds_both_envelopes() {
-    let config = Config::default();
-    let background = envelope(config.background_duty, config.background_burst, MAXIMUM_PERIOD);
-    let foreground = envelope(config.foreground_duty, config.foreground_burst, MAXIMUM_PERIOD);
+    let host = HostConfig::default();
+    let background = envelope(host.background_duty, host.background_burst, MAXIMUM_PERIOD);
+    let foreground = envelope(host.foreground_duty, host.foreground_burst, MAXIMUM_PERIOD);
     for seed in 1..6u64 {
         let (h, fs, known) = mixed_origin_history(seed);
         let admissions = h.admissions();
@@ -905,5 +905,150 @@ fn a_random_history_of_mixed_foreground_and_background_work_holds_both_envelopes
             let present = reachable(&fs, name).is_some();
             assert_eq!(represented, present, "seed {seed} disagrees with the filesystem about {name}");
         }
+    }
+}
+
+fn structural_invariants(snapshot: &tree_fucker::Snapshot, seed: u64, version: u64) {
+    for entry in snapshot.entries() {
+        let Some(state) = entry.load_state() else {
+            continue;
+        };
+        match state {
+            tree_fucker::LoadState::Excluded => assert_eq!(
+                snapshot.descendants(entry.id).count(),
+                0,
+                "RFC 17.3 seed {seed} version {version}: no excluded entry has a represented descendant, {} has {}",
+                entry.path,
+                snapshot.descendants(entry.id).count()
+            ),
+            tree_fucker::LoadState::Unloaded => assert_eq!(
+                snapshot.children(entry.id).count(),
+                0,
+                "RFC 17.3 seed {seed} version {version}: no unloaded directory has represented immediate children, \
+                 {} has {}",
+                entry.path,
+                snapshot.children(entry.id).count()
+            ),
+            tree_fucker::LoadState::Loading => assert_eq!(
+                snapshot.children(entry.id).count(),
+                0,
+                "RFC 17.3 seed {seed} version {version}: no Loading directory has represented immediate children, \
+                 {} has {}",
+                entry.path,
+                snapshot.children(entry.id).count()
+            ),
+            tree_fucker::LoadState::Loaded => {}
+        }
+    }
+}
+
+#[test]
+fn every_generated_history_holds_the_rfc_17_3_snapshot_properties() {
+    for seed in 1..8u64 {
+        let run = random_history(seed);
+        let events = run.harness.events().to_vec();
+        let mut previous: Option<tree_fucker::Snapshot> = None;
+        let mut last_version = 0u64;
+        let mut added: BTreeMap<u64, String> = BTreeMap::new();
+        let mut deltas = 0;
+        for event in &events {
+            if let Some(version) = event.version().map(|v| v.get()) {
+                assert!(
+                    version >= last_version,
+                    "RFC 17.3 seed {seed}: snapshot versions increase monotonically; {last_version} then {version}"
+                );
+                last_version = version;
+            }
+            let tree_fucker::UpdateEvent::Delta(delta) = event else {
+                continue;
+            };
+            deltas += 1;
+            assert_eq!(
+                delta.previous_version.next(),
+                delta.new_version,
+                "RFC 17.3 seed {seed}: a delta names the version it transforms"
+            );
+            assert_eq!(
+                delta.snapshot.version(),
+                delta.new_version,
+                "RFC 7.4 seed {seed}: a delta carries its snapshot"
+            );
+
+            for change in &delta.changes {
+                if let tree_fucker::PathChange::Added { id, path, .. } = change {
+                    let path = path.to_string();
+                    assert!(
+                        !added.contains_key(&id.get()),
+                        "RFC 17.3 seed {seed}: EntryId values are never reused; {} was added as {:?} and again as \
+                         {path:?}",
+                        id.get(),
+                        added.get(&id.get())
+                    );
+                    added.insert(id.get(), path);
+                }
+            }
+
+            if let Some(before) = previous.as_ref() {
+                assert_eq!(
+                    before.version(),
+                    delta.previous_version,
+                    "RFC 17.3 seed {seed}: a delta transforms the snapshot the previous delta published"
+                );
+                let mut paths: std::collections::BTreeSet<String> =
+                    before.entries().map(|entry| entry.path.to_string()).collect();
+                for change in &delta.changes {
+                    if let tree_fucker::PathChange::Removed { path, .. } = change {
+                        let prefix = format!("{path}/");
+                        paths.retain(|held| held != &path.to_string() && !held.starts_with(&prefix));
+                    }
+                }
+                let renames: Vec<(String, String)> = delta
+                    .changes
+                    .iter()
+                    .filter_map(|change| match change {
+                        tree_fucker::PathChange::Renamed { old_path, new_path, .. } => {
+                            Some((old_path.to_string(), new_path.to_string()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !renames.is_empty() {
+                    let moved: std::collections::BTreeSet<String> = paths
+                        .iter()
+                        .map(|held| {
+                            for (from, to) in &renames {
+                                let prefix = format!("{from}/");
+                                if held == from {
+                                    return to.clone();
+                                }
+                                if let Some(rest) = held.strip_prefix(&prefix) {
+                                    return format!("{to}/{rest}");
+                                }
+                            }
+                            held.clone()
+                        })
+                        .collect();
+                    paths = moved;
+                }
+                for change in &delta.changes {
+                    if let tree_fucker::PathChange::Added { path, .. } = change {
+                        paths.insert(path.to_string());
+                    }
+                }
+                let now: std::collections::BTreeSet<String> =
+                    delta.snapshot.entries().map(|entry| entry.path.to_string()).collect();
+                assert_eq!(
+                    paths,
+                    now,
+                    "RFC 17.3 seed {seed}: the update transforms its previous snapshot into its new snapshot; \
+                     version {}",
+                    delta.new_version.get()
+                );
+            }
+            structural_invariants(&delta.snapshot, seed, delta.new_version.get());
+            previous = Some(delta.snapshot.clone());
+        }
+        assert!(deltas > 2, "RFC 17.3 seed {seed}: the history published {deltas} deltas, too few to test");
+        structural_invariants(&run.harness.snapshot(), seed, last_version);
     }
 }

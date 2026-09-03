@@ -1,14 +1,13 @@
 use std::cmp::Reverse;
-use std::collections::HashMap as StdHashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use imbl::{HashMap, OrdMap};
+use imbl::OrdMap;
 
-use crate::entry::{Entry, LoadState, Shape};
-use crate::ids::{EntryGeneration, EntryId, SnapshotVersion};
+use crate::entry::{Entry, Shape};
+use crate::ids::{EntryGeneration, EntryId, IdHashing, IdMap, SharedIdMap, SnapshotVersion};
 use crate::path::{CaseSensitivity, PathKey, RelativePath};
 use crate::update::PathChange;
 
@@ -21,10 +20,10 @@ struct Inner {
     version: SnapshotVersion,
     case: CaseSensitivity,
     bytes: u64,
-    child_case: HashMap<EntryId, CaseSensitivity>,
+    child_case: SharedIdMap<EntryId, CaseSensitivity>,
     by_path: OrdMap<PathKey, Arc<Entry>>,
-    by_id: HashMap<EntryId, PathKey>,
-    children: HashMap<EntryId, OrdMap<PathKey, EntryId>>,
+    by_id: SharedIdMap<EntryId, PathKey>,
+    children: SharedIdMap<EntryId, OrdMap<PathKey, EntryId>>,
 }
 
 fn survivor(candidate: &Arc<Entry>, kept: &Arc<Entry>) -> EntryId {
@@ -44,8 +43,11 @@ fn fold(
     path: &RelativePath,
     default: CaseSensitivity,
     by_path: &OrdMap<PathKey, Arc<Entry>>,
-    child_case: &HashMap<EntryId, CaseSensitivity>,
+    child_case: &SharedIdMap<EntryId, CaseSensitivity>,
 ) -> (PathKey, CaseSensitivity) {
+    if child_case.is_empty() {
+        return (path.key(default), default);
+    }
     let mut key = PathKey::root();
     let mut case = default;
     let declared = |key: &PathKey| by_path.get(key).and_then(|entry| child_case.get(&entry.id)).copied();
@@ -68,20 +70,16 @@ impl Snapshot {
                 version,
                 case,
                 bytes: 0,
-                child_case: HashMap::new(),
+                child_case: SharedIdMap::with_hasher(IdHashing),
                 by_path: OrdMap::new(),
-                by_id: HashMap::new(),
-                children: HashMap::new(),
+                by_id: SharedIdMap::with_hasher(IdHashing),
+                children: SharedIdMap::with_hasher(IdHashing),
             }),
         }
     }
 
     pub fn version(&self) -> SnapshotVersion {
         self.inner.version
-    }
-
-    pub fn case_sensitivity(&self) -> CaseSensitivity {
-        self.inner.case
     }
 
     pub fn len(&self) -> usize {
@@ -185,7 +183,7 @@ impl Snapshot {
             by_path: self.inner.by_path.clone(),
             by_id: self.inner.by_id.clone(),
             children: self.inner.children.clone(),
-            before: StdHashMap::new(),
+            before: IdMap::default(),
         }
     }
 }
@@ -200,11 +198,11 @@ pub struct SnapshotBuilder {
     case: CaseSensitivity,
     bytes: u64,
     folds: usize,
-    child_case: HashMap<EntryId, CaseSensitivity>,
+    child_case: SharedIdMap<EntryId, CaseSensitivity>,
     by_path: OrdMap<PathKey, Arc<Entry>>,
-    by_id: HashMap<EntryId, PathKey>,
-    children: HashMap<EntryId, OrdMap<PathKey, EntryId>>,
-    before: StdHashMap<EntryId, Option<Arc<Entry>>>,
+    by_id: SharedIdMap<EntryId, PathKey>,
+    children: SharedIdMap<EntryId, OrdMap<PathKey, EntryId>>,
+    before: IdMap<EntryId, Option<Arc<Entry>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +257,9 @@ impl SnapshotBuilder {
     }
 
     pub fn set_child_case(&mut self, id: EntryId, case: Option<CaseSensitivity>) -> Vec<Arc<Entry>> {
+        if self.child_case.get(&id).copied() == case {
+            return Vec::new();
+        }
         let Some(path) = self.get(id).map(|entry| entry.path.clone()) else {
             return Vec::new();
         };
@@ -348,11 +349,6 @@ impl SnapshotBuilder {
     pub fn get(&self, id: EntryId) -> Option<&Entry> {
         let key = self.by_id.get(&id)?;
         self.by_path.get(key).map(|e| e.as_ref())
-    }
-
-    pub fn get_path(&mut self, path: &RelativePath) -> Option<&Entry> {
-        let key = self.key(path);
-        self.by_path.get(&key).map(|e| e.as_ref())
     }
 
     pub fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
@@ -611,14 +607,10 @@ pub fn new_entry(id: EntryId, path: RelativePath, shape: Shape) -> Entry {
     Entry { id, path, shape, metadata: Default::default(), identity: None, generation: EntryGeneration::new(0) }
 }
 
-pub fn is_loaded_directory(entry: &Entry) -> bool {
-    entry.shape == Shape::Directory(LoadState::Loaded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::EntryKind;
+    use crate::entry::{EntryKind, LoadState};
 
     fn path(p: &str) -> RelativePath {
         RelativePath::parse(p).expect("valid path")

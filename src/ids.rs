@@ -51,3 +51,44 @@ counter_type!(JobId);
 counter_type!(WatchId);
 counter_type!(WatchRequestId);
 counter_type!(TimerId);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(u64::try_from(value).unwrap_or(u64::MAX));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdHashing;
+
+impl std::hash::BuildHasher for IdHashing {
+    type Hasher = IdHasher;
+
+    fn build_hasher(&self) -> IdHasher {
+        IdHasher::default()
+    }
+}
+
+pub type IdMap<K, V> = std::collections::HashMap<K, V, IdHashing>;
+pub type SharedIdMap<K, V> = imbl::GenericHashMap<K, V, IdHashing, imbl::shared_ptr::DefaultSharedPtr>;

@@ -58,6 +58,7 @@ impl Coordinator {
                 SessionState::Finished(SessionOutcome::Complete(listing)) => {
                     self.listings += 1;
                     self.last_listing_children = Some(listing.entries.len());
+                    self.record_directory_size(&job.path, listing.entries.len());
                     match self.commit_listing(&job, listing) {
                         Ok(()) => self.finish_job(id, JobOutcome::Accepted),
                         Err(rejection) => {
@@ -73,6 +74,7 @@ impl Coordinator {
                 SessionState::Finished(SessionOutcome::ResourceLimited(reported)) => {
                     self.listing_failures += 1;
                     let limited = ResourceLimited { domain: self.domain_of(entry), ..reported };
+                    self.record_directory_size(&job.path, usize::try_from(limited.observed).unwrap_or(usize::MAX));
                     self.record_resource_limit(ResourceLimitEvent { path: job.path.clone(), limited });
                     self.finish_job(id, JobOutcome::Rejected(ListingRejection::ResourceLimited(limited)));
                 }
@@ -808,7 +810,7 @@ impl Coordinator {
                         let reason = format!("registration failed for {}: {err}", job.path);
                         self.degrade_domain_watcher(entry, reason.clone());
                         self.watcher_health = WatcherHealth::Degraded { backend: self.caps.watcher, reason };
-                        match self.config.watch_registration_failure {
+                        match self.config.watch_registration_failure_mode {
                             WatchRegistrationFailure::ReconcileOnly => {
                                 if is_root && self.open_gate == OpenGate::Pending {
                                     self.open_gate = OpenGate::Ready;

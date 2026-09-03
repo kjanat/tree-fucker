@@ -21,12 +21,6 @@ pub enum FsError {
     Fatal(String),
 }
 
-impl FsError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, FsError::PermissionDenied | FsError::Transient(_) | FsError::Unsupported(_))
-    }
-}
-
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

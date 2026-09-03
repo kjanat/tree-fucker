@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use super::governor::{GrantId, Reservation};
 use super::types::*;
-use super::{Coordinator, JobSpec, ListingWork, Output, WatchDecision, WatchScope, Work};
+use super::{
+    Coordinator, JobSpec, ListingWork, ObligationCounts, Output, WatchDecision, WatchScope, Work, obligation_counts,
+};
 use crate::domain::StorageDomainId;
 use crate::entry::{LoadState, Shape};
 use crate::fs::{CancellationToken, Lease};
@@ -313,13 +315,15 @@ impl Coordinator {
                 self.last_round_result = Some(RoundResult::Successful);
             }
             self.last_round = Some((self.now, Duration::ZERO));
+            self.last_successful_round = self.last_round;
+            self.last_obligations = ObligationCounts::default();
             return;
         }
         let generation = self.recon_seq.next().max(self.min_recon);
         self.recon_seq = generation;
         let barrier = self.next_seq();
         let mut obligations = Vec::with_capacity(loaded.len());
-        let mut index = std::collections::HashMap::new();
+        let mut index = IdMap::default();
         for (i, (_, id, path)) in loaded.into_iter().enumerate() {
             let load_generation = self.dir_state(id).map(|d| d.load_generation).unwrap_or_default();
             obligations.push(Obligation { entry: id, load_generation, path, state: ObligationState::Pending });
@@ -715,21 +719,21 @@ impl Coordinator {
 
     pub(super) fn capture_guards(&self, entry: EntryId, need: ReadNeed) -> Guards {
         let e = self.snapshot.get_by_id(entry);
-        let parent = self.parent_of(entry);
         let state = self.entries.get(entry);
+        let dir = state.and_then(|s| s.dir());
+        let parent_dir = self.parent_of(entry).and_then(|p| self.dir_state(p));
         Guards {
             incarnation: self.root.incarnation(),
             entry_generation: e.map(|e| e.generation).unwrap_or_default(),
-            load_generation: state.and_then(|s| s.dir()).map(|d| d.load_generation),
+            load_generation: dir.map(|d| d.load_generation),
             policy_revision: self.policy.revision(),
             policy_fence: self.policy_fence,
-            parent_context: parent.and_then(|p| self.dir_state(p)).map(|d| d.context_generation),
-            child_state: if need.observes_children() {
-                state.and_then(|s| s.dir()).map(|d| d.child_state)
-            } else {
-                None
+            parent_context: parent_dir.map(|d| d.context_generation),
+            child_state: match need.observes_children() {
+                true => dir.map(|d| d.child_state),
+                false => None,
             },
-            parent_child_state: parent.and_then(|p| self.dir_state(p)).map(|d| d.child_state),
+            parent_child_state: parent_dir.map(|d| d.child_state),
             entry_state: state.map(|s| s.state_generation).unwrap_or_default(),
             change_epoch: state.map(|s| s.change_epoch).unwrap_or_default(),
         }
@@ -760,7 +764,7 @@ impl Coordinator {
         }
         let mut deferred: Vec<JobId> = Vec::new();
         loop {
-            if self.blocking_slots.len() >= self.config.max_in_flight {
+            if self.blocking_slots.len() >= self.maximum_in_flight {
                 break;
             }
             let Some(id) = self.queue_order.pop_front() else {
@@ -845,12 +849,17 @@ impl Coordinator {
             .collect();
         let generation = round.generation;
         let started = round.started;
+        let counts = obligation_counts(round);
         let accepted: Vec<EntryId> =
             round.obligations.iter().filter(|o| o.state == ObligationState::Accepted).map(|o| o.entry).collect();
         for entry in accepted {
             self.entries.mark_covered(entry, generation);
         }
         self.last_round = Some((started, self.now.since(started)));
+        self.last_obligations = counts;
+        if unsatisfied.is_empty() {
+            self.last_successful_round = self.last_round;
+        }
         self.last_round_result =
             Some(if unsatisfied.is_empty() { RoundResult::Successful } else { RoundResult::Degraded { unsatisfied } });
         self.round = None;

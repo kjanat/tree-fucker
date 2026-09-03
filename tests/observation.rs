@@ -4,7 +4,7 @@ use std::time::Duration;
 use tree_fucker::core::{Command, JobOperation};
 use tree_fucker::testing::DomainId;
 use tree_fucker::testing::{CostScope, FailureMode, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{ErrorCause, RoundResult, UpdateEvent};
+use tree_fucker::update::{ErrorCause, ResourceLimit, RoundResult, UpdateEvent};
 use tree_fucker::{
     Config, DomainCapabilities, DomainCrossing, EntryKind, Error, FsError, IdentitySource, KindSource, LoadAll,
     MetadataFields, MetadataSource, MetadataSources, RelativePath, WatcherKind,
@@ -427,4 +427,143 @@ fn a_domain_acquiring_identity_per_child_counts_one_operation_per_child_and_a_no
         "RFC 10.1: identity acquisition is not modelled as metadata I/O; the tree counted {} metadata operations",
         stats.metadata_operations
     );
+}
+
+const RFC16_MEDIA: DomainId = DomainId::new(11);
+
+fn rfc16_tree() -> Arc<FakeFileSystem> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::Recursive));
+    fs.mkdir("wide");
+    for i in 0..3 {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    fs.mkdir("narrow");
+    fs.create_file("narrow/f", 1);
+    fs.mkdir("mnt");
+    fs.mkdir("mnt/inner");
+    fs.set_domain("mnt", RFC16_MEDIA);
+    fs
+}
+
+#[test]
+fn every_rfc_16_observability_item_is_present_in_stats_or_health() {
+    let fs = rfc16_tree();
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let config = Config { entries_per_directory: 3, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    h.command(Command::SetPriority(vec![path("narrow")]));
+    h.run_round();
+    let successful = h.stats();
+    fs.add_silently("wide/f3", EntryKind::File);
+    fs.add_silently("wide/f4", EntryKind::File);
+    h.run_round();
+    h.run_round();
+
+    let stats = h.stats();
+    let health = h.health();
+    let listed = stats
+        .domains
+        .iter()
+        .find(|domain| domain.listings > 0)
+        .cloned()
+        .expect("RFC 16: at least one storage domain was listed");
+
+    let items: Vec<(&str, bool)> = vec![
+        ("current snapshot version", stats.version.get() > 0),
+        ("initial scan state", stats.initial_scan == health.initial_scan),
+        ("current reconciliation generation", stats.reconciliation_generation.get() > 0),
+        ("time and duration of the last successful round", successful.last_successful_round.is_some()),
+        ("baseline cursor position", stats.baseline_cursor.0 <= stats.baseline_cursor.1),
+        ("obligation counts, total", successful.obligations.total > 0),
+        ("obligation counts, accepted", successful.obligations.accepted > 0),
+        (
+            "obligation counts, unsatisfied",
+            stats.obligations.unsatisfied > 0 && stats.obligations.unsatisfied <= stats.obligations.total,
+        ),
+        ("obligation counts, removed", stats.obligations.removed <= stats.obligations.total),
+        ("priority cursor progress", stats.priority_cursor.1 > 0),
+        ("loaded entry count", stats.loaded_directories > 0),
+        ("represented entry count", stats.represented_entries > 0),
+        ("queued job count", stats.queued_jobs == 0),
+        ("in-flight job count", stats.in_flight_jobs == 0),
+        ("watcher backend", stats.watcher == WatcherKind::Recursive),
+        ("watcher health", !health.watcher_domains.is_empty()),
+        ("dropped watcher hint count", stats.dropped_hints == 0),
+        ("coalesced watcher hint count", stats.coalesced_hints < u64::MAX),
+        ("listing latency", stats.last_listing_duration.is_some() && listed.latency.samples > 0),
+        ("listing failure counts", stats.listing_failures > 0),
+        ("degraded paths", stats.degraded_paths.contains(&path("wide"))),
+        ("storage domains entered", stats.domains.len() >= 2),
+        (
+            "declared capabilities and the source of each declaration",
+            stats.domains.iter().all(|domain| {
+                domain.capabilities.sources.topology == domain.capabilities.sources.topology
+                    && domain.capabilities.topology == domain.capabilities.topology
+            }),
+        ),
+        ("per-domain concurrency window", listed.window >= 1 && listed.window <= listed.ceiling),
+        ("per-domain in-flight count", listed.in_flight == 0),
+        ("per-domain worker time consumed", listed.charged > Duration::ZERO),
+        ("per-domain worker time granted", listed.granted > Duration::ZERO),
+        ("per-domain bucket level", listed.capacity > Duration::ZERO),
+        ("per-domain debt", listed.level == Duration::ZERO || listed.debt == Duration::ZERO),
+        ("throttled job count", stats.governor.denials < u64::MAX && listed.throttled_jobs < u64::MAX),
+        ("total throttled duration", stats.governor.throttled_duration < Duration::MAX),
+        ("effective background duty per domain", listed.effective_duty > 0.0),
+        ("listing counts per domain", listed.listings > 0),
+        ("metadata counts per domain", listed.metadata_operations < u64::MAX),
+        ("enumeration counts per domain", listed.entries_enumerated > 0),
+        (
+            "per-domain latency summaries",
+            listed.latency.samples > 0
+                && listed.latency.minimum <= listed.latency.median
+                && listed.latency.median <= listed.latency.tail
+                && listed.latency.mean >= listed.latency.minimum,
+        ),
+        (
+            "largest directories encountered",
+            stats.largest_directories.first().map(|d| d.children)
+                == stats.largest_directories.iter().map(|d| d.children).max()
+                && stats.largest_directories.iter().any(|d| d.path == path("wide") && d.children > 3),
+        ),
+        ("accounted memory", stats.accounted_memory > 0),
+        ("snapshot bytes", stats.snapshot_bytes > 0),
+        (
+            "stuck workers with their paths, operations, and start times",
+            stats.stuck_workers.iter().all(|slot| slot.started <= h.now()),
+        ),
+        (
+            "resource-limit events with cause and the configured limit",
+            stats.resource_limits.iter().any(|event| {
+                event.limited.limit == ResourceLimit::EntriesPerDirectory && event.limited.configured == 3
+            }),
+        ),
+        ("domain-crossing decisions", stats.crossings.iter().any(|crossing| crossing.path == path("mnt"))),
+    ];
+    let missing: Vec<&str> = items.iter().filter(|(_, present)| !present).map(|(name, _)| *name).collect();
+    assert!(missing.is_empty(), "RFC 16: the implementation exposes at least these items; missing {missing:?}");
+
+    let mut stuck = Harness::open_with_host(
+        {
+            let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+            fs.mkdir("held");
+            fs.set_cost(CostScope::path("held"), FakeOp::ReadDir, Duration::from_secs(36_000));
+            fs
+        },
+        Arc::new(LoadAll),
+        tree_fucker::HostConfig { stuck_threshold: Duration::from_secs(30), ..Default::default() },
+        Config::default(),
+    )
+    .expect("open");
+    stuck.run_jobs_until(tree_fucker::core::MonotonicTime::ZERO + Duration::from_secs(300));
+    let slot = stuck
+        .stats()
+        .stuck_workers
+        .first()
+        .cloned()
+        .expect("RFC 16: stuck workers are reported with their paths, operations, and start times");
+    assert_eq!(slot.path, path("held"));
+    assert_eq!(slot.operation, JobOperation::Listing);
+    assert!(slot.started < stuck.now());
 }

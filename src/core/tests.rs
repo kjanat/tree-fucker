@@ -67,7 +67,8 @@ fn a_successful_watch_registration_advances_the_retry_phase_to_listing() {
     fs.mkdir("c");
     fs.fail("c", FakeOp::Watch, FailureMode::Once(FsError::Transient("busy".into())));
     fs.fail("c", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("io".into())));
-    let config = Config { watch_registration_failure: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
+    let config =
+        Config { watch_registration_failure_mode: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     h.advance(Duration::from_secs(120));
@@ -84,7 +85,8 @@ fn a_retry_after_a_successful_watch_registration_uses_the_retry_class() {
     fs.mkdir("c");
     fs.fail("c", FakeOp::Watch, FailureMode::Once(FsError::Transient("busy".into())));
     fs.fail("c", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("io".into())));
-    let config = Config { watch_registration_failure: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
+    let config =
+        Config { watch_registration_failure_mode: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     h.advance(Duration::from_secs(120));

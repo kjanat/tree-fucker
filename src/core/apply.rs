@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
 
@@ -109,7 +109,7 @@ impl Coordinator {
             return Ok(());
         };
         let mut order: Vec<PathKey> = Vec::with_capacity(listing.entries.len());
-        let mut chosen: HashMap<PathKey, Chosen> = HashMap::with_capacity(listing.entries.len());
+        let mut chosen: BTreeMap<PathKey, Chosen> = BTreeMap::new();
         let mut malformed: Vec<ErrorCause> = Vec::new();
         let mut duplicates: Vec<OsString> = Vec::new();
         let mut unresolved: Vec<OsString> = Vec::new();
@@ -171,8 +171,8 @@ impl Coordinator {
         let previous_domain =
             self.dir_state(dir_id).and_then(|d| d.domain.as_ref()).map(|b| b.probe.capabilities.clone());
         let binding = self.bind_domain(&listing.domain);
-        let own_domain = binding.probe.clone();
         effects.domains.push((dir_id, binding));
+        let own_domain = listing.domain.as_ref();
         let was_loading = dir.shape == Shape::Directory(LoadState::Loading);
         let new_metadata = listing.directory.metadata.project(fields);
         if was_loading || dir.metadata != new_metadata || dir.identity != listing.directory.identity {
@@ -196,13 +196,13 @@ impl Coordinator {
         }
         let inherit = Reasons { initial_scan: job.reasons.initial_scan, ..Default::default() };
         let classification =
-            Classification { ctx: &ctx, inherit, fields: observed_fields, parent_domain: Some(&own_domain) };
-        let existing: HashMap<PathKey, Arc<Entry>> = builder
+            Classification { ctx: &ctx, inherit, fields: observed_fields, parent_domain: Some(own_domain) };
+        let existing: BTreeMap<PathKey, Arc<Entry>> = builder
             .children(dir_id)
             .into_iter()
             .filter_map(|e| Some((dir_key.descend(e.path.file_name()?, case), e)))
             .collect();
-        let mut seen_ids: HashSet<EntryId> = HashSet::new();
+        let mut seen_ids: HashSet<EntryId, crate::ids::IdHashing> = HashSet::default();
         for (path, key, info, child_domain) in children {
             let Some(old) = existing.get(&key) else {
                 let candidate = Candidate { key, path, info, domain: child_domain.as_deref() };
@@ -222,7 +222,7 @@ impl Coordinator {
                     old.id,
                     &path,
                     child_domain.as_deref(),
-                    &own_domain,
+                    own_domain,
                 );
                 let observed = Observed { path: &path, info };
                 self.reconcile_existing(&mut builder, &mut effects, old, observed, &classification);

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use super::types::*;
@@ -281,7 +280,7 @@ impl Coordinator {
         }
         let new_loading: Vec<EntryId> = effects.new_loading.iter().map(|(e, _, _)| *e).collect();
         self.commit(builder, effects, None);
-        let mut remaining: HashMap<EntryId, LoadGeneration> = HashMap::new();
+        let mut remaining: IdMap<EntryId, LoadGeneration> = IdMap::default();
         for entry in new_loading {
             if let Some(dir) = self.dir_state(entry) {
                 remaining.insert(entry, dir.load_generation);

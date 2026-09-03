@@ -5,7 +5,9 @@ use tree_fucker::core::JobOperation;
 use tree_fucker::policy::{PathPredicate, ScanDecision};
 use tree_fucker::testing::{BlockingMode, DeterministicRuntime, FailureMode, FakeFileSystem, FakeOp, HoldingRuntime};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RecoverableError, RoundResult, UpdateEvent};
-use tree_fucker::{Config, EntryKind, Error, FsError, LagMode, LoadAll, LoadState, RelativePath, Tree, WatcherKind};
+use tree_fucker::{
+    Config, EntryKind, Error, FsError, HostConfig, LagMode, LoadAll, LoadState, RelativePath, Tree, WatcherKind,
+};
 
 fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
@@ -18,7 +20,7 @@ fn open_tree(
     config: Config,
     runtime: Arc<dyn tree_fucker::runtime::Runtime>,
 ) -> impl std::future::Future<Output = tree_fucker::Result<(tree_fucker::TreeHandle, tree_fucker::UpdateStream)>> {
-    let governor = tree_fucker::HostGovernor::independent(&config);
+    let governor = tree_fucker::HostGovernor::independent(&HostConfig::default());
     Tree::open_outside_host_governor(fs, root, policy, config, runtime, governor)
 }
 
@@ -585,7 +587,7 @@ fn open_uses_the_process_wide_host_governor_and_the_opt_out_does_not() {
          validation under its bootstrap scope; bootstrap grants went from {before} to {after}"
     );
 
-    let own = tree_fucker::HostGovernor::independent(&Config::default());
+    let own = tree_fucker::HostGovernor::independent(&HostConfig::default());
     let other = Arc::new(FakeFileSystem::new(WatcherKind::None));
     other.mkdir("b");
     let (opted_out, _stream) = runtime
@@ -615,8 +617,8 @@ fn an_open_under_an_exhausted_bootstrap_allowance_waits_rather_than_bypassing() 
     let runtime = Arc::new(DeterministicRuntime::new());
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
     fs.mkdir("a");
-    let config = Config { bootstrap_allowance: Duration::from_millis(20), ..Default::default() };
-    let governor = tree_fucker::HostGovernor::independent(&config);
+    let host = HostConfig { bootstrap_allowance: Duration::from_millis(20), ..Default::default() };
+    let governor = tree_fucker::HostGovernor::independent(&host);
     let held = tree_fucker::core::GrantId::Bootstrap(governor.next_bootstrap());
     governor
         .try_admit(
@@ -644,9 +646,15 @@ fn an_open_under_an_exhausted_bootstrap_allowance_waits_rather_than_bypassing() 
     tree_fucker::runtime::Runtime::spawn(
         runtime.as_ref(),
         Box::pin(async move {
-            let opened =
-                Tree::open_outside_host_governor(opening, root, Arc::new(LoadAll), config, spawn_rt, held_governor)
-                    .await;
+            let opened = Tree::open_outside_host_governor(
+                opening,
+                root,
+                Arc::new(LoadAll),
+                Config::default(),
+                spawn_rt,
+                held_governor,
+            )
+            .await;
             assert!(opened.is_ok(), "the open completes once the allowance frees");
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }),

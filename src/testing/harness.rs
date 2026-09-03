@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::fake_fs::{DomainId, FakeFileSystem, FakeOp};
-use crate::config::Config;
+use crate::config::{Config, HostConfig};
 use crate::core::{
     Class, Command, Coordinator, HostGovernor, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats,
     Work, WorkOrigin, WorkerLoss,
@@ -11,7 +11,7 @@ use crate::core::{
 use crate::domain::StorageDomainId;
 use crate::error::Error;
 use crate::fs::{Continuation, FileSystem, HintKind, ListingSession, SessionStep, WatcherEvent};
-use crate::ids::{CommandId, JobId, TimerId, WatchId, WatchRequestId};
+use crate::ids::{CommandId, IdMap, JobId, TimerId, WatchId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
 use crate::snapshot::Snapshot;
@@ -72,10 +72,12 @@ pub struct Harness {
     pub fs: Arc<FakeFileSystem>,
     pub coordinator: Coordinator,
     now: MonotonicTime,
+    injected: Duration,
+    opened_at: std::time::Instant,
     jobs: VecDeque<JobSpec>,
     registrations: VecDeque<(WatchRequestId, RelativePath, bool)>,
     events: Vec<UpdateEvent>,
-    results: HashMap<CommandId, Result<(), Error>>,
+    results: IdMap<CommandId, Result<(), Error>>,
     next_command: u64,
     timer: Option<(TimerId, MonotonicTime)>,
     sink: Arc<Sink>,
@@ -84,13 +86,14 @@ pub struct Harness {
     unwatched: Vec<WatchId>,
     stopped: bool,
     schedule: BTreeSet<(MonotonicTime, JobId)>,
-    running: HashMap<JobId, Running>,
-    job_domain: HashMap<JobId, DomainId>,
+    running: IdMap<JobId, Running>,
+    job_domain: IdMap<JobId, DomainId>,
     charges: Vec<Charge>,
     admissions: Vec<Admission>,
-    admitted: HashSet<(JobId, u32)>,
-    sessions: HashMap<JobId, SessionSlot>,
-    entries_seen: HashMap<JobId, usize>,
+    admitted: HashSet<(JobId, u32), crate::ids::IdHashing>,
+    grant_buffer: Vec<crate::core::Grant>,
+    sessions: IdMap<JobId, SessionSlot>,
+    entries_seen: IdMap<JobId, usize>,
     batch_index: usize,
     batch_members: BTreeSet<JobId>,
     waited_at: Option<MonotonicTime>,
@@ -99,8 +102,17 @@ pub struct Harness {
 
 impl Harness {
     pub fn open(fs: Arc<FakeFileSystem>, policy: Arc<dyn ScanPolicy>, config: Config) -> Result<Harness, Error> {
-        let governor = HostGovernor::independent(&config);
-        Harness::open_under(fs, policy, config, governor)
+        Harness::open_with_host(fs, policy, HostConfig::default(), config)
+    }
+
+    pub fn open_with_host(
+        fs: Arc<FakeFileSystem>,
+        policy: Arc<dyn ScanPolicy>,
+        host: HostConfig,
+        config: Config,
+    ) -> Result<Harness, Error> {
+        host.validate().map_err(Error::InvalidConfig)?;
+        Harness::open_under(fs, policy, config, HostGovernor::independent(&host))
     }
 
     pub fn open_under(
@@ -118,10 +130,12 @@ impl Harness {
             fs,
             coordinator,
             now,
+            injected: Duration::ZERO,
+            opened_at: std::time::Instant::now(),
             jobs: VecDeque::new(),
             registrations: VecDeque::new(),
             events: Vec::new(),
-            results: HashMap::new(),
+            results: IdMap::default(),
             next_command: 1,
             timer: None,
             sink: Arc::new(Sink { queue: Mutex::new(VecDeque::new()) }),
@@ -130,13 +144,14 @@ impl Harness {
             unwatched: Vec::new(),
             stopped: false,
             schedule: BTreeSet::new(),
-            running: HashMap::new(),
-            job_domain: HashMap::new(),
+            running: IdMap::default(),
+            job_domain: IdMap::default(),
             charges: Vec::new(),
             admissions: Vec::new(),
-            admitted: HashSet::new(),
-            sessions: HashMap::new(),
-            entries_seen: HashMap::new(),
+            admitted: HashSet::default(),
+            grant_buffer: Vec::new(),
+            sessions: IdMap::default(),
+            entries_seen: IdMap::default(),
             batch_index: 0,
             batch_members: BTreeSet::new(),
             waited_at: None,
@@ -155,6 +170,20 @@ impl Harness {
 
     pub fn open_default(fs: Arc<FakeFileSystem>, policy: Arc<dyn ScanPolicy>) -> Harness {
         Harness::open(fs, policy, Config::default()).expect("open")
+    }
+
+    fn advance_injected(&mut self, at: MonotonicTime) {
+        let next = self.now.max(at);
+        self.injected += next.since(self.now);
+        self.now = next;
+    }
+
+    pub fn injected(&self) -> Duration {
+        self.injected
+    }
+
+    pub fn real_elapsed(&self) -> Duration {
+        self.opened_at.elapsed()
     }
 
     pub fn now(&self) -> MonotonicTime {
@@ -214,12 +243,14 @@ impl Harness {
     }
 
     fn record_grants(&mut self) {
+        let mut fresh = std::mem::take(&mut self.grant_buffer);
+        fresh.clear();
         let admitted = &self.admitted;
-        let fresh = self.coordinator.new_grants(&|id, lease| match id.job() {
+        self.coordinator.new_grants_into(&mut fresh, &|id, lease| match id.job() {
             Some(job) => admitted.contains(&(job, lease)),
             None => true,
         });
-        for grant in fresh {
+        for grant in &fresh {
             let Some(job) = grant.id.job() else {
                 continue;
             };
@@ -244,6 +275,7 @@ impl Harness {
                 origin: grant.origin,
             });
         }
+        self.grant_buffer = fresh;
     }
 
     fn batch_of(&mut self, job: JobId) -> usize {
@@ -304,10 +336,6 @@ impl Harness {
 
     pub fn charged_work(&self) -> Duration {
         self.charges.iter().map(|c| c.cost).sum()
-    }
-
-    pub fn charged_work_between(&self, from: MonotonicTime, to: MonotonicTime) -> Duration {
-        self.charges.iter().filter(|c| c.at > from && c.at <= to).map(|c| c.cost).sum()
     }
 
     pub fn reserved_between(&self, from: MonotonicTime, to: MonotonicTime) -> Duration {
@@ -566,7 +594,7 @@ impl Harness {
         let Some((due, id)) = self.schedule.iter().next().copied() else {
             return false;
         };
-        self.now = self.now.max(due);
+        self.advance_injected(due);
         if self.complete_job(id) || self.complete_outstanding_job(id) {
             return true;
         }
@@ -603,7 +631,7 @@ impl Harness {
         for _ in 0..MAXIMUM_STEPS {
             before_step(self);
             if !self.step(target, &mut fired) {
-                self.now = self.now.max(target);
+                self.advance_injected(target);
                 self.observe();
                 if self.auto_register {
                     self.complete_registrations();
@@ -667,7 +695,7 @@ impl Harness {
             return false;
         }
         self.waited_at = Some(self.now.max(at));
-        self.now = self.now.max(at);
+        self.advance_injected(at);
         self.timer = None;
         self.feed(Input::Timer(id));
         true
@@ -678,7 +706,7 @@ impl Harness {
         loop {
             match self.timer {
                 Some((id, at)) if at <= target => {
-                    self.now = self.now.max(at);
+                    self.advance_injected(at);
                     self.timer = None;
                     self.feed(Input::Timer(id));
                     self.settle(target);
@@ -686,7 +714,7 @@ impl Harness {
                 _ => break,
             }
         }
-        self.now = target;
+        self.advance_injected(target);
         self.observe();
         self.settle(target);
     }
@@ -694,7 +722,7 @@ impl Harness {
     pub fn fire_timer_only(&mut self) -> bool {
         match self.timer {
             Some((id, at)) => {
-                self.now = self.now.max(at);
+                self.advance_injected(at);
                 self.timer = None;
                 self.feed(Input::Timer(id));
                 true
@@ -706,7 +734,7 @@ impl Harness {
     pub fn fire_timer(&mut self) -> bool {
         match self.timer {
             Some((id, at)) => {
-                self.now = self.now.max(at);
+                self.advance_injected(at);
                 self.timer = None;
                 self.feed(Input::Timer(id));
                 self.run_until_idle();

@@ -123,10 +123,6 @@ impl DeterministicRuntime {
         self.cancel_requests.load(Ordering::SeqCst)
     }
 
-    pub fn caught_panics(&self) -> u64 {
-        self.caught_panics.load(Ordering::SeqCst)
-    }
-
     pub fn run_until_stalled(&self) {
         loop {
             let blocking: Vec<BlockingWork> = lock(&self.inner).blocking.drain(..).collect();

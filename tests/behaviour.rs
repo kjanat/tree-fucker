@@ -8,8 +8,9 @@ use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness, InjectedPosition};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RoundResult, UpdateEvent, WatcherHealth};
 use tree_fucker::{
-    CaseSensitivity, Config, DomainCapabilities, EntryKind, Error, FsError, IdentityReliability, LoadAll, LoadState,
-    MetadataFields, PathChange, PathPredicate, PolicyRevision, RelativePath, WatchRegistrationFailure, WatcherKind,
+    CaseSensitivity, Config, DomainCapabilities, EntryKind, Error, FsError, HostConfig, IdentityReliability, LoadAll,
+    LoadState, MetadataFields, PathChange, PathPredicate, PolicyRevision, RelativePath, WatchRegistrationFailure,
+    WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
@@ -65,7 +66,8 @@ fn per_directory_watcher_registers_before_each_first_listing() {
 fn require_watcher_fails_open_when_root_registration_fails() {
     let fs = populated(WatcherKind::Recursive);
     fs.fail("", FakeOp::Watch, FailureMode::Always(FsError::Unsupported("nope".into())));
-    let config = Config { watch_registration_failure: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
+    let config =
+        Config { watch_registration_failure_mode: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
     let result = Harness::open(fs, Arc::new(LoadAll), config);
     assert!(matches!(result, Err(Error::WatcherRegistrationFailed)));
 }
@@ -87,7 +89,8 @@ fn reconcile_only_degrades_watcher_health_and_continues() {
 fn require_watcher_blocks_listing_for_failed_directory_registration() {
     let fs = populated(WatcherKind::NonRecursive);
     fs.fail("c", FakeOp::Watch, FailureMode::Times(2, FsError::Transient("busy".into())));
-    let config = Config { watch_registration_failure: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
+    let config =
+        Config { watch_registration_failure_mode: WatchRegistrationFailure::RequireWatcher, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     assert_eq!(h.entry("c").and_then(|e| e.load_state()), Some(LoadState::Loading));
@@ -230,8 +233,9 @@ fn priority_set_larger_than_batch_does_not_starve_baseline() {
         fs.mkdir(&format!("p{i:02}"));
     }
     fs.mkdir("zz");
-    let config = Config { batch_size: 4, max_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
-    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    let host = HostConfig { maximum_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
+    let config = Config { batch_size: 4, ..Default::default() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), host, config).expect("open");
     h.run_until_idle();
     let priority: Vec<RelativePath> = (0..12).map(|i| path(&format!("p{i:02}"))).collect();
     let t = h.command(Command::SetPriority(priority));
@@ -268,7 +272,7 @@ fn closed_batch_admits_nothing_until_every_member_settles() {
     for i in 0..6 {
         fs.mkdir(&format!("d{i}"));
     }
-    let config = Config { batch_size: 3, max_in_flight: 8, ..Default::default() };
+    let config = Config { batch_size: 3, ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
     h.fire_timer_only();

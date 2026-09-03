@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Add;
 use std::time::Duration;
 
@@ -36,12 +36,6 @@ impl Add<Duration> for MonotonicTime {
 pub enum WorkOrigin {
     Background,
     Foreground,
-}
-
-impl WorkOrigin {
-    pub fn is_foreground(self) -> bool {
-        self == WorkOrigin::Foreground
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -496,7 +490,7 @@ impl EntryState {
 
 #[derive(Debug, Default)]
 pub struct EntryStates {
-    states: HashMap<EntryId, EntryState>,
+    states: IdMap<EntryId, EntryState>,
     due: BTreeMap<MonotonicTime, BTreeSet<EntryId>>,
     degraded: BTreeSet<EntryId>,
     metadata_degraded: BTreeSet<EntryId>,
@@ -910,7 +904,7 @@ pub struct Round {
     pub generation: ReconciliationGeneration,
     pub barrier: Sequence,
     pub obligations: Vec<Obligation>,
-    pub index: HashMap<EntryId, usize>,
+    pub index: IdMap<EntryId, usize>,
     pub cursor: usize,
     pub started: MonotonicTime,
 }
@@ -944,7 +938,7 @@ struct ScanObligation {
 
 #[derive(Clone, Debug)]
 pub struct InitialScan {
-    obligations: HashMap<EntryId, ScanObligation>,
+    obligations: IdMap<EntryId, ScanObligation>,
     pending: usize,
     failed: BTreeMap<RelativePath, usize>,
     pub foreground_done: bool,
@@ -954,7 +948,7 @@ pub struct InitialScan {
 impl InitialScan {
     pub fn new() -> InitialScan {
         InitialScan {
-            obligations: HashMap::new(),
+            obligations: IdMap::default(),
             pending: 0,
             failed: BTreeMap::new(),
             foreground_done: false,
@@ -1061,7 +1055,7 @@ pub enum RefreshTarget {
 pub enum CommandState {
     Refresh { remaining: Vec<RefreshTarget> },
     Load { entry: EntryId },
-    InvalidatePolicy { remaining: HashMap<EntryId, LoadGeneration> },
+    InvalidatePolicy { remaining: IdMap<EntryId, LoadGeneration> },
 }
 
 #[derive(Clone, Debug)]

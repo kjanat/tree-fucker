@@ -61,13 +61,6 @@ impl RelativePath {
         Ok(RelativePath { components: Arc::from(components) })
     }
 
-    pub fn from_components(components: Vec<OsString>) -> Result<Self, PathError> {
-        for name in &components {
-            validate_name(name)?;
-        }
-        Ok(RelativePath { components: Arc::from(components) })
-    }
-
     pub fn components(&self) -> &[OsString] {
         &self.components
     }
@@ -216,10 +209,6 @@ impl PathKey {
 
     pub fn starts_with(&self, prefix: &PathKey) -> bool {
         self.folded.starts_with(&prefix.folded)
-    }
-
-    pub fn folded(&self) -> &RelativePath {
-        &self.folded
     }
 
     pub fn child(&self, name: &OsStr, case: CaseSensitivity) -> Result<PathKey, PathError> {

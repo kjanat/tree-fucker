@@ -420,21 +420,6 @@ pub struct DeclarationSources {
     pub watcher: DeclarationSource,
 }
 
-impl DeclarationSources {
-    pub const DECLARED: DeclarationSources = DeclarationSources {
-        semantics: DeclarationSource::Declared,
-        topology: DeclarationSource::Declared,
-        transport: DeclarationSource::Declared,
-        media: DeclarationSource::Declared,
-        case: DeclarationSource::Declared,
-        timestamp_granularity: DeclarationSource::Declared,
-        identity_space: DeclarationSource::Declared,
-        identity_reliability: DeclarationSource::Declared,
-        observation: DeclarationSource::Declared,
-        watcher: DeclarationSource::Declared,
-    };
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DomainCapabilities {
     pub semantics: FilesystemSemantics,
@@ -506,10 +491,6 @@ pub enum Crossing {
 }
 
 impl Crossing {
-    pub fn is_proven(self) -> bool {
-        matches!(self, Crossing::Proven)
-    }
-
     pub fn stronger(self, other: Crossing) -> Crossing {
         match (self, other) {
             (Crossing::Proven, _) | (_, Crossing::Proven) => Crossing::Proven,
@@ -569,12 +550,6 @@ pub enum ProbeError {
     PermissionDenied,
     Transient(String),
     Unsupported(String),
-}
-
-impl ProbeError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, ProbeError::PermissionDenied | ProbeError::Transient(_) | ProbeError::Unsupported(_))
-    }
 }
 
 impl fmt::Display for ProbeError {

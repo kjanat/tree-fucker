@@ -9,7 +9,7 @@ mod watcher;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,21 @@ use crate::update::{
 
 const RESOURCE_LIMIT_HISTORY: usize = 64;
 const CROSSING_HISTORY: usize = 64;
+const LARGEST_DIRECTORIES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObligationCounts {
+    pub total: usize,
+    pub accepted: usize,
+    pub unsatisfied: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectorySize {
+    pub path: RelativePath,
+    pub children: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossingEvent {
@@ -256,7 +271,9 @@ pub struct Stats {
     pub reconciliation_generation: ReconciliationGeneration,
     pub minimum_coverage_generation: ReconciliationGeneration,
     pub last_round: Option<(MonotonicTime, Duration)>,
+    pub last_successful_round: Option<(MonotonicTime, Duration)>,
     pub baseline_cursor: (usize, usize),
+    pub obligations: ObligationCounts,
     pub priority_cursor: (usize, usize),
     pub loaded_directories: usize,
     pub represented_entries: usize,
@@ -284,6 +301,7 @@ pub struct Stats {
     pub lost_workers: u64,
     pub last_listing_duration: Option<Duration>,
     pub last_listing_children: Option<usize>,
+    pub largest_directories: Vec<DirectorySize>,
     pub degraded_paths: BTreeSet<RelativePath>,
     pub metadata_degraded_paths: BTreeSet<RelativePath>,
     pub metadata_operations: u64,
@@ -313,6 +331,8 @@ pub struct Coordinator {
     governor: HostGovernor,
     tree: u64,
     memory_ceiling: u64,
+    maximum_in_flight: usize,
+    in_flight_bytes_ceiling: u64,
     policy: Arc<dyn ScanPolicy>,
     caps: FsCapabilities,
     now: MonotonicTime,
@@ -323,14 +343,15 @@ pub struct Coordinator {
     next_job_id: JobId,
     next_watch_request: WatchRequestId,
     snapshot: Snapshot,
+    parent_cache: std::cell::RefCell<(SnapshotVersion, IdMap<EntryId, Option<EntryId>>)>,
     published_version: SnapshotVersion,
     root: RootState,
     root_seed: Option<PolicyContext>,
     initial_scan: InitialScan,
     entries: EntryStates,
-    pending: HashMap<EntryId, PendingRequest>,
-    pending_enrichment: HashMap<EntryId, EnrichmentRequest>,
-    pending_domain: HashMap<EntryId, DomainRequest>,
+    pending: IdMap<EntryId, PendingRequest>,
+    pending_enrichment: IdMap<EntryId, EnrichmentRequest>,
+    pending_domain: IdMap<EntryId, DomainRequest>,
     domain_records: BTreeMap<StorageDomainId, DomainRecord>,
     unknown_domain: Option<StorageDomainId>,
     crossing_events: VecDeque<CrossingEvent>,
@@ -338,17 +359,19 @@ pub struct Coordinator {
     domain_resolutions: u64,
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
-    jobs: HashMap<JobId, ActiveJob>,
+    jobs: IdMap<JobId, ActiveJob>,
     blocking_slots: BTreeMap<JobId, Occupancy>,
-    active_by_entry: HashMap<EntryId, JobId>,
+    active_by_entry: IdMap<EntryId, JobId>,
     probe_job: Option<JobId>,
-    registrations: HashMap<WatchRequestId, RegistrationTarget>,
+    registrations: IdMap<WatchRequestId, RegistrationTarget>,
     queue_order: VecDeque<JobId>,
     batch: Option<Batch>,
     round: Option<Round>,
     last_round: Option<(MonotonicTime, Duration)>,
+    last_successful_round: Option<(MonotonicTime, Duration)>,
     last_round_result: Option<crate::update::RoundResult>,
-    commands: HashMap<CommandId, PendingCommand>,
+    last_obligations: ObligationCounts,
+    commands: IdMap<CommandId, PendingCommand>,
     priority: PrioritySet,
     policy_fence: PolicyFence,
     class_rotation: usize,
@@ -380,7 +403,7 @@ pub struct Coordinator {
     listing_bytes: u64,
     in_flight_listing_bytes: u64,
     reported_memory: (u64, u64),
-    session_bytes: HashMap<JobId, u64>,
+    session_bytes: IdMap<JobId, u64>,
     kind_resolutions: u64,
     identity_reads: u64,
     unresolved_listings: u64,
@@ -391,6 +414,7 @@ pub struct Coordinator {
     enrichment_failures: u64,
     last_listing_duration: Option<Duration>,
     last_listing_children: Option<usize>,
+    largest_directories: Vec<DirectorySize>,
 }
 
 impl Drop for Coordinator {
@@ -416,7 +440,7 @@ impl Coordinator {
         governor: HostGovernor,
     ) -> Result<Coordinator, Error> {
         config.validate().map_err(Error::InvalidConfig)?;
-        governor.reject_raised_limits(&config).map_err(Error::InvalidConfig)?;
+        governor.limits().validate().map_err(Error::InvalidConfig)?;
         if root_info.kind != crate::entry::EntryKind::Directory {
             return Err(Error::NotDirectory);
         }
@@ -424,11 +448,15 @@ impl Coordinator {
         let snapshot = Snapshot::empty(SnapshotVersion::new(0), caps.case);
         let tree = governor.next_tree();
         let memory_ceiling = governor.memory_ceiling();
+        let maximum_in_flight = governor.limits().maximum_in_flight;
+        let in_flight_bytes_ceiling = governor.limits().in_flight_listing_bytes;
         let mut coordinator = Coordinator {
             config,
             governor,
             tree,
             memory_ceiling,
+            maximum_in_flight,
+            in_flight_bytes_ceiling,
             policy,
             caps,
             now,
@@ -439,14 +467,15 @@ impl Coordinator {
             next_job_id: JobId::new(1),
             next_watch_request: WatchRequestId::new(1),
             snapshot,
+            parent_cache: std::cell::RefCell::new((SnapshotVersion::new(0), IdMap::default())),
             published_version: SnapshotVersion::new(0),
             root: RootState::Unavailable { last: RootIncarnation::new(0) },
             root_seed: None,
             initial_scan: InitialScan::new(),
             entries: EntryStates::default(),
-            pending: HashMap::new(),
-            pending_enrichment: HashMap::new(),
-            pending_domain: HashMap::new(),
+            pending: IdMap::default(),
+            pending_enrichment: IdMap::default(),
+            pending_domain: IdMap::default(),
             domain_records: BTreeMap::new(),
             unknown_domain: None,
             crossing_events: VecDeque::new(),
@@ -454,17 +483,19 @@ impl Coordinator {
             domain_resolutions: 0,
             root_probe: None,
             probe_attempts: 0,
-            jobs: HashMap::new(),
+            jobs: IdMap::default(),
             blocking_slots: BTreeMap::new(),
-            active_by_entry: HashMap::new(),
+            active_by_entry: IdMap::default(),
             probe_job: None,
-            registrations: HashMap::new(),
+            registrations: IdMap::default(),
             queue_order: VecDeque::new(),
             batch: None,
             round: None,
             last_round: None,
+            last_successful_round: None,
             last_round_result: None,
-            commands: HashMap::new(),
+            last_obligations: ObligationCounts::default(),
+            commands: IdMap::default(),
             priority: PrioritySet::default(),
             policy_fence: PolicyFence::new(0),
             class_rotation: 0,
@@ -500,7 +531,7 @@ impl Coordinator {
             listing_bytes: 0,
             in_flight_listing_bytes: 0,
             reported_memory: (0, 0),
-            session_bytes: HashMap::new(),
+            session_bytes: IdMap::default(),
             kind_resolutions: 0,
             identity_reads: 0,
             unresolved_listings: 0,
@@ -511,6 +542,7 @@ impl Coordinator {
             enrichment_failures: 0,
             last_listing_duration: None,
             last_listing_children: None,
+            largest_directories: Vec::new(),
         };
         coordinator.install_root(root_info);
         if !coordinator.caps.watcher.is_present() {
@@ -626,12 +658,27 @@ impl Coordinator {
         self.governor.grants()
     }
 
-    pub fn new_grants(&self, seen: &dyn Fn(GrantId, u32) -> bool) -> Vec<Grant> {
-        self.governor.new_grants(seen)
+    pub fn new_grants_into(&self, into: &mut Vec<Grant>, seen: &dyn Fn(GrantId, u32) -> bool) {
+        self.governor.new_grants_into(into, seen)
+    }
+
+    pub(super) fn record_directory_size(&mut self, path: &RelativePath, children: usize) {
+        match self.largest_directories.iter().position(|entry| entry.path == *path) {
+            Some(at) if self.largest_directories[at].children == children => return,
+            Some(at) => self.largest_directories[at].children = children,
+            None if self.largest_directories.len() >= LARGEST_DIRECTORIES
+                && self.largest_directories.last().is_some_and(|last| last.children >= children) =>
+            {
+                return;
+            }
+            None => self.largest_directories.push(DirectorySize { path: path.clone(), children }),
+        }
+        self.largest_directories.sort_by(|a, b| b.children.cmp(&a.children).then_with(|| a.path.cmp(&b.path)));
+        self.largest_directories.truncate(LARGEST_DIRECTORIES);
     }
 
     pub(super) fn ceilings(&self) -> Ceilings {
-        Ceilings { entries: self.config.entries_per_directory, bytes: self.config.in_flight_listing_bytes }
+        Ceilings { entries: self.config.entries_per_directory, bytes: self.in_flight_bytes_ceiling }
     }
 
     pub(super) fn limited(
@@ -660,10 +707,6 @@ impl Coordinator {
 
     pub fn is_stopped(&self) -> bool {
         matches!(self.shutdown, ShutdownState::Stopped | ShutdownState::Terminated { .. })
-    }
-
-    pub fn next_wake(&self) -> Option<MonotonicTime> {
-        self.timer_wake
     }
 
     pub fn observe(&mut self, now: MonotonicTime) -> Vec<Output> {
@@ -765,7 +808,12 @@ impl Coordinator {
             reconciliation_generation: self.round.as_ref().map(|r| r.generation).unwrap_or(self.recon_seq),
             minimum_coverage_generation: self.min_recon,
             last_round: self.last_round,
+            last_successful_round: self.last_successful_round,
             baseline_cursor: self.round.as_ref().map(|r| (r.cursor, r.obligations.len())).unwrap_or((0, 0)),
+            obligations: match self.round.as_ref() {
+                Some(round) => obligation_counts(round),
+                None => self.last_obligations,
+            },
             priority_cursor: (self.priority.cursor, priority_len),
             loaded_directories: loaded,
             represented_entries: self.snapshot.len(),
@@ -809,6 +857,7 @@ impl Coordinator {
             lost_workers: self.lost_workers,
             last_listing_duration: self.last_listing_duration,
             last_listing_children: self.last_listing_children,
+            largest_directories: self.largest_directories.clone(),
             degraded_paths: self.degraded_paths(),
             metadata_degraded_paths: self.metadata_degraded_paths(),
             metadata_operations: self.metadata_operations,
@@ -896,8 +945,13 @@ impl Coordinator {
         };
         let watcher = resolve_watcher(capabilities.watcher, self.caps.watcher);
         let now = self.now;
-        self.governor.register_domain(id, &capabilities, self.config.per_domain_concurrency, now);
-        self.domain_records.insert(id, DomainRecord { identity, capabilities, watcher });
+        let known = self.domain_records.get(&id).is_some_and(|held| {
+            held.identity == identity && held.capabilities == capabilities && held.watcher == watcher
+        });
+        if !known {
+            self.governor.register_domain(id, &capabilities, now);
+            self.domain_records.insert(id, DomainRecord { identity, capabilities, watcher });
+        }
         DomainBinding { id, probe: probe.clone() }
     }
 
@@ -993,7 +1047,7 @@ impl Coordinator {
         let wanted = match self.dir_state(entry).map(|d| d.watch()) {
             Some(WatchState::NotRegistered | WatchState::Capped) => true,
             Some(WatchState::Failed) => {
-                self.config.watch_registration_failure == crate::config::WatchRegistrationFailure::RequireWatcher
+                self.config.watch_registration_failure_mode == crate::config::WatchRegistrationFailure::RequireWatcher
             }
             Some(WatchState::Pending | WatchState::Registered(_)) | None => false,
         };
@@ -1149,7 +1203,7 @@ impl Coordinator {
         if self.governor.throttle(self.now).is_some() {
             return true;
         }
-        if self.blocking_slots.len() >= self.config.max_in_flight && !self.queue_order.is_empty() {
+        if self.blocking_slots.len() >= self.maximum_in_flight && !self.queue_order.is_empty() {
             return true;
         }
         self.domain_resource_health().values().any(ResourceHealth::is_throttled)
@@ -1159,7 +1213,7 @@ impl Coordinator {
         if let Some((cause, resume)) = self.governor.throttle(self.now) {
             return ResourceHealth::Throttled { cause, resume };
         }
-        if self.blocking_slots.len() >= self.config.max_in_flight && !self.queue_order.is_empty() {
+        if self.blocking_slots.len() >= self.maximum_in_flight && !self.queue_order.is_empty() {
             return ResourceHealth::Throttled { cause: ThrottleCause::Concurrency, resume: None };
         }
         domains.values().copied().find(|health| health.is_throttled()).unwrap_or(ResourceHealth::Nominal)
@@ -1283,7 +1337,18 @@ impl Coordinator {
     }
 
     fn parent_of(&self, id: EntryId) -> Option<EntryId> {
-        self.snapshot.parent_id(id)
+        let version = self.snapshot.version();
+        let mut cache = self.parent_cache.borrow_mut();
+        if cache.0 != version {
+            cache.0 = version;
+            cache.1.clear();
+        }
+        if let Some(parent) = cache.1.get(&id) {
+            return *parent;
+        }
+        let parent = self.snapshot.parent_id(id);
+        cache.1.insert(id, parent);
+        parent
     }
 
     fn context_for_children(&self, dir: EntryId) -> Option<PolicyContext> {
@@ -1382,11 +1447,11 @@ impl Coordinator {
     }
 
     fn publish(&mut self) {
-        let health = self.compute_health();
         let version = self.snapshot.version();
         if version != self.published_version {
             return;
         }
+        let health = self.compute_health();
         let health_changed = self.last_published_health.as_ref() != Some(&health);
         if health_changed || !self.errors.is_empty() {
             let errors = std::mem::take(&mut self.errors);
@@ -1549,4 +1614,17 @@ fn reported_domain(result: &JobResult) -> Option<ProbeResult> {
         JobResult::Domain(Ok(probe)) => Some(probe.clone()),
         JobResult::Domain(Err(_)) | JobResult::Listing(_) | JobResult::Metadata(_) | JobResult::Enrichment(_) => None,
     }
+}
+
+fn obligation_counts(round: &Round) -> ObligationCounts {
+    let mut counts = ObligationCounts { total: round.obligations.len(), ..ObligationCounts::default() };
+    for obligation in &round.obligations {
+        match obligation.state {
+            ObligationState::Accepted => counts.accepted += 1,
+            ObligationState::Unsatisfied => counts.unsatisfied += 1,
+            ObligationState::Removed => counts.removed += 1,
+            ObligationState::Pending | ObligationState::Designated(_) => {}
+        }
+    }
+    counts
 }

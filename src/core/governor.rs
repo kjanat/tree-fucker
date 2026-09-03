@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::types::{MonotonicTime, WorkOrigin};
-use crate::config::Config;
+use crate::config::HostConfig;
 use crate::domain::{AccessTopology, DomainCapabilities, MediaHint, StorageDomainId};
 use crate::ids::{JobId, WatchRequestId};
 use crate::path::RelativePath;
@@ -259,6 +259,8 @@ struct DomainState {
     completions: usize,
     queue: VecDeque<Duration>,
     summary: LatencySummary,
+    sorted: Vec<Duration>,
+    total: Duration,
     standing_queue_delay: Duration,
     throttled_jobs: u64,
     throttled_since: Option<MonotonicTime>,
@@ -267,10 +269,10 @@ struct DomainState {
 }
 
 impl DomainState {
-    fn new(config: &Config, capabilities: &DomainCapabilities, now: MonotonicTime) -> DomainState {
+    fn new(config: &HostConfig, capabilities: &DomainCapabilities, now: MonotonicTime) -> DomainState {
         let ceiling = config
             .per_domain_concurrency
-            .min(config.max_in_flight)
+            .min(config.maximum_in_flight)
             .min(topology_ceiling(capabilities, config.per_domain_concurrency))
             .max(1);
         DomainState {
@@ -288,6 +290,8 @@ impl DomainState {
             completions: 0,
             queue: VecDeque::new(),
             summary: LatencySummary::default(),
+            sorted: Vec::with_capacity(LATENCY_HISTORY),
+            total: Duration::ZERO,
             standing_queue_delay: Duration::ZERO,
             throttled_jobs: 0,
             throttled_since: None,
@@ -301,29 +305,34 @@ impl DomainState {
     }
 
     fn recompute_summary(&mut self) {
-        let samples = self.latency.len();
+        let samples = self.sorted.len();
         if samples == 0 {
             self.summary = LatencySummary::default();
             return;
         }
-        let mut sorted: Vec<Duration> = self.latency.iter().copied().collect();
-        sorted.sort_unstable();
-        let total: Duration = sorted.iter().copied().sum();
         let tail = (samples * 9 / 10).min(samples - 1);
         self.summary = LatencySummary {
             samples,
-            minimum: sorted[0],
-            median: sorted[samples / 2],
-            mean: total / u32::try_from(samples).unwrap_or(u32::MAX),
-            tail: sorted[tail],
+            minimum: self.sorted[0],
+            median: self.sorted[samples / 2],
+            mean: self.total / u32::try_from(samples).unwrap_or(u32::MAX),
+            tail: self.sorted[tail],
         };
     }
 
     fn record_latency(&mut self, latency: Duration) {
-        if self.latency.len() >= LATENCY_HISTORY {
-            self.latency.pop_front();
+        if self.latency.len() >= LATENCY_HISTORY
+            && let Some(oldest) = self.latency.pop_front()
+        {
+            if let Ok(at) = self.sorted.binary_search(&oldest) {
+                self.sorted.remove(at);
+            }
+            self.total = self.total.saturating_sub(oldest);
         }
         self.latency.push_back(latency);
+        let at = self.sorted.partition_point(|held| *held < latency);
+        self.sorted.insert(at, latency);
+        self.total += latency;
         self.completions += 1;
         self.recompute_summary();
         let ceiling = duration(self.bucket.capacity);
@@ -384,7 +393,7 @@ impl DomainState {
 }
 
 pub struct Governor {
-    config: Config,
+    config: HostConfig,
     global: Bucket,
     foreground: Bucket,
     bootstrap_capacity: i128,
@@ -421,9 +430,9 @@ pub struct Governor {
 }
 
 impl Governor {
-    pub fn new(config: &Config, now: MonotonicTime) -> Governor {
+    pub fn new(config: &HostConfig, now: MonotonicTime) -> Governor {
         Governor {
-            config: config.clone(),
+            config: *config,
             global: Bucket::new(config.background_duty, config.background_burst, now),
             foreground: Bucket::new(config.foreground_duty, config.foreground_burst, now),
             bootstrap_capacity: nanos(config.bootstrap_allowance),
@@ -460,25 +469,12 @@ impl Governor {
         }
     }
 
-    pub fn register_domain(
-        &mut self,
-        id: StorageDomainId,
-        capabilities: &DomainCapabilities,
-        subordinate_ceiling: usize,
-        now: MonotonicTime,
-    ) {
-        match self.domains.get_mut(&id) {
-            Some(state) => {
-                state.ceiling = state.ceiling.min(subordinate_ceiling).max(1);
-                state.window = state.window.min(state.ceiling);
-            }
-            None => {
-                let mut state = DomainState::new(&self.config, capabilities, now);
-                state.ceiling = state.ceiling.min(subordinate_ceiling).max(1);
-                state.window = state.window.min(state.ceiling);
-                self.domains.insert(id, state);
-            }
+    pub fn register_domain(&mut self, id: StorageDomainId, capabilities: &DomainCapabilities, now: MonotonicTime) {
+        if self.domains.contains_key(&id) {
+            return;
         }
+        let state = DomainState::new(&self.config, capabilities, now);
+        self.domains.insert(id, state);
     }
 
     pub fn next_tree(&mut self) -> u64 {
@@ -509,10 +505,6 @@ impl Governor {
         }
     }
 
-    pub fn accounted_memory(&self) -> u64 {
-        self.memory_total
-    }
-
     pub fn accounted_memory_excluding(&self, tree: u64) -> u64 {
         let own = self.memory.get(&tree).copied().unwrap_or((0, 0));
         self.memory_total.saturating_sub(own.0.saturating_add(own.1))
@@ -520,10 +512,6 @@ impl Governor {
 
     pub fn memory_ceiling(&self) -> u64 {
         self.config.accounted_memory_ceiling
-    }
-
-    pub fn in_flight_bytes(&self) -> u64 {
-        self.in_flight_total
     }
 
     pub fn bytes_estimate(&self, domain: Option<StorageDomainId>) -> u64 {
@@ -718,7 +706,7 @@ impl Governor {
     }
 
     pub fn may_start(&self, domain: Option<StorageDomainId>, in_flight: usize) -> Result<(), ThrottleCause> {
-        if in_flight >= self.config.max_in_flight {
+        if in_flight >= self.config.maximum_in_flight {
             return Err(ThrottleCause::Concurrency);
         }
         if self.in_flight_on(domain) >= self.window_of(domain) {
@@ -862,10 +850,6 @@ impl Governor {
             self.global_bucket(origin).level -= extra;
         }
         self.credit(domain, origin, 0, extra, 0, now);
-    }
-
-    pub fn charge_of(&self, id: GrantId) -> Option<Duration> {
-        self.grants.get(&id).map(|grant| grant.charged)
     }
 
     pub fn overshoot_of(&self, id: GrantId) -> Duration {
@@ -1159,14 +1143,10 @@ impl Governor {
                 Some(since) => self.throttled_total + now.since(since),
                 None => self.throttled_total,
             },
-            next_admissible: self
-                .domains
-                .keys()
-                .map(|id| Some(*id))
-                .chain(std::iter::once(None))
-                .map(|domain| self.admissible_at(domain, now))
-                .min()
-                .flatten(),
+            next_admissible: match self.domains.is_empty() {
+                true => self.admissible_at(None, now),
+                false => self.domains.keys().map(|id| self.admissible_at(Some(*id), now)).min().flatten(),
+            },
             last_decision: self.last_decision,
             bootstrap: self.bootstrap.view(),
             domains: {
@@ -1186,7 +1166,7 @@ impl Governor {
 pub struct HostGovernor {
     inner: Arc<Mutex<Governor>>,
     base: Arc<Mutex<Option<Instant>>>,
-    limits: Arc<Config>,
+    limits: HostConfig,
 }
 
 static PROCESS_GOVERNOR: OnceLock<HostGovernor> = OnceLock::new();
@@ -1209,7 +1189,7 @@ impl std::fmt::Display for HostGovernorError {
 impl std::error::Error for HostGovernorError {}
 
 pub fn host_governor() -> HostGovernor {
-    PROCESS_GOVERNOR.get_or_init(|| HostGovernor::independent(&Config::default())).clone()
+    PROCESS_GOVERNOR.get_or_init(|| HostGovernor::independent(&HostConfig::default())).clone()
 }
 
 fn guard(inner: &Mutex<Governor>) -> MutexGuard<'_, Governor> {
@@ -1220,7 +1200,7 @@ fn guard(inner: &Mutex<Governor>) -> MutexGuard<'_, Governor> {
 }
 
 impl HostGovernor {
-    pub fn install(config: Config) -> Result<HostGovernor, HostGovernorError> {
+    pub fn install(config: HostConfig) -> Result<HostGovernor, HostGovernorError> {
         config.validate().map_err(HostGovernorError::InvalidConfig)?;
         let installed = HostGovernor::independent(&config);
         match PROCESS_GOVERNOR.set(installed.clone()) {
@@ -1229,12 +1209,16 @@ impl HostGovernor {
         }
     }
 
-    pub fn independent(config: &Config) -> HostGovernor {
+    pub fn independent(config: &HostConfig) -> HostGovernor {
         HostGovernor {
             inner: Arc::new(Mutex::new(Governor::new(config, MonotonicTime::ZERO))),
             base: Arc::new(Mutex::new(None)),
-            limits: Arc::new(config.clone()),
+            limits: *config,
         }
+    }
+
+    pub fn limits(&self) -> &HostConfig {
+        &self.limits
     }
 
     pub fn base(&self, now: Instant) -> Instant {
@@ -1245,59 +1229,8 @@ impl HostGovernor {
         *base.get_or_insert(now)
     }
 
-    pub fn reject_raised_limits(&self, config: &Config) -> Result<(), String> {
-        let host = self.limits.as_ref();
-        let raised = |name: &str| Err(format!("{name} raises a host governor limit"));
-        if config.max_in_flight > host.max_in_flight {
-            return raised("max_in_flight");
-        }
-        if config.per_domain_concurrency > host.per_domain_concurrency {
-            return raised("per_domain_concurrency");
-        }
-        if config.background_duty > host.background_duty {
-            return raised("background_duty");
-        }
-        if config.background_burst > host.background_burst {
-            return raised("background_burst");
-        }
-        if config.domain_background_duty > host.domain_background_duty {
-            return raised("domain_background_duty");
-        }
-        if config.domain_background_burst > host.domain_background_burst {
-            return raised("domain_background_burst");
-        }
-        if config.foreground_duty > host.foreground_duty {
-            return raised("foreground_duty");
-        }
-        if config.foreground_burst > host.foreground_burst {
-            return raised("foreground_burst");
-        }
-        if config.domain_foreground_duty > host.domain_foreground_duty {
-            return raised("domain_foreground_duty");
-        }
-        if config.domain_foreground_burst > host.domain_foreground_burst {
-            return raised("domain_foreground_burst");
-        }
-        if config.bootstrap_allowance > host.bootstrap_allowance {
-            return raised("bootstrap_allowance");
-        }
-        if config.accounted_memory_ceiling > host.accounted_memory_ceiling {
-            return raised("accounted_memory_ceiling");
-        }
-        if config.in_flight_listing_bytes > host.in_flight_listing_bytes {
-            return raised("in_flight_listing_bytes");
-        }
-        Ok(())
-    }
-
-    pub fn register_domain(
-        &self,
-        id: StorageDomainId,
-        capabilities: &DomainCapabilities,
-        subordinate_ceiling: usize,
-        now: MonotonicTime,
-    ) {
-        guard(&self.inner).register_domain(id, capabilities, subordinate_ceiling, now)
+    pub fn register_domain(&self, id: StorageDomainId, capabilities: &DomainCapabilities, now: MonotonicTime) {
+        guard(&self.inner).register_domain(id, capabilities, now)
     }
 
     pub fn next_tree(&self) -> u64 {
@@ -1316,20 +1249,12 @@ impl HostGovernor {
         guard(&self.inner).forget_tree(tree)
     }
 
-    pub fn accounted_memory(&self) -> u64 {
-        guard(&self.inner).accounted_memory()
-    }
-
     pub fn accounted_memory_excluding(&self, tree: u64) -> u64 {
         guard(&self.inner).accounted_memory_excluding(tree)
     }
 
     pub fn memory_ceiling(&self) -> u64 {
         guard(&self.inner).memory_ceiling()
-    }
-
-    pub fn in_flight_bytes(&self) -> u64 {
-        guard(&self.inner).in_flight_bytes()
     }
 
     pub fn bytes_estimate(&self, domain: Option<StorageDomainId>) -> u64 {
@@ -1378,10 +1303,6 @@ impl HostGovernor {
 
     pub fn report(&self, id: GrantId, blocking: Duration, now: MonotonicTime) {
         guard(&self.inner).report(id, blocking, now)
-    }
-
-    pub fn charge_of(&self, id: GrantId) -> Option<Duration> {
-        guard(&self.inner).charge_of(id)
     }
 
     pub fn overshoot_of(&self, id: GrantId) -> Duration {
@@ -1460,8 +1381,8 @@ impl HostGovernor {
         guard(&self.inner).grants().cloned().collect()
     }
 
-    pub fn new_grants(&self, seen: &dyn Fn(GrantId, u32) -> bool) -> Vec<Grant> {
-        guard(&self.inner).grants().filter(|grant| !seen(grant.id, grant.lease)).cloned().collect()
+    pub fn new_grants_into(&self, into: &mut Vec<Grant>, seen: &dyn Fn(GrantId, u32) -> bool) {
+        into.extend(guard(&self.inner).grants().filter(|grant| !seen(grant.id, grant.lease)).cloned());
     }
 
     pub fn view(&self, now: MonotonicTime) -> GovernorView {

@@ -122,6 +122,9 @@ struct Inner {
     unknown_kinds: BTreeSet<RelativePath>,
     chunk: usize,
     ignore_cancellation: bool,
+    path_scoped_costs: usize,
+    domain_scoped_costs: usize,
+    per_child_cost_ops: usize,
 }
 
 pub struct FakeFileSystem {
@@ -190,6 +193,9 @@ impl FakeFileSystem {
                 unknown_kinds: BTreeSet::new(),
                 chunk: DEFAULT_CHUNK,
                 ignore_cancellation: false,
+                path_scoped_costs: 0,
+                domain_scoped_costs: 0,
+                per_child_cost_ops: 0,
             })),
         }
     }
@@ -476,7 +482,23 @@ impl FakeFileSystem {
     }
 
     pub fn set_cost(&self, scope: CostScope, op: FakeOp, cost: Duration) {
-        lock(&self.inner).costs.insert((scope, op), cost);
+        let mut inner = lock(&self.inner);
+        let counted = match scope {
+            CostScope::Path(_) => Some(true),
+            CostScope::Domain(_) => Some(false),
+            CostScope::Everything => None,
+        };
+        let per_child = matches!(op, FakeOp::ResolveKind | FakeOp::ResolveIdentity);
+        if inner.costs.insert((scope, op), cost).is_none() {
+            match counted {
+                Some(true) => inner.path_scoped_costs += 1,
+                Some(false) => inner.domain_scoped_costs += 1,
+                None => {}
+            }
+            if per_child {
+                inner.per_child_cost_ops += 1;
+            }
+        }
     }
 
     pub fn cost_of(&self, op: FakeOp, path: &RelativePath) -> Duration {
@@ -526,12 +548,6 @@ impl FakeFileSystem {
         Self::capabilities_for(&inner, path)
     }
 
-    pub fn is_domain_root(&self, p: &str) -> bool {
-        let path = Self::path(p);
-        let inner = lock(&self.inner);
-        Self::domain_root(&inner, &path)
-    }
-
     fn capabilities_for(inner: &Inner, path: &RelativePath) -> DomainCapabilities {
         Self::capabilities_of_domain(inner, Self::domain_for(inner, path))
     }
@@ -544,15 +560,21 @@ impl FakeFileSystem {
         capabilities
     }
 
-    fn domain_root(inner: &Inner, path: &RelativePath) -> bool {
-        let domain = Self::domain_for(inner, path);
+    fn domain_root_of(inner: &Inner, path: &RelativePath, domain: DomainId) -> bool {
         if inner.non_domain_roots.contains(&domain) {
             return false;
         }
-        match path.parent() {
-            Some(parent) => Self::domain_for(inner, &parent) != domain,
-            None => true,
+        if path.depth() == 0 {
+            return true;
         }
+        let above = inner
+            .domains
+            .iter()
+            .filter(|(prefix, _)| prefix.depth() < path.depth() && path.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.depth())
+            .map(|(_, domain)| *domain)
+            .unwrap_or(DomainId::ROOT);
+        above != domain
     }
 
     fn probe_for(inner: &Inner, path: &RelativePath, parent: Option<&ProbeResult>) -> ProbeResult {
@@ -562,9 +584,12 @@ impl FakeFileSystem {
         } else {
             DomainIdentity::Known(Self::domain_key(domain))
         };
-        let probe =
-            DeclaredProbe::new(identity, Self::capabilities_of_domain(inner, domain), Self::domain_root(inner, path))
-                .with_directory_case(inner.directory_cases.get(path).copied());
+        let probe = DeclaredProbe::new(
+            identity,
+            Self::capabilities_of_domain(inner, domain),
+            Self::domain_root_of(inner, path, domain),
+        )
+        .with_directory_case(inner.directory_cases.get(path).copied());
         match probe.probe(Path::new("."), parent) {
             Ok(result) => result,
             Err(_) => ProbeResult::unknown(),
@@ -655,13 +680,12 @@ impl FakeFileSystem {
         lock(&self.inner).chunk
     }
 
-    pub fn listing_cost(&self, path: &RelativePath) -> Duration {
-        self.lease_cost(path, true, 0, usize::MAX)
-    }
-
     pub fn lease_cost(&self, path: &RelativePath, first: bool, skip: usize, take: usize) -> Duration {
         let inner = lock(&self.inner);
         let mut total = Self::scoped_cost(&inner, if first { FakeOp::ReadDir } else { FakeOp::Chunk }, path);
+        if inner.per_child_cost_ops == 0 {
+            return total;
+        }
         for (_, child, info) in Self::enumeration_order(&inner, path).into_iter().skip(skip).take(take) {
             let Some(child) = child else {
                 continue;
@@ -675,10 +699,11 @@ impl FakeFileSystem {
         inner: &Inner,
         path: &RelativePath,
     ) -> Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> {
+        let depth = path.depth() + 1;
         let real: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> = inner
             .nodes
             .iter()
-            .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
+            .filter(|(k, _)| k.depth() == depth && k.starts_with(path))
             .filter_map(|(k, info)| Some((k.file_name()?.to_os_string(), Some(k.clone()), *info)))
             .collect();
         let injected: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> = inner
@@ -703,8 +728,9 @@ impl FakeFileSystem {
     }
 
     fn child_paths(inner: &Inner, path: &RelativePath) -> Vec<RelativePath> {
+        let depth = path.depth() + 1;
         let mut children: Vec<RelativePath> =
-            inner.nodes.keys().filter(|k| k.parent().map(|p| p == *path).unwrap_or(false)).cloned().collect();
+            inner.nodes.keys().filter(|k| k.depth() == depth && k.starts_with(path)).cloned().collect();
         for injected in inner.injected.iter().filter(|c| c.dir == *path) {
             if let Ok(child) = path.join(&injected.name) {
                 children.push(child);
@@ -714,12 +740,16 @@ impl FakeFileSystem {
     }
 
     fn scoped_cost(inner: &Inner, op: FakeOp, path: &RelativePath) -> Duration {
-        if let Some(cost) = inner.costs.get(&(CostScope::Path(path.clone()), op)) {
+        if inner.path_scoped_costs > 0
+            && let Some(cost) = inner.costs.get(&(CostScope::Path(path.clone()), op))
+        {
             return *cost;
         }
-        let domain = Self::domain_for(inner, path);
-        if let Some(cost) = inner.costs.get(&(CostScope::Domain(domain), op)) {
-            return *cost;
+        if inner.domain_scoped_costs > 0 {
+            let domain = Self::domain_for(inner, path);
+            if let Some(cost) = inner.costs.get(&(CostScope::Domain(domain), op)) {
+                return *cost;
+            }
         }
         inner.costs.get(&(CostScope::Everything, op)).copied().unwrap_or(Duration::ZERO)
     }

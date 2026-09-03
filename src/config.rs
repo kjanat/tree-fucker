@@ -32,10 +32,99 @@ impl Default for ClassWeights {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostConfig {
+    pub maximum_in_flight: usize,
+    pub per_domain_concurrency: usize,
+    pub domain_background_duty: f64,
+    pub background_duty: f64,
+    pub domain_background_burst: Duration,
+    pub background_burst: Duration,
+    pub foreground_duty: f64,
+    pub foreground_burst: Duration,
+    pub domain_foreground_duty: f64,
+    pub domain_foreground_burst: Duration,
+    pub bootstrap_allowance: Duration,
+    pub accounted_memory_ceiling: u64,
+    pub in_flight_listing_bytes: u64,
+    pub initial_cost_estimate: Duration,
+    pub stuck_threshold: Duration,
+    pub failure_surcharge: Duration,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        HostConfig {
+            maximum_in_flight: 8,
+            per_domain_concurrency: 4,
+            domain_background_duty: 0.01,
+            background_duty: 0.02,
+            domain_background_burst: Duration::from_millis(250),
+            background_burst: Duration::from_millis(500),
+            foreground_duty: 0.25,
+            foreground_burst: Duration::from_secs(2),
+            domain_foreground_duty: 0.25,
+            domain_foreground_burst: Duration::from_secs(2),
+            bootstrap_allowance: Duration::from_millis(500),
+            accounted_memory_ceiling: 512 * 1024 * 1024,
+            in_flight_listing_bytes: 32 * 1024 * 1024,
+            initial_cost_estimate: Duration::from_millis(20),
+            stuck_threshold: Duration::from_secs(30),
+            failure_surcharge: Duration::from_millis(20),
+        }
+    }
+}
+
+impl HostConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.maximum_in_flight == 0 {
+            return Err("maximum_in_flight must be greater than zero".into());
+        }
+        if self.per_domain_concurrency < 1 || self.per_domain_concurrency > self.maximum_in_flight {
+            return Err("per_domain_concurrency must be at least 1 and at most maximum_in_flight".into());
+        }
+        let duties = [
+            ("background_duty", self.background_duty),
+            ("domain_background_duty", self.domain_background_duty),
+            ("foreground_duty", self.foreground_duty),
+            ("domain_foreground_duty", self.domain_foreground_duty),
+        ];
+        let workers = Duration::from_secs(u64::try_from(self.maximum_in_flight).unwrap_or(u64::MAX));
+        for (name, rate) in duties {
+            if !rate.is_finite() || rate <= 0.0 {
+                return Err(format!("{name} must be finite, greater than zero and at most maximum_in_flight"));
+            }
+            if Duration::try_from_secs_f64(rate).unwrap_or(Duration::MAX) > workers {
+                return Err(format!("{name} must be finite, greater than zero and at most maximum_in_flight"));
+            }
+        }
+        let bursts = [
+            ("background_burst", self.background_burst),
+            ("domain_background_burst", self.domain_background_burst),
+            ("foreground_burst", self.foreground_burst),
+            ("domain_foreground_burst", self.domain_foreground_burst),
+            ("bootstrap_allowance", self.bootstrap_allowance),
+            ("initial_cost_estimate", self.initial_cost_estimate),
+            ("stuck_threshold", self.stuck_threshold),
+        ];
+        for (name, value) in bursts {
+            if value.is_zero() {
+                return Err(format!("{name} must be greater than zero"));
+            }
+        }
+        if self.accounted_memory_ceiling == 0 {
+            return Err("accounted_memory_ceiling must be greater than zero".into());
+        }
+        if self.in_flight_listing_bytes == 0 {
+            return Err("in_flight_listing_bytes must be greater than zero".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub batch_size: usize,
-    pub max_in_flight: usize,
     pub command_capacity: usize,
     pub paths_per_command: usize,
     pub priority_set_limit: usize,
@@ -45,27 +134,12 @@ pub struct Config {
     pub entries_per_lease: usize,
     pub operations_per_lease: usize,
     pub represented_entries: usize,
+    pub snapshot_bytes: u64,
+    pub foreground_ceiling_per_command: Duration,
     pub transient_degrade_threshold: u32,
     pub retry_maximum_delay: Duration,
-    pub watch_registration_failure: WatchRegistrationFailure,
+    pub watch_registration_failure_mode: WatchRegistrationFailure,
     pub root_reappearance_monitoring: bool,
-    pub background_duty: f64,
-    pub background_burst: Duration,
-    pub domain_background_duty: f64,
-    pub domain_background_burst: Duration,
-    pub foreground_duty: f64,
-    pub foreground_burst: Duration,
-    pub domain_foreground_duty: f64,
-    pub domain_foreground_burst: Duration,
-    pub foreground_ceiling_per_command: Duration,
-    pub bootstrap_allowance: Duration,
-    pub accounted_memory_ceiling: u64,
-    pub in_flight_listing_bytes: u64,
-    pub snapshot_bytes: u64,
-    pub per_domain_concurrency: usize,
-    pub failure_surcharge: Duration,
-    pub initial_cost_estimate: Duration,
-    pub stuck_threshold: Duration,
     pub minimum_period: Duration,
     pub maximum_period: Duration,
     pub fixed_interval: Option<Duration>,
@@ -81,37 +155,21 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             batch_size: 64,
-            max_in_flight: 8,
             command_capacity: 1024,
             paths_per_command: 65536,
-            priority_set_limit: 65536,
+            priority_set_limit: 4096,
             update_stream_capacity: 256,
             watcher_path_limit: 16384,
-            entries_per_directory: 1_000_000,
+            entries_per_directory: 250_000,
             entries_per_lease: 4096,
             operations_per_lease: 256,
-            represented_entries: 10_000_000,
+            represented_entries: 1_000_000,
+            snapshot_bytes: 256 * 1024 * 1024,
+            foreground_ceiling_per_command: Duration::from_secs(30),
             transient_degrade_threshold: 3,
             retry_maximum_delay: Duration::from_secs(300),
-            watch_registration_failure: WatchRegistrationFailure::ReconcileOnly,
+            watch_registration_failure_mode: WatchRegistrationFailure::ReconcileOnly,
             root_reappearance_monitoring: true,
-            background_duty: 0.02,
-            background_burst: Duration::from_millis(500),
-            domain_background_duty: 0.02,
-            domain_background_burst: Duration::from_millis(500),
-            foreground_duty: 0.25,
-            foreground_burst: Duration::from_secs(2),
-            domain_foreground_duty: 0.25,
-            domain_foreground_burst: Duration::from_secs(2),
-            foreground_ceiling_per_command: Duration::from_secs(30),
-            bootstrap_allowance: Duration::from_millis(500),
-            accounted_memory_ceiling: 512 * 1024 * 1024,
-            in_flight_listing_bytes: 32 * 1024 * 1024,
-            snapshot_bytes: 256 * 1024 * 1024,
-            per_domain_concurrency: 4,
-            failure_surcharge: Duration::from_millis(20),
-            initial_cost_estimate: Duration::from_millis(20),
-            stuck_threshold: Duration::from_secs(30),
             minimum_period: Duration::from_secs(1),
             maximum_period: Duration::from_secs(300),
             fixed_interval: None,
@@ -130,72 +188,11 @@ impl Config {
         if self.batch_size < 2 {
             return Err("batch_size must be at least 2".into());
         }
-        if self.max_in_flight == 0 {
-            return Err("max_in_flight must be greater than zero".into());
-        }
-        if !self.background_duty.is_finite() || self.background_duty <= 0.0 {
-            return Err("background_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        let duty = Duration::try_from_secs_f64(self.background_duty).unwrap_or(Duration::MAX);
-        if duty > Duration::from_secs(u64::try_from(self.max_in_flight).unwrap_or(u64::MAX)) {
-            return Err("background_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        if self.background_burst.is_zero() {
-            return Err("background_burst must be greater than zero".into());
-        }
-        if !self.domain_background_duty.is_finite() || self.domain_background_duty <= 0.0 {
-            return Err("domain_background_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        let domain_duty = Duration::try_from_secs_f64(self.domain_background_duty).unwrap_or(Duration::MAX);
-        if domain_duty > Duration::from_secs(u64::try_from(self.max_in_flight).unwrap_or(u64::MAX)) {
-            return Err("domain_background_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        if self.domain_background_burst.is_zero() {
-            return Err("domain_background_burst must be greater than zero".into());
-        }
-        if !self.foreground_duty.is_finite() || self.foreground_duty <= 0.0 {
-            return Err("foreground_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        let foreground_duty = Duration::try_from_secs_f64(self.foreground_duty).unwrap_or(Duration::MAX);
-        if foreground_duty > Duration::from_secs(u64::try_from(self.max_in_flight).unwrap_or(u64::MAX)) {
-            return Err("foreground_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        if self.foreground_burst.is_zero() {
-            return Err("foreground_burst must be greater than zero".into());
-        }
-        if !self.domain_foreground_duty.is_finite() || self.domain_foreground_duty <= 0.0 {
-            return Err("domain_foreground_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        let domain_foreground_duty = Duration::try_from_secs_f64(self.domain_foreground_duty).unwrap_or(Duration::MAX);
-        if domain_foreground_duty > Duration::from_secs(u64::try_from(self.max_in_flight).unwrap_or(u64::MAX)) {
-            return Err("domain_foreground_duty must be finite, greater than zero and at most max_in_flight".into());
-        }
-        if self.domain_foreground_burst.is_zero() {
-            return Err("domain_foreground_burst must be greater than zero".into());
-        }
-        if self.foreground_ceiling_per_command.is_zero() {
-            return Err("foreground_ceiling_per_command must be greater than zero".into());
-        }
-        if self.bootstrap_allowance.is_zero() {
-            return Err("bootstrap_allowance must be greater than zero".into());
-        }
-        if self.accounted_memory_ceiling == 0 {
-            return Err("accounted_memory_ceiling must be greater than zero".into());
-        }
-        if self.in_flight_listing_bytes == 0 {
-            return Err("in_flight_listing_bytes must be greater than zero".into());
-        }
         if self.snapshot_bytes == 0 {
             return Err("snapshot_bytes must be greater than zero".into());
         }
-        if self.per_domain_concurrency < 1 || self.per_domain_concurrency > self.max_in_flight {
-            return Err("per_domain_concurrency must be at least 1 and at most max_in_flight".into());
-        }
-        if self.initial_cost_estimate.is_zero() {
-            return Err("initial_cost_estimate must be greater than zero".into());
-        }
-        if self.stuck_threshold.is_zero() {
-            return Err("stuck_threshold must be greater than zero".into());
+        if self.foreground_ceiling_per_command.is_zero() {
+            return Err("foreground_ceiling_per_command must be greater than zero".into());
         }
         if self.entries_per_directory == 0 {
             return Err("entries_per_directory must be at least 1".into());
