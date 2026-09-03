@@ -3,3 +3,5 @@ style_edition        = "2024"
 tab_spaces           = 4
 max_width            = 120
 use_small_heuristics = "Max"
+group_imports        = "StdExternalCrate"
+wrap_comments        = true

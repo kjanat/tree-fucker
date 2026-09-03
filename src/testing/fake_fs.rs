@@ -18,6 +18,40 @@ pub enum FakeOp {
     Watch,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DomainId(u64);
+
+impl DomainId {
+    pub const ROOT: DomainId = DomainId(0);
+
+    pub const fn new(value: u64) -> DomainId {
+        DomainId(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DomainId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "domain {}", self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CostScope {
+    Path(RelativePath),
+    Domain(DomainId),
+    Everything,
+}
+
+impl CostScope {
+    pub fn path(p: &str) -> CostScope {
+        CostScope::Path(FakeFileSystem::path(p))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FailureMode {
     Once(FsError),
@@ -65,6 +99,8 @@ struct Inner {
     paused_queue: VecDeque<(WatchId, WatcherEvent)>,
     ops: Vec<(FakeOp, RelativePath)>,
     root_kind: EntryKind,
+    costs: HashMap<(CostScope, FakeOp), Duration>,
+    domains: Vec<(RelativePath, DomainId)>,
 }
 
 pub struct FakeFileSystem {
@@ -123,6 +159,8 @@ impl FakeFileSystem {
                 paused_queue: VecDeque::new(),
                 ops: Vec::new(),
                 root_kind: EntryKind::Directory,
+                costs: HashMap::new(),
+                domains: Vec::new(),
             }),
         }
     }
@@ -413,6 +451,65 @@ impl FakeFileSystem {
                 w.sink.deliver(event);
             }
         }
+    }
+
+    pub fn set_cost(&self, scope: CostScope, op: FakeOp, cost: Duration) {
+        lock(&self.inner).costs.insert((scope, op), cost);
+    }
+
+    pub fn cost_of(&self, op: FakeOp, path: &RelativePath) -> Duration {
+        let inner = lock(&self.inner);
+        if let Some(cost) = inner.costs.get(&(CostScope::Path(path.clone()), op)) {
+            return *cost;
+        }
+        let domain = Self::domain_for(&inner, path);
+        if let Some(cost) = inner.costs.get(&(CostScope::Domain(domain), op)) {
+            return *cost;
+        }
+        inner.costs.get(&(CostScope::Everything, op)).copied().unwrap_or(Duration::ZERO)
+    }
+
+    pub fn set_domain(&self, prefix: &str, domain: DomainId) {
+        let path = Self::path(prefix);
+        let mut inner = lock(&self.inner);
+        Self::assign_domain(&mut inner, path, domain);
+    }
+
+    pub fn remount(&self, prefix: &str, domain: DomainId) {
+        let path = Self::path(prefix);
+        let mut inner = lock(&self.inner);
+        assert!(inner.nodes.contains_key(&path), "remount of {path}, which the fake filesystem does not contain");
+        Self::assign_domain(&mut inner, path, domain);
+    }
+
+    pub fn domain_of(&self, path: &RelativePath) -> DomainId {
+        Self::domain_for(&lock(&self.inner), path)
+    }
+
+    fn assign_domain(inner: &mut Inner, path: RelativePath, domain: DomainId) {
+        match inner.domains.iter_mut().find(|(prefix, _)| *prefix == path) {
+            Some(slot) => slot.1 = domain,
+            None => inner.domains.push((path, domain)),
+        }
+    }
+
+    fn domain_for(inner: &Inner, path: &RelativePath) -> DomainId {
+        inner
+            .domains
+            .iter()
+            .filter(|(prefix, _)| path.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.depth())
+            .map(|(_, domain)| *domain)
+            .unwrap_or(DomainId::ROOT)
+    }
+
+    pub fn emit_storm(&self, paths: &[&str], kind: HintKind, repeat: usize) -> usize {
+        let targets: Vec<RelativePath> = paths.iter().map(|p| Self::path(p)).collect();
+        let mut inner = lock(&self.inner);
+        for _ in 0..repeat {
+            Self::emit(&mut inner, targets.clone(), kind);
+        }
+        repeat * targets.len()
     }
 
     pub fn emit_overflow(&self) {

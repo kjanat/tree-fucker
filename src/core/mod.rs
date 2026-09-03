@@ -12,6 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use types::*;
+pub use types::{Class, MonotonicTime};
+
 use crate::config::Config;
 use crate::entry::{LoadState, Shape};
 use crate::error::Error;
@@ -24,9 +27,6 @@ use crate::update::{
     ErrorCause, Health, InitialScanState, Operation, ReconciliationHealth, RecoverableError, RootAvailability,
     ShutdownState, Update, UpdateEvent, WatcherHealth,
 };
-
-pub use types::MonotonicTime;
-use types::*;
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -98,6 +98,12 @@ pub struct BlockingSlot {
     pub path: RelativePath,
     pub operation: JobOperation,
     pub started: MonotonicTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchView {
+    pub periodic: bool,
+    pub members: BTreeSet<JobId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,6 +297,16 @@ impl Coordinator {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn job_class(&self, id: JobId) -> Option<Class> {
+        self.jobs.get(&id).map(|job| job.reasons.class())
+    }
+
+    pub fn open_batch(&self) -> Option<BatchView> {
+        self.batch
+            .as_ref()
+            .map(|batch| BatchView { periodic: batch.periodic, members: batch.members.iter().copied().collect() })
     }
 
     pub fn is_stopped(&self) -> bool {

@@ -214,6 +214,115 @@ impl DeterministicRuntime {
     }
 }
 
+struct InertHandle {
+    cancels: Arc<AtomicU64>,
+    drops: Arc<AtomicU64>,
+}
+
+impl TaskHandle for InertHandle {
+    fn cancel(&self) {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn detach(self: Box<Self>) {}
+}
+
+impl Drop for InertHandle {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub struct HoldingRuntime {
+    inner: Arc<DeterministicRuntime>,
+    hold: AtomicBool,
+    budget: AtomicU64,
+    held: Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    cancels: Arc<AtomicU64>,
+    drops: Arc<AtomicU64>,
+}
+
+impl HoldingRuntime {
+    pub fn new(inner: Arc<DeterministicRuntime>) -> HoldingRuntime {
+        HoldingRuntime {
+            inner,
+            hold: AtomicBool::new(false),
+            budget: AtomicU64::new(0),
+            held: Mutex::new(Vec::new()),
+            cancels: Arc::new(AtomicU64::new(0)),
+            drops: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn hold(&self) {
+        self.hold.store(true, Ordering::SeqCst);
+    }
+
+    pub fn hold_next(&self, count: usize) {
+        self.budget.store(count as u64, Ordering::SeqCst);
+    }
+
+    pub fn held(&self) -> usize {
+        self.held.lock().map(|held| held.len()).unwrap_or(0)
+    }
+
+    pub fn cancels(&self) -> usize {
+        self.cancels.load(Ordering::SeqCst) as usize
+    }
+
+    pub fn dropped_handles(&self) -> usize {
+        self.drops.load(Ordering::SeqCst) as usize
+    }
+
+    pub fn release(&self) {
+        let work: Vec<Box<dyn FnOnce() + Send + 'static>> = match self.held.lock() {
+            Ok(mut held) => held.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        for item in work {
+            item();
+        }
+    }
+
+    fn take_budget(&self) -> bool {
+        let mut left = self.budget.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = left.checked_sub(1) else {
+                return false;
+            };
+            match self.budget.compare_exchange(left, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(current) => left = current,
+            }
+        }
+    }
+}
+
+impl Runtime for HoldingRuntime {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+
+    fn spawn(&self, future: BoxFuture<'static, ()>) {
+        self.inner.spawn(future);
+    }
+
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxTaskHandle {
+        if self.hold.load(Ordering::SeqCst) || self.take_budget() {
+            match self.held.lock() {
+                Ok(mut held) => held.push(work),
+                Err(poisoned) => poisoned.into_inner().push(work),
+            }
+            return Box::new(InertHandle { cancels: self.cancels.clone(), drops: self.drops.clone() });
+        }
+        self.inner.spawn_blocking(work)
+    }
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        self.inner.sleep(duration)
+    }
+}
+
 impl Runtime for DeterministicRuntime {
     fn now(&self) -> Instant {
         let inner = lock(&self.inner);

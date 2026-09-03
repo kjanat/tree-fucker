@@ -1,23 +1,54 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::fake_fs::{DomainId, FakeFileSystem, FakeOp};
 use crate::config::Config;
 use crate::core::{
-    Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, WorkerLoss,
+    Class, Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, WorkerLoss,
 };
 use crate::error::Error;
-use crate::fs::{FileSystem, WatcherEvent};
+use crate::fs::{FileSystem, HintKind, WatcherEvent};
 use crate::ids::{CommandId, JobId, TimerId, WatchId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
 use crate::snapshot::Snapshot;
 use crate::update::{Health, UpdateEvent};
 
-use super::fake_fs::FakeFileSystem;
+const MAXIMUM_STEPS: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(pub CommandId);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admission {
+    pub at: MonotonicTime,
+    pub job: JobId,
+    pub class: Class,
+    pub entry: RelativePath,
+    pub batch: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Charge {
+    pub at: MonotonicTime,
+    pub job: JobId,
+    pub domain: DomainId,
+    pub cost: Duration,
+}
+
+struct Running {
+    started: MonotonicTime,
+    due: MonotonicTime,
+    domain: DomainId,
+}
+
+fn fake_op(operation: JobOperation) -> FakeOp {
+    match operation {
+        JobOperation::Listing => FakeOp::ReadDir,
+        JobOperation::Metadata => FakeOp::Metadata,
+    }
+}
 
 struct Sink {
     queue: Mutex<VecDeque<WatcherEvent>>,
@@ -46,6 +77,14 @@ pub struct Harness {
     outstanding: VecDeque<JobSpec>,
     unwatched: Vec<WatchId>,
     stopped: bool,
+    schedule: BTreeSet<(MonotonicTime, JobId)>,
+    running: HashMap<JobId, Running>,
+    job_domain: HashMap<JobId, DomainId>,
+    charges: Vec<Charge>,
+    admissions: Vec<Admission>,
+    admitted: HashSet<JobId>,
+    batch_index: usize,
+    batch_members: BTreeSet<JobId>,
     pub auto_register: bool,
 }
 
@@ -71,6 +110,14 @@ impl Harness {
             outstanding: VecDeque::new(),
             unwatched: Vec::new(),
             stopped: false,
+            schedule: BTreeSet::new(),
+            running: HashMap::new(),
+            job_domain: HashMap::new(),
+            charges: Vec::new(),
+            admissions: Vec::new(),
+            admitted: HashSet::new(),
+            batch_index: 0,
+            batch_members: BTreeSet::new(),
             auto_register: true,
         };
         harness.process(outputs);
@@ -94,7 +141,11 @@ impl Harness {
     fn process(&mut self, outputs: Vec<Output>) {
         for output in outputs {
             match output {
-                Output::StartJob(spec) => self.jobs.push_back(spec),
+                Output::StartJob(spec) => {
+                    self.record_admission(&spec);
+                    self.begin_work(&spec);
+                    self.jobs.push_back(spec);
+                }
                 Output::CancelJob(id) => {
                     self.cancelled.push(id);
                     if let Some(index) = self.jobs.iter().position(|j| j.id == id)
@@ -124,6 +175,76 @@ impl Harness {
         let now = self.now;
         let outputs = self.coordinator.handle(input, now);
         self.process(outputs);
+    }
+
+    fn record_admission(&mut self, spec: &JobSpec) {
+        if !self.admitted.insert(spec.id) {
+            return;
+        }
+        let Some(class) = self.coordinator.job_class(spec.id) else {
+            return;
+        };
+        let batch = self.batch_of(spec.id);
+        self.admissions.push(Admission { at: self.now, job: spec.id, class, entry: spec.path.clone(), batch });
+    }
+
+    fn batch_of(&mut self, job: JobId) -> usize {
+        if self.batch_members.contains(&job) {
+            return self.batch_index;
+        }
+        self.batch_index += 1;
+        self.batch_members = self.coordinator.open_batch().map(|view| view.members).unwrap_or_default();
+        self.batch_members.insert(job);
+        self.batch_index
+    }
+
+    fn begin_work(&mut self, spec: &JobSpec) {
+        self.settle_work(spec.id);
+        let cost = self.fs.cost_of(fake_op(spec.operation), &spec.path);
+        let domain = self.fs.domain_of(&spec.path);
+        let due = self.now + cost;
+        self.job_domain.insert(spec.id, domain);
+        self.running.insert(spec.id, Running { started: self.now, due, domain });
+        self.schedule.insert((due, spec.id));
+    }
+
+    fn settle_work(&mut self, job: JobId) {
+        let Some(run) = self.running.remove(&job) else {
+            return;
+        };
+        self.schedule.remove(&(run.due, job));
+        let cost = self.now.since(run.started);
+        if !cost.is_zero() {
+            self.charges.push(Charge { at: self.now, job, domain: run.domain, cost });
+        }
+    }
+
+    pub fn admissions(&self) -> Vec<Admission> {
+        self.admissions.clone()
+    }
+
+    pub fn charges(&self) -> Vec<Charge> {
+        self.charges.clone()
+    }
+
+    pub fn charged_work(&self) -> Duration {
+        self.charges.iter().map(|c| c.cost).sum()
+    }
+
+    pub fn charged_work_between(&self, from: MonotonicTime, to: MonotonicTime) -> Duration {
+        self.charges.iter().filter(|c| c.at > from && c.at <= to).map(|c| c.cost).sum()
+    }
+
+    pub fn charged_work_by_domain(&self) -> BTreeMap<DomainId, Duration> {
+        let mut totals: BTreeMap<DomainId, Duration> = BTreeMap::new();
+        for charge in &self.charges {
+            *totals.entry(charge.domain).or_default() += charge.cost;
+        }
+        totals
+    }
+
+    pub fn domain_of(&self, job: JobId) -> Option<DomainId> {
+        self.job_domain.get(&job).copied()
     }
 
     pub fn command(&mut self, command: Command) -> Ticket {
@@ -157,6 +278,7 @@ impl Harness {
             JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
             JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
         };
+        self.settle_work(spec.id);
         self.feed(Input::JobCompleted { job: spec.id, result });
         true
     }
@@ -166,6 +288,7 @@ impl Harness {
             return false;
         };
         self.jobs.remove(index);
+        self.settle_work(id);
         self.feed(Input::JobCompleted { job: id, result });
         true
     }
@@ -175,6 +298,7 @@ impl Harness {
             return false;
         };
         self.jobs.remove(index);
+        self.settle_work(id);
         self.feed(Input::WorkerLost(WorkerLoss::Job(id)));
         true
     }
@@ -194,6 +318,7 @@ impl Harness {
             JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
             JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
         };
+        self.settle_work(spec.id);
         self.feed(Input::JobCompleted { job: spec.id, result });
         true
     }
@@ -203,6 +328,7 @@ impl Harness {
             return false;
         };
         self.outstanding.remove(index);
+        self.settle_work(id);
         self.feed(Input::WorkerLost(WorkerLoss::Job(id)));
         true
     }
@@ -278,8 +404,85 @@ impl Harness {
         count
     }
 
+    pub fn deliver_watcher_events_capped(&mut self, limit: usize) -> usize {
+        let mut count = 0;
+        while count < limit {
+            let next = self.sink.queue.lock().ok().and_then(|mut q| q.pop_front());
+            let Some(event) = next else { break };
+            self.feed(Input::Watcher(event));
+            count += 1;
+        }
+        count
+    }
+
     pub fn inject_watcher_event(&mut self, event: WatcherEvent) {
         self.feed(Input::Watcher(event));
+    }
+
+    pub fn advance_to_next_completion(&mut self) -> bool {
+        let Some((due, id)) = self.schedule.iter().next().copied() else {
+            return false;
+        };
+        self.now = self.now.max(due);
+        if self.complete_job(id) || self.complete_outstanding_job(id) {
+            return true;
+        }
+        self.settle_work(id);
+        true
+    }
+
+    fn step(&mut self, target: MonotonicTime, fired: &mut Option<MonotonicTime>) -> bool {
+        if self.auto_register {
+            self.complete_registrations();
+        }
+        self.deliver_watcher_events();
+        let job = self.schedule.iter().next().map(|(due, _)| *due).filter(|due| *due <= target);
+        let timer = self.timer.map(|(_, at)| at).filter(|at| *at <= target && Some(*at) != *fired);
+        match (job, timer) {
+            (Some(j), Some(t)) if t < j => {
+                *fired = Some(t);
+                self.fire_timer_only()
+            }
+            (Some(_), _) => {
+                *fired = None;
+                self.advance_to_next_completion()
+            }
+            (None, Some(t)) => {
+                *fired = Some(t);
+                self.fire_timer_only()
+            }
+            (None, None) => false,
+        }
+    }
+
+    fn drive(&mut self, target: MonotonicTime, mut before_step: impl FnMut(&mut Harness)) {
+        let mut fired = None;
+        for _ in 0..MAXIMUM_STEPS {
+            before_step(self);
+            if !self.step(target, &mut fired) {
+                self.now = self.now.max(target);
+                if self.auto_register {
+                    self.complete_registrations();
+                }
+                self.deliver_watcher_events();
+                return;
+            }
+        }
+        panic!("the harness took {MAXIMUM_STEPS} steps without reaching {target:?}");
+    }
+
+    pub fn run_jobs_until(&mut self, target: MonotonicTime) {
+        self.drive(target, |_| {});
+    }
+
+    pub fn flood_hints_until(&mut self, paths: &[&str], kind: HintKind, target: MonotonicTime) -> usize {
+        let owned: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
+        let mut emitted = 0;
+        self.drive(target, |harness| {
+            let borrowed: Vec<&str> = owned.iter().map(|p| p.as_str()).collect();
+            emitted += harness.fs.emit_storm(&borrowed, kind, 1);
+        });
+        emitted
     }
 
     pub fn run_until_idle(&mut self) {

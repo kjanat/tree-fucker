@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tree_fucker::core::JobOperation;
 use tree_fucker::policy::{PathPredicate, ScanDecision};
-use tree_fucker::testing::{BlockingMode, DeterministicRuntime, FailureMode, FakeFileSystem, FakeOp};
+use tree_fucker::testing::{BlockingMode, DeterministicRuntime, FailureMode, FakeFileSystem, FakeOp, HoldingRuntime};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RecoverableError, RoundResult, UpdateEvent};
 use tree_fucker::{Config, EntryKind, Error, FsError, LagMode, LoadAll, LoadState, RelativePath, Tree, WatcherKind};
 
@@ -340,114 +340,6 @@ fn a_registration_dispatched_before_shutdown_releases_its_watch() {
     assert!(poll_once(shut.as_mut()).is_pending());
     runtime.run_until_stalled();
     assert_eq!(fs.watch_count(), 0);
-}
-
-struct InertHandle {
-    cancels: Arc<std::sync::atomic::AtomicUsize>,
-    drops: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl tree_fucker::runtime::TaskHandle for InertHandle {
-    fn cancel(&self) {
-        self.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn detach(self: Box<Self>) {}
-}
-
-impl Drop for InertHandle {
-    fn drop(&mut self) {
-        self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-struct HoldingRuntime {
-    inner: Arc<DeterministicRuntime>,
-    hold: std::sync::atomic::AtomicBool,
-    budget: std::sync::atomic::AtomicUsize,
-    held: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
-    cancels: Arc<std::sync::atomic::AtomicUsize>,
-    drops: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl HoldingRuntime {
-    fn new(inner: Arc<DeterministicRuntime>) -> HoldingRuntime {
-        HoldingRuntime {
-            inner,
-            hold: std::sync::atomic::AtomicBool::new(false),
-            budget: std::sync::atomic::AtomicUsize::new(0),
-            held: std::sync::Mutex::new(Vec::new()),
-            cancels: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    fn cancels(&self) -> usize {
-        self.cancels.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn dropped_handles(&self) -> usize {
-        self.drops.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn hold(&self) {
-        self.hold.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn hold_next(&self, count: usize) {
-        self.budget.store(count, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn take_budget(&self) -> bool {
-        let mut left = self.budget.load(std::sync::atomic::Ordering::SeqCst);
-        loop {
-            let Some(next) = left.checked_sub(1) else {
-                return false;
-            };
-            match self.budget.compare_exchange(
-                left,
-                next,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(current) => left = current,
-            }
-        }
-    }
-
-    fn held(&self) -> usize {
-        self.held.lock().expect("held lock").len()
-    }
-
-    fn release(&self) {
-        let work: Vec<Box<dyn FnOnce() + Send + 'static>> = self.held.lock().expect("held lock").drain(..).collect();
-        for item in work {
-            item();
-        }
-    }
-}
-
-impl tree_fucker::runtime::Runtime for HoldingRuntime {
-    fn now(&self) -> std::time::Instant {
-        self.inner.now()
-    }
-
-    fn spawn(&self, future: tree_fucker::runtime::BoxFuture<'static, ()>) {
-        self.inner.spawn(future);
-    }
-
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> tree_fucker::runtime::BoxTaskHandle {
-        if self.hold.load(std::sync::atomic::Ordering::SeqCst) || self.take_budget() {
-            self.held.lock().expect("held lock").push(work);
-            return Box::new(InertHandle { cancels: self.cancels.clone(), drops: self.drops.clone() });
-        }
-        self.inner.spawn_blocking(work)
-    }
-
-    fn sleep(&self, duration: Duration) -> tree_fucker::runtime::BoxFuture<'static, ()> {
-        self.inner.sleep(duration)
-    }
 }
 
 fn poll_stream(
