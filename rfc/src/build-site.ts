@@ -12,6 +12,7 @@ const dprintConfig = abs('./.dprint.json', true);
 
 const assets: Array<[source: string, target: string]> = [
 	['../static/style.css', 'style.css'],
+	['../static/robots.txt', 'robots.txt'],
 	['../tree-fucker.txt', 'tree-fucker.txt'],
 ];
 
