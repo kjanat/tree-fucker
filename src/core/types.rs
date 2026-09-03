@@ -782,7 +782,6 @@ pub struct PendingCommand {
 pub struct Batch {
     pub members: HashSet<JobId>,
     pub periodic: bool,
-    pub started: MonotonicTime,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -829,6 +828,7 @@ pub enum JobOutcome {
     Stale,
     Cancelled,
     WorkerLost,
+    Stuck,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

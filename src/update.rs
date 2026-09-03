@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::core::MonotonicTime;
 use crate::entry::{EntryKind, LoadState, Metadata};
 use crate::fs::{FsError, WatcherKind};
 use crate::ids::{EntryId, RootIncarnation, SnapshotVersion};
@@ -92,6 +93,40 @@ impl ReconciliationHealth {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThrottleCause {
+    DutyBudget,
+    Concurrency,
+}
+
+impl fmt::Display for ThrottleCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ThrottleCause::DutyBudget => f.write_str("duty budget"),
+            ThrottleCause::Concurrency => f.write_str("concurrency window"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceHealth {
+    Nominal,
+    Throttled { cause: ThrottleCause, resume: Option<MonotonicTime> },
+}
+
+impl ResourceHealth {
+    pub fn is_throttled(&self) -> bool {
+        matches!(self, ResourceHealth::Throttled { .. })
+    }
+
+    pub fn cause(&self) -> Option<ThrottleCause> {
+        match self {
+            ResourceHealth::Nominal => None,
+            ResourceHealth::Throttled { cause, .. } => Some(*cause),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShutdownState {
     Running,
@@ -106,6 +141,7 @@ pub struct Health {
     pub root: RootAvailability,
     pub watcher: WatcherHealth,
     pub reconciliation: ReconciliationHealth,
+    pub resource: ResourceHealth,
     pub shutdown: ShutdownState,
 }
 
@@ -126,6 +162,7 @@ pub enum ErrorCause {
     DuplicateName(std::ffi::OsString),
     WatcherLost(String),
     WorkerLost,
+    WorkerStuck,
 }
 
 impl fmt::Display for ErrorCause {
@@ -137,6 +174,7 @@ impl fmt::Display for ErrorCause {
             ErrorCause::DuplicateName(n) => write!(f, "duplicate name {n:?}"),
             ErrorCause::WatcherLost(m) => write!(f, "watcher lost: {m}"),
             ErrorCause::WorkerLost => f.write_str("filesystem worker lost"),
+            ErrorCause::WorkerStuck => f.write_str("filesystem worker stuck"),
         }
     }
 }

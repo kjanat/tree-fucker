@@ -306,7 +306,7 @@ impl Coordinator {
         self.root_probe = None;
         self.shutdown = ShutdownState::Stopped;
         let health = self.compute_health();
-        self.outputs.push(Output::Publish(UpdateEvent::Terminal { health }));
+        self.outputs.push(Output::Publish(Box::new(UpdateEvent::Terminal { health })));
         self.outputs.push(Output::CommandFinished { id, result: Ok(()) });
         self.outputs.push(Output::Stopped(TerminalOutcome::ShutDown));
     }

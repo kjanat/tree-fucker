@@ -1,3 +1,4 @@
+use super::governor::GrantId;
 use super::types::*;
 use super::{Coordinator, Output};
 use crate::entry::{LoadState, Shape};
@@ -86,18 +87,28 @@ impl Coordinator {
         let RootState::Available { id: root_id, .. } = self.root else {
             return;
         };
-        if self.caps.watcher.is_per_directory() {
-            let dirs: Vec<(crate::ids::EntryId, RelativePath)> =
-                self.snapshot.loaded_directories().map(|e| (e.id, e.path.clone())).collect();
-            for (id, path) in dirs {
-                let request = self.next_watch_request();
-                self.registrations.insert(request, RegistrationTarget::Standalone(id));
-                self.outputs.push(Output::RegisterWatch { request, path, recursive: false });
-            }
+        let targets: Vec<(crate::ids::EntryId, RelativePath, bool)> = if self.caps.watcher.is_per_directory() {
+            self.snapshot
+                .loaded_directories()
+                .filter(|e| !matches!(self.dir_state(e.id).map(|d| d.watch), Some(WatchState::Registered(_))))
+                .map(|e| (e.id, e.path.clone(), false))
+                .collect()
         } else {
+            vec![(root_id, RelativePath::root(), true)]
+        };
+        let mut deferred = false;
+        for (id, path, recursive) in targets {
             let request = self.next_watch_request();
-            self.registrations.insert(request, RegistrationTarget::Standalone(root_id));
-            self.outputs.push(Output::RegisterWatch { request, path: RelativePath::root(), recursive: true });
+            let now = self.now;
+            if self.governor.try_admit(GrantId::WatchRegistration(request), path.clone(), 0, 1, now).is_err() {
+                deferred = true;
+                break;
+            }
+            self.registrations.insert(request, RegistrationTarget::Standalone(id));
+            self.outputs.push(Output::RegisterWatch { request, path, recursive });
+        }
+        if deferred {
+            self.watcher_restart_due = Some(self.now + self.config.minimum_period);
         }
     }
 }

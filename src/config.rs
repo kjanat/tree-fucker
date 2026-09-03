@@ -44,7 +44,10 @@ pub struct Config {
     pub retry_maximum_delay: Duration,
     pub watch_registration_failure: WatchRegistrationFailure,
     pub root_reappearance_monitoring: bool,
-    pub target_duty_cycle: f64,
+    pub background_duty: f64,
+    pub background_burst: Duration,
+    pub initial_cost_estimate: Duration,
+    pub stuck_threshold: Duration,
     pub minimum_period: Duration,
     pub maximum_period: Duration,
     pub fixed_interval: Option<Duration>,
@@ -71,7 +74,10 @@ impl Default for Config {
             retry_maximum_delay: Duration::from_secs(300),
             watch_registration_failure: WatchRegistrationFailure::ReconcileOnly,
             root_reappearance_monitoring: true,
-            target_duty_cycle: 0.01,
+            background_duty: 0.02,
+            background_burst: Duration::from_millis(500),
+            initial_cost_estimate: Duration::from_millis(20),
+            stuck_threshold: Duration::from_secs(30),
             minimum_period: Duration::from_secs(1),
             maximum_period: Duration::from_secs(300),
             fixed_interval: None,
@@ -92,8 +98,20 @@ impl Config {
         if self.max_in_flight == 0 {
             return Err("max_in_flight must be greater than zero".into());
         }
-        if !self.target_duty_cycle.is_finite() || self.target_duty_cycle <= 0.0 || self.target_duty_cycle > 1.0 {
-            return Err("target_duty_cycle must be finite, greater than zero and at most 1".into());
+        if !self.background_duty.is_finite()
+            || self.background_duty <= 0.0
+            || self.background_duty > self.max_in_flight as f64
+        {
+            return Err("background_duty must be finite, greater than zero and at most max_in_flight".into());
+        }
+        if self.background_burst.is_zero() {
+            return Err("background_burst must be greater than zero".into());
+        }
+        if self.initial_cost_estimate.is_zero() {
+            return Err("initial_cost_estimate must be greater than zero".into());
+        }
+        if self.stuck_threshold.is_zero() {
+            return Err("stuck_threshold must be greater than zero".into());
         }
         if self.minimum_period.is_zero() || self.minimum_period > self.maximum_period {
             return Err("minimum_period must be greater than zero and at most maximum_period".into());

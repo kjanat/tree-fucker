@@ -1,5 +1,6 @@
 mod apply;
 mod commands;
+mod governor;
 mod jobs;
 mod scheduler;
 mod types;
@@ -12,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use governor::Governor;
+pub use governor::{AdmissionDecision, GovernorView, Grant, GrantId};
 use types::*;
 pub use types::{Class, MonotonicTime};
 
@@ -24,8 +27,8 @@ use crate::path::RelativePath;
 use crate::policy::{PolicyContext, ScanPolicy};
 use crate::snapshot::{Snapshot, new_entry};
 use crate::update::{
-    ErrorCause, Health, InitialScanState, Operation, ReconciliationHealth, RecoverableError, RootAvailability,
-    ShutdownState, Update, UpdateEvent, WatcherHealth,
+    ErrorCause, Health, InitialScanState, Operation, ReconciliationHealth, RecoverableError, ResourceHealth,
+    RootAvailability, ShutdownState, ThrottleCause, Update, UpdateEvent, WatcherHealth,
 };
 
 #[derive(Clone, Debug)]
@@ -86,7 +89,7 @@ pub enum Output {
     CancelJob(JobId),
     RegisterWatch { request: WatchRequestId, path: RelativePath, recursive: bool },
     Unwatch(WatchId),
-    Publish(UpdateEvent),
+    Publish(Box<UpdateEvent>),
     CommandFinished { id: CommandId, result: Result<(), Error> },
     SetTimer { id: TimerId, at: MonotonicTime },
     Stopped(TerminalOutcome),
@@ -106,7 +109,7 @@ pub struct BatchView {
     pub members: BTreeSet<JobId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Stats {
     pub version: SnapshotVersion,
     pub initial_scan: InitialScanState,
@@ -121,6 +124,10 @@ pub struct Stats {
     pub in_flight_jobs: usize,
     pub blocking_slots_held: usize,
     pub blocking_slots: Vec<BlockingSlot>,
+    pub stuck_workers: Vec<BlockingSlot>,
+    pub governor: GovernorView,
+    pub grants: Vec<Grant>,
+    pub resource: ResourceHealth,
     pub pending_requests: usize,
     pub watcher: WatcherKind,
     pub dropped_hints: u64,
@@ -136,6 +143,7 @@ pub struct Stats {
 
 pub struct Coordinator {
     config: Config,
+    governor: Governor,
     policy: Arc<dyn ScanPolicy>,
     caps: FsCapabilities,
     now: MonotonicTime,
@@ -168,6 +176,7 @@ pub struct Coordinator {
     priority: PrioritySet,
     policy_fence: PolicyFence,
     class_rotation: usize,
+    dispatch_rotation: usize,
     watcher_health: WatcherHealth,
     watcher_restart_due: Option<MonotonicTime>,
     watcher_restart_attempts: u32,
@@ -206,8 +215,10 @@ impl Coordinator {
         }
         let seed = config.jitter_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let snapshot = Snapshot::empty(SnapshotVersion::new(0), caps.case);
+        let governor = Governor::new(&config, now);
         let mut coordinator = Coordinator {
             config,
+            governor,
             policy,
             caps,
             now,
@@ -240,6 +251,7 @@ impl Coordinator {
             priority: PrioritySet::default(),
             policy_fence: PolicyFence::new(0),
             class_rotation: 0,
+            dispatch_rotation: 0,
             watcher_health: if caps.watcher.is_present() {
                 WatcherHealth::Healthy { backend: caps.watcher }
             } else {
@@ -303,6 +315,14 @@ impl Coordinator {
         self.jobs.get(&id).map(|job| job.reasons.class())
     }
 
+    pub fn grants(&self) -> Vec<Grant> {
+        self.governor.grants().cloned().collect()
+    }
+
+    pub fn governor(&self) -> GovernorView {
+        self.governor.view(self.now)
+    }
+
     pub fn open_batch(&self) -> Option<BatchView> {
         self.batch
             .as_ref()
@@ -317,17 +337,28 @@ impl Coordinator {
         self.timer_wake
     }
 
+    pub fn observe(&mut self, now: MonotonicTime) -> Vec<Output> {
+        self.now = self.now.max(now);
+        if self.is_stopped() {
+            return self.take_outputs();
+        }
+        self.after_input();
+        self.take_outputs()
+    }
+
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         match &input {
             Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => {
                 self.blocking_slots.remove(job);
+                let now = self.now;
+                self.governor.release(GrantId::Job(*job), now);
             }
-            Input::Command { .. }
-            | Input::Watcher(_)
-            | Input::WatchRegistered { .. }
-            | Input::WorkerLost(WorkerLoss::WatchRegistration(_))
-            | Input::Timer(_) => {}
+            Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
+                let now = self.now;
+                self.governor.release(GrantId::WatchRegistration(*request), now);
+            }
+            Input::Command { .. } | Input::Watcher(_) | Input::Timer(_) => {}
         }
         if self.is_stopped() {
             match input {
@@ -385,6 +416,23 @@ impl Coordinator {
             represented_entries: self.snapshot.len(),
             queued_jobs: queued,
             in_flight_jobs: in_flight,
+            stuck_workers: self
+                .governor
+                .stuck_grants()
+                .filter_map(|grant| {
+                    let job = grant.id.job()?;
+                    let held = self.blocking_slots.get(&job)?;
+                    Some(BlockingSlot {
+                        job,
+                        path: held.path.clone(),
+                        operation: held.operation,
+                        started: held.started,
+                    })
+                })
+                .collect(),
+            governor: self.governor.view(self.now),
+            grants: self.governor.grants().cloned().collect(),
+            resource: self.resource_health(),
             blocking_slots_held: blocking_slots.len(),
             blocking_slots,
             pending_requests: self.pending.len() + usize::from(self.root_probe.is_some()),
@@ -405,12 +453,37 @@ impl Coordinator {
         if self.is_stopped() {
             return;
         }
+        let now = self.now;
+        self.governor.account(now);
+        self.declare_stuck_workers();
         self.check_round_end();
         self.check_initial_scan();
         self.maybe_dispatch();
         self.start_queued();
         self.publish();
         self.arm_timer();
+    }
+
+    fn declare_stuck_workers(&mut self) {
+        for grant in self.governor.newly_stuck(self.now) {
+            self.governor.mark_stuck(grant);
+            let Some(job) = grant.job() else {
+                continue;
+            };
+            if self.jobs.contains_key(&job) {
+                self.finish_job(job, JobOutcome::Stuck);
+            }
+        }
+    }
+
+    fn resource_health(&self) -> ResourceHealth {
+        if let Some(resume) = self.governor.resume_at(self.now) {
+            return ResourceHealth::Throttled { cause: ThrottleCause::DutyBudget, resume: Some(resume) };
+        }
+        if self.blocking_slots.len() >= self.config.max_in_flight && !self.queue_order.is_empty() {
+            return ResourceHealth::Throttled { cause: ThrottleCause::Concurrency, resume: None };
+        }
+        ResourceHealth::Nominal
     }
 
     fn next_seq(&mut self) -> Sequence {
@@ -578,6 +651,7 @@ impl Coordinator {
                 degraded_paths: self.degraded_paths(),
                 coverage_pending,
             },
+            resource: self.resource_health(),
             shutdown: self.shutdown.clone(),
         }
     }
@@ -592,7 +666,7 @@ impl Coordinator {
         if health_changed || !self.errors.is_empty() {
             let errors = std::mem::take(&mut self.errors);
             self.last_published_health = Some(health.clone());
-            self.outputs.push(Output::Publish(UpdateEvent::Health { version, health, errors }));
+            self.outputs.push(Output::Publish(Box::new(UpdateEvent::Health { version, health, errors })));
         }
     }
 
@@ -601,14 +675,14 @@ impl Coordinator {
         let errors = std::mem::take(&mut self.errors);
         self.last_published_health = Some(health.clone());
         self.published_version = self.snapshot.version();
-        self.outputs.push(Output::Publish(UpdateEvent::Delta(Update {
+        self.outputs.push(Output::Publish(Box::new(UpdateEvent::Delta(Update {
             previous_version: previous,
             new_version: self.snapshot.version(),
             snapshot: self.snapshot.clone(),
             changes,
             health,
             errors,
-        })));
+        }))));
     }
 
     fn terminate(&mut self, error: FsError) {
@@ -625,7 +699,7 @@ impl Coordinator {
         self.cancel_all_jobs();
         self.unwatch_all();
         let health = self.compute_health();
-        self.outputs.push(Output::Publish(UpdateEvent::Terminal { health }));
+        self.outputs.push(Output::Publish(Box::new(UpdateEvent::Terminal { health })));
         self.outputs.push(Output::Stopped(TerminalOutcome::Terminated));
     }
 
@@ -669,7 +743,19 @@ impl Coordinator {
             });
         };
         if !self.baseline_due && self.batch.is_none() {
-            consider(self.periodic_due);
+            let due = match self.governor.resume_at(self.now) {
+                Some(at) => self.periodic_due.max(at),
+                None => self.periodic_due,
+            };
+            consider(due);
+        }
+        if self.batch.is_none()
+            && let Some(at) = self.governor.resume_at(self.now)
+        {
+            consider(at);
+        }
+        if let Some(at) = self.governor.next_stuck_deadline() {
+            consider(at);
         }
         if let Some(probe) = &self.root_probe
             && let Some(t) = probe.not_before

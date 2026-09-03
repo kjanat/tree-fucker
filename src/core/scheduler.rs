@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use super::governor::GrantId;
 use super::types::*;
 use super::{Coordinator, JobOperation, JobSpec, Output};
 use crate::entry::{LoadState, Shape};
@@ -30,22 +31,41 @@ impl Coordinator {
             (false, false) => (0, 0),
         };
         let mut members: HashSet<JobId> = HashSet::new();
-        if baseline_slots > 0 {
-            self.admit_baseline(baseline_slots, &mut members);
+        let contended = baseline_slots > 0 && expedited_slots > 0;
+        let baseline_first = !contended || self.dispatch_rotation.is_multiple_of(2);
+        if contended {
+            self.dispatch_rotation = self.dispatch_rotation.wrapping_add(1);
         }
-        if expedited_slots > 0 {
-            self.admit_expedited(expedited_slots, expedited, &mut members);
+        let mut granting = true;
+        if baseline_first && baseline_slots > 0 {
+            granting = self.admit_baseline(baseline_slots, &mut members);
+        }
+        if granting && expedited_slots > 0 {
+            granting = self.admit_expedited(expedited_slots, expedited, &mut members);
+        }
+        if granting && !baseline_first && baseline_slots > 0 {
+            self.admit_baseline(baseline_slots, &mut members);
         }
         if periodic {
             self.baseline_due = false;
         }
         if members.is_empty() {
             if periodic {
-                self.complete_periodic(Duration::ZERO);
+                self.complete_periodic();
             }
             return;
         }
-        self.batch = Some(Batch { members, periodic, started: self.now });
+        self.batch = Some(Batch { members, periodic });
+    }
+
+    fn try_grant(&mut self, entry: Option<EntryId>, need: ReadNeed, path: &RelativePathOwned) -> Option<JobGrant> {
+        let id = self.next_job_id();
+        let registration = entry.map(|e| self.needs_registration(e, need)).unwrap_or(false);
+        let now = self.now;
+        match self.governor.try_admit(GrantId::Job(id), path.clone(), 1, u32::from(registration), now) {
+            Ok(_) => Some(JobGrant { id, registration }),
+            Err(_) => None,
+        }
     }
 
     fn probe_ready(&self) -> bool {
@@ -148,7 +168,7 @@ impl Coordinator {
         self.round = Some(Round { generation, barrier, obligations, index, cursor: 0, started: self.now });
     }
 
-    fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) {
+    fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) -> bool {
         let mut remaining = slots;
         loop {
             if remaining == 0 {
@@ -211,6 +231,9 @@ impl Coordinator {
                 self.advance_cursor();
                 continue;
             }
+            let Some(grant) = self.try_grant(Some(obligation.entry), ReadNeed::Listing, &obligation.path) else {
+                return false;
+            };
             let mut request = self.pending.remove(&obligation.entry).unwrap_or(PendingRequest {
                 path: obligation.path.clone(),
                 need: ReadNeed::Listing,
@@ -221,11 +244,12 @@ impl Coordinator {
             request.need = ReadNeed::Listing;
             request.reasons.baseline = true;
             request.designate_for_round = Some(generation);
-            let job_id = self.admit(Some(obligation.entry), request);
+            let job_id = self.admit(grant, Some(obligation.entry), request);
             members.insert(job_id);
             remaining -= 1;
             self.advance_cursor();
         }
+        true
     }
 
     fn advance_cursor(&mut self) {
@@ -243,7 +267,7 @@ impl Coordinator {
         }
     }
 
-    fn admit_expedited(&mut self, slots: usize, ready: Vec<EntryId>, members: &mut HashSet<JobId>) {
+    fn admit_expedited(&mut self, slots: usize, ready: Vec<EntryId>, members: &mut HashSet<JobId>) -> bool {
         let mut by_class: [Vec<EntryId>; 5] = Default::default();
         for id in ready {
             if members.iter().any(|j| self.jobs.get(j).map(|job| job.entry() == Some(id)).unwrap_or(false)) {
@@ -273,7 +297,7 @@ impl Coordinator {
         }
         let weight_sum: u64 = (0..5).filter(|i| counts[*i] > 0).map(|i| u64::from(weights[i])).sum();
         if weight_sum == 0 {
-            return;
+            return true;
         }
         let mut quota: [usize; 5] = [0; 5];
         let mut assigned = 0usize;
@@ -307,23 +331,36 @@ impl Coordinator {
                 && take > 0
                 && let Some(probe) = self.root_probe.take()
             {
-                let job_id = self.admit(None, probe.request);
-                members.insert(job_id);
-                take -= 1;
-                probe_pending = false;
+                match self.try_grant(None, probe.request.need, &probe.request.path) {
+                    Some(grant) => {
+                        let job_id = self.admit(grant, None, probe.request);
+                        members.insert(job_id);
+                        take -= 1;
+                        probe_pending = false;
+                    }
+                    None => {
+                        self.root_probe = Some(probe);
+                        return false;
+                    }
+                }
             }
             for id in by_class[i].iter().take(take) {
-                let Some(request) = self.pending.remove(id) else {
+                let Some(request) = self.pending.get(id).cloned() else {
                     continue;
                 };
-                let job_id = self.admit(Some(*id), request);
+                let Some(grant) = self.try_grant(Some(*id), request.need, &request.path) else {
+                    return false;
+                };
+                self.pending.remove(id);
+                let job_id = self.admit(grant, Some(*id), request);
                 members.insert(job_id);
             }
         }
+        true
     }
 
-    fn admit(&mut self, entry: Option<EntryId>, request: PendingRequest) -> JobId {
-        let id = self.next_job_id();
+    fn admit(&mut self, grant: JobGrant, entry: Option<EntryId>, request: PendingRequest) -> JobId {
+        let id = grant.id;
         let dispatch = self.next_seq();
         let mut reasons = request.reasons;
         let mut barriers = request.barriers;
@@ -357,8 +394,7 @@ impl Coordinator {
             Some(entry_id) => JobTarget::Entry { id: entry_id, guards: self.capture_guards(entry_id, request.need) },
             None => JobTarget::RootProbe { expected_unavailable: self.root.incarnation() },
         };
-        let needs_registration = entry.map(|e| self.needs_registration(e, request.need)).unwrap_or(false);
-        let phase = if needs_registration {
+        let phase = if grant.registration {
             let req = self.next_watch_request();
             self.registrations.insert(req, RegistrationTarget::Job(id));
             let recursive = !self.caps.watcher.is_per_directory();
@@ -503,6 +539,7 @@ impl Coordinator {
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.phase = JobPhase::Running(now);
             }
+            self.governor.start(GrantId::Job(id), now);
             self.dispatch_job(id, operation);
         }
     }
@@ -526,26 +563,16 @@ impl Coordinator {
         batch.members.remove(&id);
         if batch.members.is_empty() {
             let periodic = batch.periodic;
-            let started = batch.started;
             self.batch = None;
             if periodic {
-                let duration = self.now.since(started);
-                self.complete_periodic(duration);
+                self.complete_periodic();
             }
         }
     }
 
-    fn complete_periodic(&mut self, duration: Duration) {
-        let target = match self.config.fixed_interval {
-            Some(interval) => interval,
-            None => {
-                let scaled = duration.as_secs_f64() / self.config.target_duty_cycle;
-                let scaled = Duration::try_from_secs_f64(scaled).unwrap_or(self.config.maximum_period);
-                scaled.clamp(self.config.minimum_period, self.config.maximum_period)
-            }
-        };
-        let delay = target.saturating_sub(duration);
-        self.periodic_due = self.now + delay;
+    pub(super) fn complete_periodic(&mut self) {
+        let interval = self.config.fixed_interval.unwrap_or(self.config.minimum_period);
+        self.periodic_due = self.now + interval;
     }
 
     pub(super) fn check_round_end(&mut self) {
@@ -586,3 +613,9 @@ impl Coordinator {
 }
 
 type RelativePathOwned = crate::path::RelativePath;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct JobGrant {
+    pub id: JobId,
+    pub registration: bool,
+}

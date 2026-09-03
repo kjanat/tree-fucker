@@ -1,3 +1,4 @@
+use super::governor::GrantId;
 use super::types::*;
 use super::{Coordinator, JobOperation, JobResult, Output, WorkerLoss};
 use crate::config::WatchRegistrationFailure;
@@ -236,6 +237,10 @@ impl Coordinator {
         let Some(job) = self.jobs.remove(&id) else {
             return;
         };
+        if job.phase.started().is_none() {
+            let now = self.now;
+            self.governor.release(GrantId::Job(id), now);
+        }
         match job.entry() {
             Some(entry) => {
                 if self.active_by_entry.get(&entry) == Some(&id) {
@@ -275,7 +280,8 @@ impl Coordinator {
             | JobOutcome::WatcherRegistrationFailed
             | JobOutcome::Stale
             | JobOutcome::Cancelled
-            | JobOutcome::WorkerLost => {
+            | JobOutcome::WorkerLost
+            | JobOutcome::Stuck => {
                 if job.designated {
                     self.set_obligation(entry, ObligationState::Unsatisfied);
                 }
@@ -283,7 +289,10 @@ impl Coordinator {
         }
         if job.reasons.initial_scan {
             match outcome {
-                JobOutcome::Failed(_) | JobOutcome::LimitExceeded | JobOutcome::WatcherRegistrationFailed => {
+                JobOutcome::Failed(_)
+                | JobOutcome::LimitExceeded
+                | JobOutcome::WatcherRegistrationFailed
+                | JobOutcome::Stuck => {
                     self.initial_scan.resolve_unsatisfied(entry, job.path.clone());
                 }
                 JobOutcome::Accepted
@@ -323,6 +332,11 @@ impl Coordinator {
             JobOutcome::WatcherRegistrationFailed => {
                 for cmd in attached {
                     self.finish_command(cmd, Err(Error::WatcherRegistrationFailed));
+                }
+            }
+            JobOutcome::Stuck => {
+                for cmd in attached {
+                    self.finish_command(cmd, Err(Error::Stuck));
                 }
             }
             JobOutcome::Stale | JobOutcome::Cancelled | JobOutcome::WorkerLost => {}
@@ -453,6 +467,26 @@ impl Coordinator {
                     &job.barriers,
                 );
                 self.entries.set_degraded(entry, Some(DegradedCause::WatcherRegistration));
+            }
+            JobOutcome::Stuck => {
+                self.push_error(
+                    job.path.clone(),
+                    if job.need == ReadNeed::Listing { Operation::Listing } else { Operation::Metadata },
+                    ErrorCause::WorkerStuck,
+                );
+                let Some(current) = represented else { return };
+                if !Self::still_required(&current, job.need) {
+                    return;
+                }
+                let attempts = self.entries.retry(entry).map(|r| r.attempts + 1).unwrap_or(1);
+                self.merge_retry(
+                    entry,
+                    Self::retry_phase(job.need),
+                    attempts,
+                    RetryTiming::Backoff,
+                    job.reasons.for_retry(),
+                    &job.barriers,
+                );
             }
             JobOutcome::WorkerLost => {
                 self.push_error(

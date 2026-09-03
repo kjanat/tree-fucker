@@ -30,5 +30,6 @@ pub use snapshot::Snapshot;
 pub use tree::{Tree, TreeHandle, UpdateStream};
 pub use update::{
     ErrorCause, Health, InitialScanState, Operation, PathChange, ReconciliationHealth, RecoverableError,
-    RootAvailability, RoundResult, ShutdownState, StreamError, Update, UpdateEvent, WatcherHealth,
+    ResourceHealth, RootAvailability, RoundResult, ShutdownState, StreamError, ThrottleCause, Update, UpdateEvent,
+    WatcherHealth,
 };

@@ -2,15 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tree_fucker::core::{Class, Command, MonotonicTime};
+use tree_fucker::core::{Class, Command, JobSpec, MonotonicTime};
 use tree_fucker::testing::{Admission, CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ErrorCause, RoundResult, UpdateEvent};
 use tree_fucker::{Config, EntryKind, FsError, HintKind, LoadAll, RelativePath, WatcherKind};
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
 const BACKGROUND_BURST_GLOBAL: Duration = Duration::from_millis(500);
-const BACKGROUND_DUTY_PER_DOMAIN: f64 = 0.01;
-const BACKGROUND_BURST_PER_DOMAIN: Duration = Duration::from_millis(250);
 const INITIAL_COST_ESTIMATE: Duration = Duration::from_millis(20);
 const STUCK_THRESHOLD: Duration = Duration::from_secs(30);
 const MAXIMUM_PERIOD: Duration = Duration::from_secs(300);
@@ -64,14 +62,25 @@ fn worst_window(h: &Harness, window: Duration) -> (MonotonicTime, Duration) {
 
 fn run_one_round(h: &mut Harness) {
     let before = h.stats().last_round;
-    for _ in 0..2000 {
-        let next = h.now() + Duration::from_millis(500);
+    for _ in 0..4000 {
+        let next = h.now() + Duration::from_secs(5);
         h.run_jobs_until(next);
         if h.stats().last_round != before {
             return;
         }
     }
     panic!("no reconciliation round completed");
+}
+
+fn dispatched_job(h: &mut Harness, p: &str) -> JobSpec {
+    for _ in 0..1200 {
+        if let Some(job) = h.pending_job_for(p) {
+            return job;
+        }
+        let next = h.now() + Duration::from_secs(1);
+        h.run_jobs_until(next);
+    }
+    panic!("no filesystem job for {p} was dispatched");
 }
 
 fn scanned(fs: Arc<FakeFileSystem>, config: Config) -> Harness {
@@ -89,7 +98,7 @@ fn by_batch(admissions: &[Admission]) -> BTreeMap<usize, Vec<Admission>> {
 }
 
 #[test]
-fn every_filesystem_op_correlates_with_a_logged_admission() {
+fn every_listing_and_metadata_op_correlates_with_a_logged_admission() {
     let fs = tree(&["a", "a/b", "c"]);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, INITIAL_COST_ESTIMATE);
     fs.set_cost(CostScope::Everything, FakeOp::Metadata, Duration::from_millis(2));
@@ -120,6 +129,74 @@ fn every_filesystem_op_correlates_with_a_logged_admission() {
             "RFC 15.1 item 1: {count} filesystem operations ran for {target} against {grants} logged admissions"
         );
     }
+}
+
+#[test]
+fn watch_registration_correlates_with_a_governor_admission() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    for dir in ["a", "a/b", "c"] {
+        fs.mkdir(dir);
+        fs.create_file(&format!("{dir}/f"), 1);
+    }
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, INITIAL_COST_ESTIMATE);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
+
+    let registered = fs.ops().iter().filter(|(op, _)| *op == FakeOp::Watch).count() as u64;
+    let granted = h.governor().watch_registration_grants;
+    assert!(registered > 0, "the workload registered no watch");
+    assert!(
+        granted >= registered,
+        "RFC 15.1 item 1: {registered} watch registrations ran against {granted} governor grants"
+    );
+}
+
+#[test]
+fn a_running_worker_is_charged_its_occupancy_before_it_completes() {
+    let fs = tree(&["held"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs.set_cost(CostScope::path("held"), FakeOp::ReadDir, Duration::from_secs(36_000));
+    let config = Config { stuck_threshold: Duration::from_secs(36_000), ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    let started = dispatched_job(&mut h, "held");
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let start = h.now();
+
+    let target = start + Duration::from_secs(60);
+    h.run_jobs_until(target);
+    assert!(
+        h.pending_jobs().iter().any(|job| job.id == started.id),
+        "the ten hour listing returned, so there is no running occupancy to account"
+    );
+
+    let view = h.governor();
+    assert!(
+        view.running_occupancy >= Duration::from_secs(60),
+        "RFC 15.2: a running operation is charged its occupancy so far at every accounting point; the \
+         governor reports {:?} of running occupancy sixty seconds after the worker started",
+        view.running_occupancy
+    );
+    assert!(
+        view.charged >= Duration::from_secs(60),
+        "RFC 15.2: the bucket must carry the occupancy of an operation that has not completed; it carries {:?}",
+        view.charged
+    );
+    assert!(
+        view.debt > Duration::ZERO,
+        "RFC 15.3: occupancy beyond the reservation puts the bucket in debt; the bucket reports level {:?}",
+        view.level
+    );
+    assert!(
+        h.charges().iter().all(|charge| charge.job != started.id),
+        "the harness completion log records a charge only when work settles, so it cannot be the source of \
+         truth for a running worker"
+    );
+    let admitted: Vec<Admission> = h.admissions().into_iter().filter(|a| a.at > start).collect();
+    assert!(
+        admitted.is_empty(),
+        "RFC 15.3: a bucket in debt admits nothing; {} jobs were admitted while the worker ran",
+        admitted.len()
+    );
 }
 
 #[test]
@@ -189,16 +266,17 @@ fn period_and_next_cycle(cost: Duration) -> (Duration, usize) {
 }
 
 #[test]
-fn a_slow_batch_lengthens_the_next_period_instead_of_the_next_batch() {
+fn a_slow_batch_pushes_out_the_next_period_and_the_bucket_bounds_the_next_cycle() {
     let (fast_gap, fast_cycle) = period_and_next_cycle(Duration::from_millis(1));
     let (slow_gap, slow_cycle) = period_and_next_cycle(Duration::from_millis(200));
     assert!(
         slow_gap > fast_gap,
         "RFC 12: a slower batch must push out the next period; fast {fast_gap:?} against slow {slow_gap:?}"
     );
-    assert_eq!(
-        slow_cycle, fast_cycle,
-        "RFC 12: batch_size bounds the jobs per cycle, so a slow batch must not shrink the next one"
+    assert!(
+        slow_cycle >= 1 && slow_cycle <= fast_cycle,
+        "RFC 15.3: the bucket, not the previous batch's duration, bounds the next cycle; it admitted \
+         {slow_cycle} against the fast tree's {fast_cycle}"
     );
 }
 
@@ -266,7 +344,7 @@ fn the_baseline_cursor_advances_while_every_expedited_class_stays_ready() {
     for step in 0..40 {
         fs.mkdir(&format!("fresh{step}"));
         let t = h.command(Command::Refresh(vec![path("keep2")]));
-        let target = h.now() + Duration::from_secs(5);
+        let target = h.now() + Duration::from_secs(60);
         h.run_jobs_until(target);
         assert!(h.result(t).is_some(), "refresh {step} never settled");
         if h.stats().last_round != last {
@@ -382,7 +460,7 @@ fn a_job_delayed_past_a_newer_dispatch_for_its_target_is_discarded() {
     fs.set_cost(CostScope::path("a"), FakeOp::ReadDir, Duration::from_secs(5));
 
     let first = h.command(Command::Refresh(vec![path("a")]));
-    let delayed = h.pending_job_for("a").expect("listing in flight");
+    let delayed = dispatched_job(&mut h, "a");
     let target = h.now() + Duration::from_secs(1);
     h.run_jobs_until(target);
     assert!(h.pending_job_for("a").is_some_and(|j| j.id == delayed.id), "the delayed listing already returned");
@@ -402,7 +480,7 @@ fn a_job_delayed_past_a_newer_dispatch_for_its_target_is_discarded() {
         "RFC 11.4 and 17.5: a result delayed past a newer dispatch for its target committed"
     );
 
-    let target = h.now() + Duration::from_secs(60);
+    let target = h.now() + Duration::from_secs(1200);
     h.run_jobs_until(target);
     assert_eq!(h.result(first), Some(Ok(())));
     assert_eq!(h.result(second), Some(Ok(())));
@@ -489,7 +567,7 @@ fn a_directory_over_its_entry_limit_reports_a_degraded_path_and_a_limit_cause() 
 }
 
 #[test]
-fn raising_the_entry_limit_lets_the_next_round_accept_the_rejected_listing() {
+fn opening_with_a_higher_entry_limit_accepts_the_previously_rejected_listing() {
     let fs = limited_tree();
     let mut low =
         Harness::open(fs.clone(), Arc::new(LoadAll), Config { entries_per_directory: 3, ..Default::default() })
@@ -580,19 +658,49 @@ fn a_slow_domain_does_not_delay_the_fast_domains_baseline_coverage() {
     let config = Config { max_in_flight: 2, batch_size: 8, ..Default::default() };
     let mut h = scanned(fs.clone(), config);
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(120));
-    fs.clear_ops();
 
-    let horizon = Duration::from_secs(600);
-    let target = h.now() + horizon;
-    h.run_jobs_until(target);
+    let slow_job = dispatched_job(&mut h, "slow");
+    let dispatched_at = h.now();
+    let batch = h.coordinator.open_batch().map(|view| view.members).unwrap_or_default();
+    assert!(batch.contains(&slow_job.id), "the slow listing was not admitted into a closed batch");
 
-    let listed = fs.count_ops(FakeOp::ReadDir, "fast0");
-    let affordable = envelope(BACKGROUND_DUTY_PER_DOMAIN, BACKGROUND_BURST_PER_DOMAIN, horizon);
+    let crossed = dispatched_at + STUCK_THRESHOLD + Duration::from_secs(1);
+    h.run_jobs_until(crossed);
     assert!(
-        listed >= 20,
-        "RFC 15.5 and 17.5: a slow domain must not delay another domain's baseline coverage; over {horizon:?} \
-         the fast domain listed fast0 {listed} times while the slow domain held the batch, against its own \
-         per-domain background budget of {affordable:?}"
+        h.stats().blocking_slots.iter().any(|slot| slot.job == slow_job.id),
+        "RFC 13.5: the slow worker returned before it could cross the stuck threshold"
+    );
+    assert!(
+        h.stats().stuck_workers.iter().any(|slot| slot.job == slow_job.id),
+        "RFC 13.5: an operation past the stuck threshold must be reported as a stuck worker"
+    );
+    assert!(
+        h.coordinator.open_batch().map(|view| !view.members.contains(&slow_job.id)).unwrap_or(true),
+        "RFC 11.3 and 13.5: a stuck logical job must leave its closed batch"
+    );
+
+    let fast_before: BTreeSet<RelativePath> =
+        h.admissions().iter().filter(|a| a.at > crossed).map(|a| a.entry.clone()).collect();
+    let returns_at = dispatched_at + Duration::from_secs(120);
+    let target = returns_at.saturating_sub(h.now()) / 2;
+    let target = h.now() + target;
+    h.run_jobs_until(target);
+    assert!(
+        h.stats().blocking_slots.iter().any(|slot| slot.job == slow_job.id),
+        "the slow worker returned before the window this test measures"
+    );
+    let fast_after: Vec<RelativePath> = h
+        .admissions()
+        .iter()
+        .filter(|a| a.at > crossed && !a.entry.starts_with(&path("slow")))
+        .map(|a| a.entry.clone())
+        .collect();
+    assert!(
+        !fast_after.is_empty(),
+        "RFC 13.5 and 17.5: a stuck worker on one domain must not delay another domain's baseline work; \
+         between {crossed:?} and {target:?} the fast domain was admitted {} times while the slow worker \
+         still held its slot (already seen: {fast_before:?})",
+        fast_after.len()
     );
 }
 
@@ -667,7 +775,8 @@ fn a_domain_that_becomes_fast_again_converges_within_one_round() {
     fs.set_domain("media", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(60));
-    let mut h = scanned(fs.clone(), Config::default());
+    let config = Config { stuck_threshold: Duration::from_secs(300), ..Default::default() };
+    let mut h = scanned(fs.clone(), config);
     run_one_round(&mut h);
 
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_millis(5));

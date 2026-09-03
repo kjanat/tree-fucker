@@ -16,6 +16,7 @@ use crate::snapshot::Snapshot;
 use crate::update::{Health, UpdateEvent};
 
 const MAXIMUM_STEPS: usize = 1_000_000;
+const SETTLE_HORIZON: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(pub CommandId);
@@ -27,6 +28,7 @@ pub struct Admission {
     pub class: Class,
     pub entry: RelativePath,
     pub batch: usize,
+    pub reserved: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +87,7 @@ pub struct Harness {
     admitted: HashSet<JobId>,
     batch_index: usize,
     batch_members: BTreeSet<JobId>,
+    waited_at: Option<MonotonicTime>,
     pub auto_register: bool,
 }
 
@@ -118,8 +121,10 @@ impl Harness {
             admitted: HashSet::new(),
             batch_index: 0,
             batch_members: BTreeSet::new(),
+            waited_at: None,
             auto_register: true,
         };
+        harness.record_grants();
         harness.process(outputs);
         if harness.auto_register {
             harness.complete_registrations();
@@ -142,7 +147,6 @@ impl Harness {
         for output in outputs {
             match output {
                 Output::StartJob(spec) => {
-                    self.record_admission(&spec);
                     self.begin_work(&spec);
                     self.jobs.push_back(spec);
                 }
@@ -161,7 +165,7 @@ impl Harness {
                     self.unwatched.push(id);
                     self.fs.unwatch(id);
                 }
-                Output::Publish(event) => self.events.push(event),
+                Output::Publish(event) => self.events.push(*event),
                 Output::CommandFinished { id, result } => {
                     self.results.insert(id, result);
                 }
@@ -174,18 +178,39 @@ impl Harness {
     fn feed(&mut self, input: Input) {
         let now = self.now;
         let outputs = self.coordinator.handle(input, now);
+        self.record_grants();
         self.process(outputs);
     }
 
-    fn record_admission(&mut self, spec: &JobSpec) {
-        if !self.admitted.insert(spec.id) {
-            return;
+    fn observe(&mut self) {
+        let now = self.now;
+        let outputs = self.coordinator.observe(now);
+        self.record_grants();
+        self.process(outputs);
+    }
+
+    fn record_grants(&mut self) {
+        for grant in self.coordinator.grants() {
+            let Some(job) = grant.id.job() else {
+                continue;
+            };
+            if self.admitted.contains(&job) {
+                continue;
+            }
+            let Some(class) = self.coordinator.job_class(job) else {
+                continue;
+            };
+            self.admitted.insert(job);
+            let batch = self.batch_of(job);
+            self.admissions.push(Admission {
+                at: grant.admitted,
+                job,
+                class,
+                entry: grant.path.clone(),
+                batch,
+                reserved: grant.reserved,
+            });
         }
-        let Some(class) = self.coordinator.job_class(spec.id) else {
-            return;
-        };
-        let batch = self.batch_of(spec.id);
-        self.admissions.push(Admission { at: self.now, job: spec.id, class, entry: spec.path.clone(), batch });
     }
 
     fn batch_of(&mut self, job: JobId) -> usize {
@@ -233,6 +258,32 @@ impl Harness {
 
     pub fn charged_work_between(&self, from: MonotonicTime, to: MonotonicTime) -> Duration {
         self.charges.iter().filter(|c| c.at > from && c.at <= to).map(|c| c.cost).sum()
+    }
+
+    pub fn reserved_between(&self, from: MonotonicTime, to: MonotonicTime) -> Duration {
+        self.admissions.iter().filter(|a| a.at > from && a.at <= to).map(|a| a.reserved).sum()
+    }
+
+    pub fn worst_reserved_window(&self, window: Duration) -> (MonotonicTime, Duration) {
+        let mut worst = (MonotonicTime::ZERO, Duration::ZERO);
+        let mut oldest = 0;
+        let mut total = Duration::ZERO;
+        for index in 0..self.admissions.len() {
+            let end = self.admissions[index].at;
+            total += self.admissions[index].reserved;
+            while self.admissions[oldest].at.0 + window <= end.0 {
+                total -= self.admissions[oldest].reserved;
+                oldest += 1;
+            }
+            if total > worst.1 {
+                worst = (end, total);
+            }
+        }
+        worst
+    }
+
+    pub fn governor(&self) -> crate::core::GovernorView {
+        self.coordinator.governor()
     }
 
     pub fn charged_work_by_domain(&self) -> BTreeMap<DomainId, Duration> {
@@ -461,6 +512,7 @@ impl Harness {
             before_step(self);
             if !self.step(target, &mut fired) {
                 self.now = self.now.max(target);
+                self.observe();
                 if self.auto_register {
                     self.complete_registrations();
                 }
@@ -486,7 +538,12 @@ impl Harness {
     }
 
     pub fn run_until_idle(&mut self) {
-        loop {
+        let horizon = self.now + SETTLE_HORIZON;
+        self.settle(horizon);
+    }
+
+    pub fn settle(&mut self, horizon: MonotonicTime) {
+        for _ in 0..MAXIMUM_STEPS {
             let mut progress = 0;
             if self.auto_register {
                 progress += self.complete_registrations();
@@ -494,10 +551,34 @@ impl Harness {
             progress += self.complete_all_jobs();
             progress += self.release_outstanding();
             progress += self.deliver_watcher_events();
-            if progress == 0 {
-                break;
+            if progress > 0 {
+                continue;
+            }
+            if !self.wait_for_capacity(horizon) {
+                return;
             }
         }
+        panic!("the harness took {MAXIMUM_STEPS} steps without settling");
+    }
+
+    fn wait_for_capacity(&mut self, horizon: MonotonicTime) -> bool {
+        if !self.stats().resource.is_throttled() {
+            return false;
+        }
+        let Some((id, at)) = self.timer else {
+            return false;
+        };
+        if at > horizon {
+            return false;
+        }
+        if at <= self.now && self.waited_at == Some(self.now) {
+            return false;
+        }
+        self.waited_at = Some(self.now.max(at));
+        self.now = self.now.max(at);
+        self.timer = None;
+        self.feed(Input::Timer(id));
+        true
     }
 
     pub fn advance(&mut self, duration: Duration) {
@@ -508,13 +589,14 @@ impl Harness {
                     self.now = self.now.max(at);
                     self.timer = None;
                     self.feed(Input::Timer(id));
-                    self.run_until_idle();
+                    self.settle(target);
                 }
                 _ => break,
             }
         }
         self.now = target;
-        self.run_until_idle();
+        self.observe();
+        self.settle(target);
     }
 
     pub fn fire_timer_only(&mut self) -> bool {

@@ -302,6 +302,7 @@ impl Actor {
                 }
                 Output::Unwatch(id) => self.unwatch(id),
                 Output::Publish(event) => {
+                    let event = *event;
                     match &event {
                         UpdateEvent::Delta(update) => *lock(&self.shared.snapshot) = update.snapshot.clone(),
                         UpdateEvent::Reset { snapshot, .. } => *lock(&self.shared.snapshot) = snapshot.clone(),
