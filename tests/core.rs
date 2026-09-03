@@ -19,6 +19,18 @@ fn sizes() -> Config {
     Config { metadata_fields: MetadataFields { size: true, ..MetadataFields::NONE }, ..Default::default() }
 }
 
+fn published_causes(h: &Harness) -> Vec<ErrorCause> {
+    h.events()
+        .iter()
+        .flat_map(|event| match event {
+            UpdateEvent::Delta(update) => update.errors.clone(),
+            UpdateEvent::Health { errors, .. } | UpdateEvent::Reset { errors, .. } => errors.clone(),
+            UpdateEvent::Terminal { .. } => Vec::new(),
+        })
+        .map(|e| e.error)
+        .collect()
+}
+
 fn populated(watcher: WatcherKind) -> Arc<FakeFileSystem> {
     let fs = Arc::new(FakeFileSystem::new(watcher));
     fs.mkdir("a");
@@ -543,7 +555,7 @@ fn a_metadata_read_does_not_satisfy_a_refresh_that_still_needs_a_listing() {
     fs.touch("a");
     h.deliver_watcher_events();
     let metadata = h.pending_job_for("a").expect("a metadata read");
-    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert_eq!(metadata.operation(), JobOperation::Metadata);
     h.complete_job(metadata.id);
     assert_eq!(h.result(t), None);
     assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loading));
@@ -565,7 +577,7 @@ fn a_lost_metadata_worker_keeps_the_stronger_listing_requirement() {
     fs.touch("a");
     h.deliver_watcher_events();
     let metadata = h.pending_job_for("a").expect("a metadata read");
-    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert_eq!(metadata.operation(), JobOperation::Metadata);
     assert!(h.lose_job(metadata.id));
     assert_eq!(h.result(t), None);
     h.advance(Duration::from_secs(60));
@@ -588,7 +600,7 @@ fn a_failed_metadata_read_keeps_the_refresh_barrier_and_the_listing_requirement(
     fs.touch("a");
     h.deliver_watcher_events();
     let metadata = h.pending_job_for("a").expect("a metadata read");
-    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert_eq!(metadata.operation(), JobOperation::Metadata);
     assert!(h.complete_job(metadata.id));
     assert_eq!(h.result(t), None);
     h.advance(Duration::from_secs(600));
@@ -608,7 +620,7 @@ fn a_failed_metadata_read_keeps_the_initial_scan_recovery_reason() {
     fs.touch("a");
     h.deliver_watcher_events();
     let metadata = h.pending_job_for("a").expect("a metadata read");
-    assert_eq!(metadata.operation, JobOperation::Metadata);
+    assert_eq!(metadata.operation(), JobOperation::Metadata);
     assert!(h.complete_job(metadata.id));
     h.advance(Duration::from_secs(600));
     assert_eq!(h.entry("a").and_then(|e| e.load_state()), Some(LoadState::Loaded));
@@ -641,7 +653,12 @@ fn retry_deadlines_stay_armed_through_merge_clearing_and_removal() {
     assert_eq!(h.result(t), Some(Ok(())));
     assert!(!h.paths().contains(&"a".to_string()));
     let remaining = h.timer().map(|(_, at)| at).expect("periodic timer armed");
-    assert!(remaining > h.now() + Duration::from_secs(300), "{remaining:?}");
+    assert_eq!(
+        remaining,
+        h.now() + Duration::from_secs(300),
+        "RFC 12: with capacity the periodic timer is due no later than now plus maximum_period, however long the \
+         configured fixed interval is"
+    );
     h.advance(Duration::from_secs(1800));
     assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
 }
@@ -683,4 +700,33 @@ fn lost_root_probe_worker_schedules_another_probe() {
     h.advance(Duration::from_secs(600));
     assert!(h.paths().contains(&".".to_string()));
     assert!(matches!(h.health().root, tree_fucker::update::RootAvailability::Available { .. }));
+}
+
+#[test]
+fn a_listing_rejected_for_an_unrepresentable_name_reports_a_typed_error_and_no_filesystem_error() {
+    let fs = populated(WatcherKind::None);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    h.take_events();
+    fs.inject_child("a", "", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+
+    assert_eq!(
+        h.result(t),
+        Some(Err(Error::InvalidListing)),
+        "RFC 13.1: a listing rejected for an unrepresentable child name is a core-generated outcome, so its \
+         command completes with that outcome"
+    );
+    let causes = published_causes(&h);
+    assert!(
+        causes.iter().any(|c| matches!(c, ErrorCause::InvalidName(_))),
+        "RFC 20 item 5: the rejected name must be reported; the tree published {causes:?}"
+    );
+    assert!(
+        !causes.iter().any(|c| matches!(c, ErrorCause::Fs(_))),
+        "RFC 13.1: the core must not fabricate a filesystem error for an outcome it generated itself; it \
+         published {causes:?}"
+    );
+    assert!(h.paths().contains(&"a/f2".to_string()), "a rejected listing removed a child");
 }

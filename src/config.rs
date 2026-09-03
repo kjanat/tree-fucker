@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use crate::entry::MetadataFields;
 
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchRegistrationFailure {
     ReconcileOnly,
@@ -39,6 +41,8 @@ pub struct Config {
     pub update_stream_capacity: usize,
     pub watcher_path_limit: usize,
     pub entries_per_directory: usize,
+    pub entries_per_lease: usize,
+    pub operations_per_lease: usize,
     pub represented_entries: usize,
     pub transient_degrade_threshold: u32,
     pub retry_maximum_delay: Duration,
@@ -69,6 +73,8 @@ impl Default for Config {
             update_stream_capacity: 256,
             watcher_path_limit: 65536,
             entries_per_directory: 1_000_000,
+            entries_per_lease: 4096,
+            operations_per_lease: 256,
             represented_entries: 10_000_000,
             transient_degrade_threshold: 3,
             retry_maximum_delay: Duration::from_secs(300),
@@ -98,10 +104,11 @@ impl Config {
         if self.max_in_flight == 0 {
             return Err("max_in_flight must be greater than zero".into());
         }
-        if !self.background_duty.is_finite()
-            || self.background_duty <= 0.0
-            || self.background_duty > self.max_in_flight as f64
-        {
+        if !self.background_duty.is_finite() || self.background_duty <= 0.0 {
+            return Err("background_duty must be finite, greater than zero and at most max_in_flight".into());
+        }
+        let duty = Duration::try_from_secs_f64(self.background_duty).unwrap_or(Duration::MAX);
+        if duty > Duration::from_secs(u64::try_from(self.max_in_flight).unwrap_or(u64::MAX)) {
             return Err("background_duty must be finite, greater than zero and at most max_in_flight".into());
         }
         if self.background_burst.is_zero() {
@@ -112,6 +119,15 @@ impl Config {
         }
         if self.stuck_threshold.is_zero() {
             return Err("stuck_threshold must be greater than zero".into());
+        }
+        if self.entries_per_directory == 0 {
+            return Err("entries_per_directory must be at least 1".into());
+        }
+        if self.entries_per_lease == 0 {
+            return Err("entries_per_lease must be at least 1".into());
+        }
+        if self.operations_per_lease == 0 {
+            return Err("operations_per_lease must be at least 1".into());
         }
         if self.minimum_period.is_zero() || self.minimum_period > self.maximum_period {
             return Err("minimum_period must be greater than zero and at most maximum_period".into());
@@ -141,7 +157,9 @@ impl Config {
     }
 
     pub fn baseline_reservation(&self) -> usize {
-        let raw = (self.batch_size as f64 * self.baseline_share).floor() as usize;
+        let share = Duration::try_from_secs_f64(self.baseline_share).unwrap_or(Duration::ZERO).as_nanos();
+        let batch = u128::try_from(self.batch_size).unwrap_or(u128::MAX);
+        let raw = usize::try_from(batch.saturating_mul(share) / NANOS_PER_SECOND).unwrap_or(usize::MAX);
         raw.clamp(1, self.batch_size - 1)
     }
 }

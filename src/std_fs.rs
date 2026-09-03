@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
-    DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities, FsError, IdentitySource, KindSource,
-    MetadataSources, Observation, ObservationSources, ObservedKind, WatcherKind, WatcherSink,
+    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
+    FsError, IdentitySource, KindSource, Lease, ListingSession, MetadataSources, Observation, ObservationSources,
+    ObservedKind, SessionCost, SessionOutcome, WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -108,38 +110,14 @@ impl FileSystem for StdFileSystem {
         Ok(info_from(&metadata))
     }
 
-    fn read_dir(&self, root: &Path, path: &RelativePath) -> Result<DirectoryListing, FsError> {
-        let full = path.under(root);
-        let own = std::fs::symlink_metadata(&full)?;
-        let directory = info_from(&own);
-        if directory.kind != EntryKind::Directory {
-            return Err(FsError::NotDirectory);
-        }
-        let mut entries = Vec::new();
-        let mut metadata_operations = 0;
-        for item in std::fs::read_dir(&full)? {
-            let item = item?;
-            let kind = match item.file_type() {
-                Ok(file_type) => ObservedKind::Resolved(kind_of(file_type)),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => {
-                    metadata_operations += 1;
-                    match std::fs::symlink_metadata(item.path()) {
-                        Ok(metadata) => ObservedKind::Resolved(kind_of(metadata.file_type())),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(_) => ObservedKind::Unresolved,
-                    }
-                }
-            };
-            let info = Observation { kind, metadata: Metadata::default(), identity: inline_identity(&own, &item) };
-            entries.push(DirEntry { name: item.file_name(), info });
-        }
-        Ok(DirectoryListing {
-            directory,
-            entries,
-            supplied_fields: MetadataSources::PER_CHILD_READ.inline(),
-            metadata_operations,
-        })
+    fn open_listing(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        ceiling: usize,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        Box::new(StdSession { full: path.under(root), ceiling, cancel, opened: None, entries: Vec::new(), bytes: 0 })
     }
 
     fn observation_sources(&self, _path: &RelativePath) -> ObservationSources {
@@ -180,4 +158,129 @@ impl FileSystem for StdFileSystem {
     }
 
     fn unwatch(&self, _watch: WatchId) {}
+}
+
+const STD_CHUNK: usize = 1024;
+
+struct Opened {
+    directory: EntryInfo,
+    own: std::fs::Metadata,
+    iterator: std::fs::ReadDir,
+    exhausted: bool,
+}
+
+struct StdSession {
+    full: PathBuf,
+    ceiling: usize,
+    cancel: CancellationToken,
+    opened: Option<Opened>,
+    entries: Vec<DirEntry>,
+    bytes: u64,
+}
+
+impl StdSession {
+    fn open(&mut self, cost: &mut SessionCost) -> Result<(), FsError> {
+        if self.opened.is_some() {
+            return Ok(());
+        }
+        cost.listing_operations += 1;
+        let own = std::fs::symlink_metadata(&self.full)?;
+        let directory = info_from(&own);
+        if directory.kind != EntryKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let iterator = std::fs::read_dir(&self.full)?;
+        self.opened = Some(Opened { directory, own, iterator, exhausted: false });
+        Ok(())
+    }
+
+    fn chunk(&mut self, budget: usize, cost: &mut SessionCost) -> Result<usize, FsError> {
+        let Some(opened) = self.opened.as_mut() else {
+            return Ok(0);
+        };
+        let mut taken = 0;
+        while taken < budget {
+            let Some(item) = opened.iterator.next() else {
+                opened.exhausted = true;
+                return Ok(taken);
+            };
+            let item = item?;
+            let kind = match item.file_type() {
+                Ok(file_type) => ObservedKind::Resolved(kind_of(file_type)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    cost.metadata_operations += 1;
+                    cost.kind_resolutions += 1;
+                    match std::fs::symlink_metadata(item.path()) {
+                        Ok(metadata) => ObservedKind::Resolved(kind_of(metadata.file_type())),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => ObservedKind::Unresolved,
+                    }
+                }
+            };
+            let info =
+                Observation { kind, metadata: Metadata::default(), identity: inline_identity(&opened.own, &item) };
+            let name = item.file_name();
+            self.bytes += entry_bytes(&name);
+            self.entries.push(DirEntry { name, info });
+            taken += 1;
+            cost.entries_enumerated += 1;
+        }
+        Ok(taken)
+    }
+
+    fn complete(&mut self) -> SessionOutcome {
+        let Some(opened) = self.opened.as_ref() else {
+            return SessionOutcome::Failed(FsError::NotFound);
+        };
+        SessionOutcome::Complete(DirectoryListing {
+            directory: opened.directory,
+            entries: std::mem::take(&mut self.entries),
+            supplied_fields: MetadataSources::PER_CHILD_READ.inline(),
+        })
+    }
+}
+
+impl ListingSession for StdSession {
+    fn resume(mut self: Box<Self>, lease: Lease) -> (Continuation, SessionCost) {
+        let started = Instant::now();
+        let mut cost = SessionCost::default();
+        let finish = |cost: &mut SessionCost, bytes: u64, started: Instant, outcome: SessionOutcome| {
+            cost.blocking = Some(started.elapsed());
+            cost.bytes = bytes;
+            (Continuation::Finished(outcome), *cost)
+        };
+        if let Err(err) = self.open(&mut cost) {
+            return finish(&mut cost, self.bytes, started, SessionOutcome::Failed(err));
+        }
+        let mut entries_left = lease.entries;
+        let mut operations_left = lease.operations;
+        loop {
+            if self.cancel.is_cancelled() {
+                return finish(&mut cost, self.bytes, started, SessionOutcome::Cancelled);
+            }
+            if self.opened.as_ref().map(|o| o.exhausted).unwrap_or(true) {
+                let outcome = self.complete();
+                return finish(&mut cost, self.bytes, started, outcome);
+            }
+            if entries_left == 0 || operations_left == 0 {
+                cost.blocking = Some(started.elapsed());
+                cost.bytes = self.bytes;
+                return (Continuation::Suspended(self), cost);
+            }
+            let budget = STD_CHUNK.min(entries_left).min(operations_left);
+            let resolutions = cost.kind_resolutions;
+            let taken = match self.chunk(budget, &mut cost) {
+                Ok(taken) => taken,
+                Err(err) => return finish(&mut cost, self.bytes, started, SessionOutcome::Failed(err)),
+            };
+            let resolved = usize::try_from(cost.kind_resolutions - resolutions).unwrap_or(usize::MAX);
+            entries_left -= taken;
+            operations_left = operations_left.saturating_sub(taken.saturating_add(resolved));
+            if self.entries.len() > self.ceiling {
+                let seen = self.entries.len();
+                return finish(&mut cost, self.bytes, started, SessionOutcome::ResourceLimited { seen });
+            }
+        }
+    }
 }

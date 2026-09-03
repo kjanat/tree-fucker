@@ -128,6 +128,29 @@ impl ResourceHealth {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceLimit {
+    EntriesPerDirectory,
+    RepresentedEntries,
+}
+
+impl fmt::Display for ResourceLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceLimit::EntriesPerDirectory => f.write_str("entries per directory"),
+            ResourceLimit::RepresentedEntries => f.write_str("represented entries"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceLimitEvent {
+    pub path: RelativePath,
+    pub resource: ResourceLimit,
+    pub seen: u64,
+    pub limit: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShutdownState {
     Running,
@@ -165,6 +188,8 @@ pub enum ErrorCause {
     WatcherLost(String),
     WorkerLost,
     WorkerStuck,
+    ResultMismatch,
+    SnapshotRejected(crate::snapshot::BuildError),
 }
 
 impl fmt::Display for ErrorCause {
@@ -178,6 +203,8 @@ impl fmt::Display for ErrorCause {
             ErrorCause::WatcherLost(m) => write!(f, "watcher lost: {m}"),
             ErrorCause::WorkerLost => f.write_str("filesystem worker lost"),
             ErrorCause::WorkerStuck => f.write_str("filesystem worker stuck"),
+            ErrorCause::ResultMismatch => f.write_str("filesystem result does not match its job"),
+            ErrorCause::SnapshotRejected(e) => write!(f, "snapshot rejected the entry: {e:?}"),
         }
     }
 }

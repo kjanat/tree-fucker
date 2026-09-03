@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use super::governor::GrantId;
 use super::types::*;
-use super::{Coordinator, JobOperation, JobSpec, Output};
+use super::{Coordinator, JobSpec, ListingWork, Output, Work};
 use crate::entry::{LoadState, Shape};
+use crate::fs::{CancellationToken, Lease};
 use crate::ids::*;
 use crate::update::{RoundResult, ShutdownState};
 
@@ -60,12 +61,63 @@ impl Coordinator {
     }
 
     fn try_grant(&mut self, entry: Option<EntryId>, need: ReadNeed, path: &RelativePathOwned) -> Option<JobGrant> {
-        let id = self.next_job_id();
+        let id = self.next_job_id;
         let registration = entry.map(|e| self.needs_registration(e, need)).unwrap_or(false);
         let now = self.now;
-        match self.governor.try_admit(GrantId::Job(id), path.clone(), 1, u32::from(registration), now) {
-            Ok(_) => Some(JobGrant { id, registration }),
+        match self.governor.try_admit(GrantId::Job(id), path.clone(), 1, u32::from(registration), 0, now) {
+            Ok(_) => {
+                self.next_job_id = id.next();
+                Some(JobGrant { id, registration })
+            }
             Err(_) => None,
+        }
+    }
+
+    pub(super) fn resume_sessions(&mut self) {
+        if self.shutdown != ShutdownState::Running {
+            return;
+        }
+        let mut suspended: Vec<JobId> =
+            self.jobs.iter().filter(|(_, job)| job.phase == JobPhase::Suspended).map(|(id, _)| *id).collect();
+        suspended.sort();
+        for id in suspended {
+            let Some(job) = self.jobs.get(&id).cloned() else {
+                continue;
+            };
+            if !self.guards_valid(&job) {
+                self.stale_results += 1;
+                self.finish_job(id, JobOutcome::Stale);
+                continue;
+            }
+            let now = self.now;
+            let lease = job.leases;
+            if self.governor.try_admit(GrantId::Job(id), job.path.clone(), 1, 0, lease, now).is_err() {
+                continue;
+            }
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.phase = JobPhase::Queued;
+                job.leases = job.leases.saturating_add(1);
+            }
+            self.queue_order.push_back(id);
+        }
+    }
+
+    pub(super) fn suspend_job(&mut self, id: JobId) {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.phase = JobPhase::Suspended;
+        }
+    }
+
+    fn work_for(&self, job: &ActiveJob) -> Work {
+        match job.need {
+            ReadNeed::Listing => Work::Listing(ListingWork {
+                lease: Lease { entries: self.config.entries_per_lease, operations: self.config.operations_per_lease },
+                ceiling: self.config.entries_per_directory,
+                cancel: job.cancel.clone(),
+                resume: job.session_open,
+            }),
+            ReadNeed::Metadata => Work::Metadata,
+            ReadNeed::Enrichment(fields) => Work::Enrichment { fields },
         }
     }
 
@@ -112,18 +164,13 @@ impl Coordinator {
             };
             let phase = record.phase;
             let reasons = record.admission_reasons();
-            let need = phase.required_need();
+            let kind = phase.required_kind();
             let barriers = record.barriers.clone();
-            let still_required = match need {
-                ReadNeed::Listing => matches!(entry.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
-                ReadNeed::Enrichment(_) => entry.is_loaded(),
-                ReadNeed::Metadata => true,
-            };
-            if !still_required {
+            if !kind.still_required(&entry) {
                 self.entries.clear_retry(id);
                 continue;
             }
-            self.request(id, entry.path.clone(), need, reasons, barriers);
+            self.request(id, entry.path.clone(), kind.need(), reasons, barriers);
         }
     }
 
@@ -337,7 +384,8 @@ impl Coordinator {
             if counts[i] == 0 {
                 continue;
             }
-            let share = (slots as u64 * u64::from(weights[i]) / weight_sum) as usize;
+            let slots = u64::try_from(slots).unwrap_or(u64::MAX);
+            let share = usize::try_from(slots.saturating_mul(u64::from(weights[i])) / weight_sum).unwrap_or(usize::MAX);
             quota[i] = share.min(counts[i]);
             assigned += quota[i];
         }
@@ -415,7 +463,9 @@ impl Coordinator {
         let mut reasons = request.reasons;
         let mut barriers = request.barriers;
         if let Some(entry_id) = entry {
-            self.merge_retry_record(entry_id, request.need, &mut reasons, &mut barriers);
+            if let Some(kind) = request.need.kind() {
+                self.merge_retry_record(entry_id, kind, &mut reasons, &mut barriers);
+            }
             if reasons.initial_scan {
                 self.initial_scan.revive(entry_id);
             }
@@ -464,6 +514,9 @@ impl Coordinator {
             reasons,
             barriers,
             designated,
+            cancel: CancellationToken::new(),
+            leases: 1,
+            session_open: false,
         };
         if let Some(entry_id) = entry {
             self.active_by_entry.insert(entry_id, id);
@@ -481,14 +534,11 @@ impl Coordinator {
         id
     }
 
-    fn merge_retry_record(&self, entry: EntryId, need: ReadNeed, reasons: &mut Reasons, barriers: &mut Vec<CommandId>) {
-        if matches!(need, ReadNeed::Enrichment(_)) {
-            return;
-        }
+    fn merge_retry_record(&self, entry: EntryId, kind: ReadKind, reasons: &mut Reasons, barriers: &mut Vec<CommandId>) {
         let Some(record) = self.entries.retry(entry) else {
             return;
         };
-        if need < record.phase.required_need() {
+        if kind < record.phase.required_kind() {
             return;
         }
         reasons.merge(record.reasons);
@@ -581,20 +631,20 @@ impl Coordinator {
                 continue;
             }
             if !self.guards_valid(job) {
-                self.finish_job(id, JobOutcome::Cancelled);
+                self.cancel_job(id);
                 continue;
             }
-            let operation = Coordinator::operation_for(job.need);
+            let work = self.work_for(job);
             let now = self.now;
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.phase = JobPhase::Running(now);
             }
             self.governor.start(GrantId::Job(id), now);
-            self.dispatch_job(id, operation);
+            self.dispatch_job(id, work);
         }
     }
 
-    pub(super) fn dispatch_job(&mut self, id: JobId, operation: JobOperation) {
+    pub(super) fn dispatch_job(&mut self, id: JobId, work: Work) {
         let Some(job) = self.jobs.get(&id) else {
             return;
         };
@@ -602,8 +652,10 @@ impl Coordinator {
             return;
         };
         let path = job.path.clone();
-        self.blocking_slots.insert(id, Occupancy { path: path.clone(), operation, started });
-        self.outputs.push(Output::StartJob(JobSpec { id, path, operation }));
+        let spec = JobSpec { id, path: path.clone(), work };
+        let operation = spec.operation();
+        self.blocking_slots.insert(id, Occupancy { path, operation, started });
+        self.outputs.push(Output::StartJob(spec));
     }
 
     pub(super) fn job_terminal(&mut self, id: JobId) {
@@ -652,12 +704,6 @@ impl Coordinator {
     }
 
     pub(super) fn cancel_job(&mut self, id: JobId) {
-        let Some(job) = self.jobs.get(&id) else {
-            return;
-        };
-        if job.phase.started().is_some() {
-            self.outputs.push(Output::CancelJob(id));
-        }
         self.finish_job(id, JobOutcome::Cancelled);
     }
 }

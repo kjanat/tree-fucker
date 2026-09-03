@@ -5,8 +5,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
-    DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities, FsError, HintKind, IdentitySource,
-    KindSource, Observation, ObservationSources, ObservedKind, WatcherEvent, WatcherKind, WatcherSink,
+    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
+    FsError, HintKind, IdentitySource, KindSource, Lease, ListingSession, Observation, ObservationSources,
+    ObservedKind, SessionCost, SessionOutcome, WatcherEvent, WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -15,7 +16,9 @@ use crate::path::{CaseSensitivity, RelativePath};
 pub enum FakeOp {
     Metadata,
     ReadDir,
+    Chunk,
     ResolveKind,
+    ResolveIdentity,
     Enrich,
     Watch,
 }
@@ -107,12 +110,16 @@ struct Inner {
     sources: HashMap<DomainId, ObservationSources>,
     default_sources: ObservationSources,
     unknown_kinds: BTreeSet<RelativePath>,
+    chunk: usize,
+    ignore_cancellation: bool,
 }
 
 pub struct FakeFileSystem {
     root: PathBuf,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
+
+const DEFAULT_CHUNK: usize = 1024;
 
 fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
     match inner.lock() {
@@ -148,7 +155,7 @@ impl FakeFileSystem {
         );
         FakeFileSystem {
             root: PathBuf::from("/fake"),
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 nodes,
                 root_present: true,
                 caps,
@@ -170,7 +177,9 @@ impl FakeFileSystem {
                 sources: HashMap::new(),
                 default_sources: ObservationSources::INLINE,
                 unknown_kinds: BTreeSet::new(),
-            }),
+                chunk: DEFAULT_CHUNK,
+                ignore_cancellation: false,
+            })),
         }
     }
 
@@ -500,18 +509,15 @@ impl FakeFileSystem {
         }
     }
 
-    fn observe(inner: &mut Inner, path: &RelativePath, info: EntryInfo) -> (Observation, u32) {
+    fn observe(inner: &mut Inner, path: &RelativePath, info: EntryInfo) -> (Observation, ChildWork) {
         let sources = Self::sources_for(inner, path);
-        let identity = match sources.identity {
-            IdentitySource::Inline => info.identity,
-            IdentitySource::PerChildRead | IdentitySource::None => None,
-        };
         let metadata = info.metadata.project(sources.metadata.inline());
-        let mut operations = 0;
+        let mut work = ChildWork::default();
         let kind = match Self::enumerated_kind(inner, path, info.kind) {
             ObservedKind::Resolved(kind) => ObservedKind::Resolved(kind),
             ObservedKind::Unresolved => {
-                operations += 1;
+                work.kind_resolutions += 1;
+                work.blocking += Self::scoped_cost(inner, FakeOp::ResolveKind, path);
                 inner.ops.push((FakeOp::ResolveKind, path.clone()));
                 match Self::take_failure(inner, path, FakeOp::ResolveKind) {
                     Some(_) => ObservedKind::Unresolved,
@@ -522,19 +528,89 @@ impl FakeFileSystem {
                 }
             }
         };
-        (Observation { kind, metadata, identity }, operations)
+        let identity = match sources.identity {
+            IdentitySource::Inline => info.identity,
+            IdentitySource::None => None,
+            IdentitySource::PerChildRead => {
+                work.identity_reads += 1;
+                work.blocking += Self::scoped_cost(inner, FakeOp::ResolveIdentity, path);
+                inner.ops.push((FakeOp::ResolveIdentity, path.clone()));
+                match Self::take_failure(inner, path, FakeOp::ResolveIdentity) {
+                    Some(_) => None,
+                    None => Self::lookup(inner, path).ok().and_then(|resolved| resolved.identity),
+                }
+            }
+        };
+        (Observation { kind, metadata, identity }, work)
+    }
+
+    fn child_operations(inner: &Inner, path: &RelativePath, kind: EntryKind) -> usize {
+        let sources = Self::sources_for(inner, path);
+        let unresolved = usize::from(Self::enumerated_kind(inner, path, kind) == ObservedKind::Unresolved);
+        let identity = usize::from(sources.identity == IdentitySource::PerChildRead);
+        unresolved + identity
+    }
+
+    fn child_cost(inner: &Inner, path: &RelativePath, kind: EntryKind) -> Duration {
+        let sources = Self::sources_for(inner, path);
+        let mut total = Duration::ZERO;
+        if Self::enumerated_kind(inner, path, kind) == ObservedKind::Unresolved {
+            total += Self::scoped_cost(inner, FakeOp::ResolveKind, path);
+        }
+        if sources.identity == IdentitySource::PerChildRead {
+            total += Self::scoped_cost(inner, FakeOp::ResolveIdentity, path);
+        }
+        total
+    }
+
+    pub fn ignore_cancellation(&self, ignore: bool) {
+        lock(&self.inner).ignore_cancellation = ignore;
+    }
+
+    pub fn set_chunk_size(&self, chunk: usize) {
+        lock(&self.inner).chunk = chunk.max(1);
+    }
+
+    pub fn chunk_size(&self) -> usize {
+        lock(&self.inner).chunk
     }
 
     pub fn listing_cost(&self, path: &RelativePath) -> Duration {
+        self.lease_cost(path, true, 0, usize::MAX)
+    }
+
+    pub fn lease_cost(&self, path: &RelativePath, first: bool, skip: usize, take: usize) -> Duration {
         let inner = lock(&self.inner);
-        let mut total = Self::scoped_cost(&inner, FakeOp::ReadDir, path);
-        for child in Self::child_paths(&inner, path) {
-            let kind = inner.nodes.get(&child).map(|info| info.kind).unwrap_or(EntryKind::Other);
-            if Self::enumerated_kind(&inner, &child, kind) == ObservedKind::Unresolved {
-                total += Self::scoped_cost(&inner, FakeOp::ResolveKind, &child);
-            }
+        let mut total = Self::scoped_cost(&inner, if first { FakeOp::ReadDir } else { FakeOp::Chunk }, path);
+        for (_, child, info) in Self::enumeration_order(&inner, path).into_iter().skip(skip).take(take) {
+            let Some(child) = child else {
+                continue;
+            };
+            total += Self::child_cost(&inner, &child, info.kind);
         }
         total
+    }
+
+    fn enumeration_order(
+        inner: &Inner,
+        path: &RelativePath,
+    ) -> Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> {
+        let real: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> = inner
+            .nodes
+            .iter()
+            .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
+            .filter_map(|(k, info)| Some((k.file_name()?.to_os_string(), Some(k.clone()), *info)))
+            .collect();
+        let injected: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> = inner
+            .injected
+            .iter()
+            .filter(|c| c.dir == *path)
+            .map(|c| (c.name.clone(), path.join(&c.name).ok(), c.info))
+            .collect();
+        match inner.injected_position {
+            InjectedPosition::Last => real.into_iter().chain(injected).collect(),
+            InjectedPosition::First => injected.into_iter().chain(real).collect(),
+        }
     }
 
     pub fn enrichment_cost(&self, path: &RelativePath) -> Duration {
@@ -740,51 +816,29 @@ impl FileSystem for FakeFileSystem {
         Self::lookup(&inner, path)
     }
 
-    fn read_dir(&self, _root: &Path, path: &RelativePath) -> Result<DirectoryListing, FsError> {
-        let mut inner = lock(&self.inner);
-        inner.ops.push((FakeOp::ReadDir, path.clone()));
-        if Self::take_panic(&mut inner, path, FakeOp::ReadDir) {
-            drop(inner);
-            panic!("injected listing panic for {path}");
-        }
-        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::ReadDir) {
-            return Err(err);
-        }
-        let directory = Self::lookup(&inner, path)?;
-        if directory.kind != EntryKind::Directory {
-            return Err(FsError::NotDirectory);
-        }
-        let real: Vec<(Option<RelativePath>, std::ffi::OsString, EntryInfo)> = inner
-            .nodes
-            .iter()
-            .filter(|(k, _)| k.parent().map(|p| p == *path).unwrap_or(false))
-            .filter_map(|(k, info)| Some((Some(k.clone()), k.file_name()?.to_os_string(), *info)))
-            .collect();
-        let injected: Vec<(Option<RelativePath>, std::ffi::OsString, EntryInfo)> = inner
-            .injected
-            .iter()
-            .filter(|c| c.dir == *path)
-            .map(|c| (path.join(&c.name).ok(), c.name.clone(), c.info))
-            .collect();
-        let observed: Vec<(Option<RelativePath>, std::ffi::OsString, EntryInfo)> = match inner.injected_position {
-            InjectedPosition::Last => real.into_iter().chain(injected).collect(),
-            InjectedPosition::First => injected.into_iter().chain(real).collect(),
+    fn open_listing(
+        &self,
+        _root: &Path,
+        path: &RelativePath,
+        ceiling: usize,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        let (chunk, observes_cancellation) = {
+            let inner = lock(&self.inner);
+            (inner.chunk, !inner.ignore_cancellation)
         };
-        let mut entries = Vec::with_capacity(observed.len());
-        let mut metadata_operations = 0;
-        for (child, name, info) in observed {
-            let observation = match child {
-                Some(child) => {
-                    let (observation, operations) = Self::observe(&mut inner, &child, info);
-                    metadata_operations += operations;
-                    observation
-                }
-                None => Observation::resolved(info),
-            };
-            entries.push(DirEntry { name, info: observation });
-        }
-        let supplied_fields = Self::sources_for(&inner, path).metadata.inline();
-        Ok(DirectoryListing { directory, entries, supplied_fields, metadata_operations })
+        Box::new(FakeSession {
+            inner: self.inner.clone(),
+            path: path.clone(),
+            ceiling,
+            cancel,
+            chunk,
+            observes_cancellation,
+            opened: None,
+            cursor: 0,
+            entries: Vec::new(),
+            bytes: 0,
+        })
     }
 
     fn observation_sources(&self, path: &RelativePath) -> ObservationSources {
@@ -849,5 +903,162 @@ impl FileSystem for FakeFileSystem {
 
     fn unwatch(&self, watch: WatchId) {
         lock(&self.inner).watches.remove(&watch);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChildWork {
+    kind_resolutions: u32,
+    identity_reads: u32,
+    blocking: Duration,
+}
+
+struct OpenedDirectory {
+    directory: EntryInfo,
+    supplied_fields: MetadataFields,
+    order: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)>,
+}
+
+struct FakeSession {
+    inner: Arc<Mutex<Inner>>,
+    path: RelativePath,
+    ceiling: usize,
+    cancel: CancellationToken,
+    chunk: usize,
+    observes_cancellation: bool,
+    opened: Option<OpenedDirectory>,
+    cursor: usize,
+    entries: Vec<DirEntry>,
+    bytes: u64,
+}
+
+impl FakeSession {
+    fn open(&mut self, cost: &mut SessionCost, blocking: &mut Duration) -> Result<(), FsError> {
+        if self.opened.is_some() {
+            *blocking += FakeFileSystem::scoped_cost(&lock(&self.inner), FakeOp::Chunk, &self.path);
+            return Ok(());
+        }
+        cost.listing_operations += 1;
+        let mut inner = lock(&self.inner);
+        *blocking += FakeFileSystem::scoped_cost(&inner, FakeOp::ReadDir, &self.path);
+        inner.ops.push((FakeOp::ReadDir, self.path.clone()));
+        if FakeFileSystem::take_panic(&mut inner, &self.path, FakeOp::ReadDir) {
+            drop(inner);
+            panic!("injected listing panic for {}", self.path);
+        }
+        if let Some(err) = FakeFileSystem::take_failure(&mut inner, &self.path, FakeOp::ReadDir) {
+            return Err(err);
+        }
+        let directory = FakeFileSystem::lookup(&inner, &self.path)?;
+        if directory.kind != EntryKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let supplied_fields = FakeFileSystem::sources_for(&inner, &self.path).metadata.inline();
+        let order = FakeFileSystem::enumeration_order(&inner, &self.path);
+        self.opened = Some(OpenedDirectory { directory, supplied_fields, order });
+        Ok(())
+    }
+
+    fn affordable(&self, entries: usize, operations: usize) -> (usize, usize) {
+        let Some(opened) = self.opened.as_ref() else {
+            return (0, 0);
+        };
+        let inner = lock(&self.inner);
+        let window = self.chunk.min(entries).min(opened.order.len() - self.cursor);
+        let mut needed = 0;
+        let mut fits = 0;
+        for offset in 0..window {
+            let (_, child, info) = &opened.order[self.cursor + offset];
+            let extra = match child {
+                Some(child) => FakeFileSystem::child_operations(&inner, child, info.kind),
+                None => 0,
+            };
+            if needed + extra > operations {
+                break;
+            }
+            needed += extra;
+            fits = offset + 1;
+        }
+        (fits, needed)
+    }
+
+    fn consume(&mut self, count: usize, cost: &mut SessionCost, blocking: &mut Duration) {
+        let Some(opened) = self.opened.as_ref() else {
+            return;
+        };
+        let mut inner = lock(&self.inner);
+        for offset in 0..count {
+            let (name, child, info) = opened.order[self.cursor + offset].clone();
+            let observation = match child {
+                Some(child) => {
+                    let (observation, work) = FakeFileSystem::observe(&mut inner, &child, info);
+                    cost.kind_resolutions += work.kind_resolutions;
+                    cost.metadata_operations += work.kind_resolutions;
+                    cost.identity_reads += work.identity_reads;
+                    *blocking += work.blocking;
+                    observation
+                }
+                None => Observation::resolved(info),
+            };
+            self.bytes += entry_bytes(&name);
+            self.entries.push(DirEntry { name, info: observation });
+        }
+        drop(inner);
+        self.cursor += count;
+        cost.entries_enumerated += u64::try_from(count).unwrap_or(u64::MAX);
+    }
+
+    fn exhausted(&self) -> bool {
+        self.opened.as_ref().map(|o| self.cursor >= o.order.len()).unwrap_or(true)
+    }
+
+    fn complete(&mut self) -> SessionOutcome {
+        let Some(opened) = self.opened.as_ref() else {
+            return SessionOutcome::Failed(FsError::NotFound);
+        };
+        SessionOutcome::Complete(DirectoryListing {
+            directory: opened.directory,
+            entries: std::mem::take(&mut self.entries),
+            supplied_fields: opened.supplied_fields,
+        })
+    }
+}
+
+impl ListingSession for FakeSession {
+    fn resume(mut self: Box<Self>, lease: Lease) -> (Continuation, SessionCost) {
+        let mut cost = SessionCost::default();
+        let mut blocking = Duration::ZERO;
+        let finish = |cost: &mut SessionCost, bytes: u64, blocking: Duration, outcome: SessionOutcome| {
+            cost.blocking = Some(blocking);
+            cost.bytes = bytes;
+            (Continuation::Finished(outcome), *cost)
+        };
+        if let Err(err) = self.open(&mut cost, &mut blocking) {
+            return finish(&mut cost, self.bytes, blocking, SessionOutcome::Failed(err));
+        }
+        let mut entries_left = lease.entries;
+        let mut operations_left = lease.operations;
+        loop {
+            if self.observes_cancellation && self.cancel.is_cancelled() {
+                return finish(&mut cost, self.bytes, blocking, SessionOutcome::Cancelled);
+            }
+            if self.exhausted() {
+                let outcome = self.complete();
+                return finish(&mut cost, self.bytes, blocking, outcome);
+            }
+            let (take, needed) = self.affordable(entries_left, operations_left);
+            if take == 0 {
+                cost.blocking = Some(blocking);
+                cost.bytes = self.bytes;
+                return (Continuation::Suspended(self), cost);
+            }
+            self.consume(take, &mut cost, &mut blocking);
+            entries_left -= take;
+            operations_left -= needed;
+            if self.entries.len() > self.ceiling {
+                let seen = self.entries.len();
+                return finish(&mut cost, self.bytes, blocking, SessionOutcome::ResourceLimited { seen });
+            }
+        }
     }
 }

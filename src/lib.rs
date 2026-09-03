@@ -17,9 +17,10 @@ pub use config::{ClassWeights, Config, LagMode, WatchRegistrationFailure};
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};
 pub use fs::{
-    DirEntry, DirectoryListing, Enrichment, EntryInfo, FieldSource, FileSystem, FsCapabilities, FsError, HintKind,
-    IdentitySource, KindSource, MetadataSources, Observation, ObservationSources, ObservedKind, WatcherEvent,
-    WatcherKind, WatcherSink,
+    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FieldSource, FileSystem,
+    FsCapabilities, FsError, HintKind, IdentitySource, KindSource, Lease, ListingSession, MetadataSources, Observation,
+    ObservationSources, ObservedKind, SessionCost, SessionOutcome, SessionState, SessionStep, WatcherEvent,
+    WatcherKind, WatcherSink, entry_bytes, list_directory,
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,
@@ -31,6 +32,6 @@ pub use snapshot::Snapshot;
 pub use tree::{Tree, TreeHandle, UpdateStream};
 pub use update::{
     ErrorCause, Health, InitialScanState, Operation, PathChange, ReconciliationHealth, RecoverableError,
-    ResourceHealth, RootAvailability, RoundResult, ShutdownState, StreamError, ThrottleCause, Update, UpdateEvent,
-    WatcherHealth,
+    ResourceHealth, ResourceLimit, ResourceLimitEvent, RootAvailability, RoundResult, ShutdownState, StreamError,
+    ThrottleCause, Update, UpdateEvent, WatcherHealth,
 };

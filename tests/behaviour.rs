@@ -678,7 +678,12 @@ fn malformed_listing_fails_the_refresh_and_keeps_the_previous_children() {
     fs.inject_child("a", "", EntryKind::File);
     let t = h.command(Command::Refresh(vec![path("a")]));
     h.run_until_idle();
-    assert!(matches!(h.result(t), Some(Err(Error::Io(FsError::Transient(_))))));
+    assert_eq!(
+        h.result(t),
+        Some(Err(Error::InvalidListing)),
+        "RFC 13.1: a listing rejected for an unrepresentable child name is a core-generated outcome, not a \
+         filesystem error"
+    );
     assert!(h.paths().contains(&"a/f2".to_string()));
     assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), 2);
     fs.clear_injected_children();

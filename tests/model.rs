@@ -13,6 +13,7 @@ const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
 const BACKGROUND_BURST_GLOBAL: Duration = Duration::from_millis(500);
 const MAXIMUM_PERIOD: Duration = Duration::from_secs(300);
 const INITIAL_COST_ESTIMATE: Duration = Duration::from_millis(20);
+const DEFAULT_CHUNK: usize = 1024;
 
 struct Lcg(u64);
 
@@ -26,7 +27,7 @@ impl Lcg {
         if items.is_empty() {
             None
         } else {
-            let index = (self.next() as usize) % items.len();
+            let index = usize::try_from(self.next()).unwrap_or(usize::MAX) % items.len();
             items.get(index)
         }
     }
@@ -68,7 +69,15 @@ struct Run {
     phase_admissions: Vec<tree_fucker::testing::Admission>,
 }
 
+fn chunked() -> Config {
+    Config { entries_per_lease: 2, operations_per_lease: 2, ..Default::default() }
+}
+
 fn random_history(seed: u64) -> Run {
+    random_history_with(seed, Config::default(), DEFAULT_CHUNK)
+}
+
+fn random_history_with(seed: u64, config: Config, chunk: usize) -> Run {
     let mut rng = Lcg(seed);
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(5 + seed * 3));
@@ -83,7 +92,8 @@ fn random_history(seed: u64) -> Run {
         fs.create_file(&file, 1);
         known.push(file);
     }
-    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    fs.set_chunk_size(chunk);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     fs.clear_ops();
     settle(&mut h);
     for step in 0..40 {
@@ -111,7 +121,7 @@ fn random_history(seed: u64) -> Run {
                 if let Some(target) = rng.pick(&known).cloned()
                     && reachable(&fs, &target).is_some()
                 {
-                    fs.set_size_silently(&target, step as u64);
+                    fs.set_size_silently(&target, u64::try_from(step).unwrap_or(u64::MAX));
                 }
             }
             _ => {
@@ -182,19 +192,74 @@ fn reserved_worker_time_over_every_window_of_a_random_history_stays_within_the_e
     let budget = envelope(BACKGROUND_DUTY_GLOBAL, BACKGROUND_BURST_GLOBAL, MAXIMUM_PERIOD);
     let mut worst = Duration::ZERO;
     let mut worst_seed = 0;
+    let mut worst_shape = "whole listings";
     for seed in 1..12u64 {
-        let run = random_history(seed);
-        let (_, seed_worst) = run.harness.worst_reserved_window(MAXIMUM_PERIOD);
-        if seed_worst > worst {
-            worst = seed_worst;
-            worst_seed = seed;
+        for (shape, config, chunk) in
+            [("whole listings", Config::default(), DEFAULT_CHUNK), ("chunked listings", chunked(), 1)]
+        {
+            let run = random_history_with(seed, config, chunk);
+            let (_, seed_worst) = run.harness.worst_reserved_window(MAXIMUM_PERIOD);
+            if seed_worst > worst {
+                worst = seed_worst;
+                worst_seed = seed;
+                worst_shape = shape;
+            }
         }
     }
     assert!(
         worst <= budget,
-        "RFC 15.3 with the RFC 9.2 host defaults: seed {worst_seed} reserved {worst:?} of worker time at \
-         admission over a {MAXIMUM_PERIOD:?} window, above the rate times window plus burst budget of {budget:?}"
+        "RFC 15.3 with the RFC 9.2 host defaults: seed {worst_seed} over {worst_shape} reserved {worst:?} of \
+         worker time at admission over a {MAXIMUM_PERIOD:?} window, above the rate times window plus burst \
+         budget of {budget:?}"
     );
+}
+
+#[test]
+fn chunked_listings_in_a_random_history_converge_and_hold_a_lease_for_every_operation() {
+    for seed in 1..8u64 {
+        let run = random_history_with(seed, chunked(), 1);
+        assert_eq!(
+            run.harness.health().reconciliation.last_round,
+            Some(RoundResult::Successful),
+            "RFC 5.2 and 10.2: chunked, leased listings must still converge; seed {seed}"
+        );
+        let mut expected: Vec<String> = Vec::new();
+        for name in &run.known {
+            if reachable(&run.fs, name).is_some() {
+                expected.push(name.clone());
+            }
+        }
+        expected.push(".".into());
+        expected.sort();
+        expected.dedup();
+        let mut actual = run.harness.paths();
+        actual.sort();
+        assert_eq!(actual, expected, "seed {seed}");
+
+        let mut granted: BTreeMap<RelativePath, usize> = BTreeMap::new();
+        for admission in &run.phase_admissions {
+            *granted.entry(admission.entry.clone()).or_default() += 1;
+        }
+        let mut performed: BTreeMap<RelativePath, usize> = BTreeMap::new();
+        for (op, target) in &run.phase_ops {
+            if *op == FakeOp::Watch {
+                continue;
+            }
+            *performed.entry(target.clone()).or_default() += 1;
+        }
+        for (target, count) in &performed {
+            let grants = granted.get(target).copied().unwrap_or(0);
+            assert!(
+                grants >= *count,
+                "RFC 15.1 item 1 and 10.2: seed {seed}: {count} filesystem operations ran for {target} against \
+                 {grants} logged grants, so an operation ran without a grant or a lease"
+            );
+        }
+        assert!(
+            run.harness.stats().lease_grants > 0,
+            "seed {seed} took no further lease, so the chunked property was never tested"
+        );
+    }
 }
 
 #[test]
@@ -266,6 +331,16 @@ fn a_bucket_in_debt_admits_nothing_until_the_debt_is_repaid() {
         !admitted.is_empty(),
         "RFC 5.2: convergence must resume once the bucket refills; nothing was admitted by {target:?}"
     );
+
+    assert!(h.governor().denials > 0, "the history recorded no denial, so contiguity was never tested");
+    let mut ids: Vec<u64> = h.admissions().iter().map(|a| a.job.get()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let expected: Vec<u64> = (1..=u64::try_from(ids.len()).unwrap_or(u64::MAX)).collect();
+    assert_eq!(
+        ids, expected,
+        "RFC 15.3: governor denial is not an admission outcome, so a denied job must consume no JobId; the          admitted ids have holes"
+    );
 }
 
 #[test]
@@ -310,7 +385,7 @@ fn random_silent_mutations_converge_after_successful_round() {
                     if let Some(target) = rng.pick(&known).cloned()
                         && reachable(&fs, &target).is_some()
                     {
-                        fs.set_size_silently(&target, step as u64);
+                        fs.set_size_silently(&target, u64::try_from(step).unwrap_or(u64::MAX));
                     }
                 }
                 _ => {

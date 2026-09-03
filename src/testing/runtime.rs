@@ -259,7 +259,7 @@ impl HoldingRuntime {
     }
 
     pub fn hold_next(&self, count: usize) {
-        self.budget.store(count as u64, Ordering::SeqCst);
+        self.budget.store(u64::try_from(count).unwrap_or(u64::MAX), Ordering::SeqCst);
     }
 
     pub fn held(&self) -> usize {
@@ -267,11 +267,11 @@ impl HoldingRuntime {
     }
 
     pub fn cancels(&self) -> usize {
-        self.cancels.load(Ordering::SeqCst) as usize
+        usize::try_from(self.cancels.load(Ordering::SeqCst)).unwrap_or(usize::MAX)
     }
 
     pub fn dropped_handles(&self) -> usize {
-        self.drops.load(Ordering::SeqCst) as usize
+        usize::try_from(self.drops.load(Ordering::SeqCst)).unwrap_or(usize::MAX)
     }
 
     pub fn release(&self) {

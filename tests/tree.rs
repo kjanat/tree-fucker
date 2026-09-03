@@ -505,3 +505,51 @@ fn fatal_termination_with_a_registration_outstanding_reports_the_same_error_befo
     inner.run_until_stalled();
     assert_eq!(inner.block_on(handle.refresh(vec![path("c")])), Err(Error::TreeTerminated));
 }
+
+#[test]
+fn a_job_cancelled_while_its_worker_is_held_leaves_no_listing_session_behind() {
+    let runtime = Arc::new(DeterministicRuntime::new());
+    let holding = Arc::new(HoldingRuntime::new(runtime.clone()));
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("wide");
+    for i in 0..8 {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    fs.set_chunk_size(1);
+    fs.ignore_cancellation(true);
+    let config = Config { entries_per_lease: 2, ..Default::default() };
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = holding.clone();
+    let (handle, _stream) =
+        runtime.block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), config, rt)).expect("open");
+    runtime.block_on(handle.initial_scan_complete()).expect("scan");
+    assert_eq!(handle.held_listing_sessions(), 0, "the initial scan left a listing session behind");
+
+    holding.hold();
+    let mut refresh = Box::pin(handle.refresh(vec![path("wide")]));
+    assert!(poll_once(refresh.as_mut()).is_pending());
+    runtime.run_until_stalled();
+    assert_eq!(holding.held(), 1, "the refresh listing never reached the blocking pool");
+
+    holding.release();
+    runtime.run_until_stalled();
+    assert_eq!(
+        handle.held_listing_sessions(),
+        1,
+        "the first lease did not suspend with its session held for the next one"
+    );
+    assert_eq!(holding.held(), 1, "the next lease never reached the blocking pool");
+
+    let mut unload = Box::pin(handle.unload(path("wide")));
+    assert!(poll_once(unload.as_mut()).is_pending());
+    runtime.run_until_stalled();
+
+    holding.release();
+    runtime.run_until_stalled();
+    assert_eq!(
+        handle.held_listing_sessions(),
+        0,
+        "RFC 10.2: a worker whose job was cancelled while it held the session must drop it, not hand it back"
+    );
+    assert_eq!(runtime.block_on(unload), Ok(()));
+    assert_eq!(handle.snapshot().get(&path("wide")).and_then(|e| e.load_state()), Some(LoadState::Unloaded));
+}

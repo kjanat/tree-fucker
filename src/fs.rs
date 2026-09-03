@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::ids::WatchId;
@@ -101,7 +103,129 @@ pub struct DirectoryListing {
     pub directory: EntryInfo,
     pub entries: Vec<DirEntry>,
     pub supplied_fields: MetadataFields,
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn new() -> CancellationToken {
+        CancellationToken(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl PartialEq for CancellationToken {
+    fn eq(&self, other: &CancellationToken) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CancellationToken {}
+
+impl fmt::Debug for CancellationToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CancellationToken({})", self.is_cancelled())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Lease {
+    pub entries: usize,
+    pub operations: usize,
+}
+
+impl Lease {
+    pub const UNBOUNDED: Lease = Lease { entries: usize::MAX, operations: usize::MAX };
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionCost {
+    pub blocking: Option<Duration>,
+    pub listing_operations: u32,
     pub metadata_operations: u32,
+    pub kind_resolutions: u32,
+    pub identity_reads: u32,
+    pub entries_enumerated: u64,
+    pub bytes: u64,
+}
+
+impl SessionCost {
+    pub fn per_child_operations(&self) -> u32 {
+        self.metadata_operations.saturating_add(self.identity_reads)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionOutcome {
+    Complete(DirectoryListing),
+    Cancelled,
+    ResourceLimited { seen: usize },
+    Failed(FsError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Suspended,
+    Finished(SessionOutcome),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionStep {
+    pub cost: SessionCost,
+    pub state: SessionState,
+}
+
+impl SessionStep {
+    pub fn suspended(cost: SessionCost) -> SessionStep {
+        SessionStep { cost, state: SessionState::Suspended }
+    }
+
+    pub fn finished(cost: SessionCost, outcome: SessionOutcome) -> SessionStep {
+        SessionStep { cost, state: SessionState::Finished(outcome) }
+    }
+
+    pub fn complete(listing: DirectoryListing) -> SessionStep {
+        SessionStep::finished(SessionCost::default(), SessionOutcome::Complete(listing))
+    }
+
+    pub fn cancelled() -> SessionStep {
+        SessionStep::finished(SessionCost::default(), SessionOutcome::Cancelled)
+    }
+
+    pub fn failed(error: FsError) -> SessionStep {
+        SessionStep::finished(SessionCost::default(), SessionOutcome::Failed(error))
+    }
+}
+
+pub enum Continuation {
+    Suspended(Box<dyn ListingSession>),
+    Finished(SessionOutcome),
+}
+
+pub trait ListingSession: Send {
+    fn resume(self: Box<Self>, lease: Lease) -> (Continuation, SessionCost);
+}
+
+pub fn list_directory(filesystem: &dyn FileSystem, root: &Path, path: &RelativePath, ceiling: usize) -> SessionOutcome {
+    let mut session = filesystem.open_listing(root, path, ceiling, CancellationToken::new());
+    loop {
+        match session.resume(Lease::UNBOUNDED).0 {
+            Continuation::Suspended(next) => session = next,
+            Continuation::Finished(outcome) => return outcome,
+        }
+    }
+}
+
+pub fn entry_bytes(name: &std::ffi::OsStr) -> u64 {
+    u64::try_from(std::mem::size_of::<DirEntry>() + name.len()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,7 +370,13 @@ pub trait FileSystem: Send + Sync {
     fn canonicalize(&self, root: &Path) -> Result<PathBuf, FsError>;
     fn observation_sources(&self, path: &RelativePath) -> ObservationSources;
     fn metadata(&self, root: &Path, path: &RelativePath) -> Result<EntryInfo, FsError>;
-    fn read_dir(&self, root: &Path, path: &RelativePath) -> Result<DirectoryListing, FsError>;
+    fn open_listing(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        ceiling: usize,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession>;
     fn enrich(&self, root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError>;
     fn watch(
         &self,

@@ -1,14 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tree_fucker::core::JobOperation;
+use tree_fucker::core::{Command, JobOperation};
 use tree_fucker::testing::DomainId;
 use tree_fucker::testing::{CostScope, FailureMode, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{ErrorCause, RoundResult};
+use tree_fucker::update::{ErrorCause, RoundResult, UpdateEvent};
 use tree_fucker::{
-    Config, EntryKind, FieldSource, FsError, IdentitySource, KindSource, LoadAll, MetadataFields, MetadataSources,
-    ObservationSources, RelativePath, WatcherKind,
+    Config, EntryKind, Error, FieldSource, FsError, IdentitySource, KindSource, LoadAll, MetadataFields,
+    MetadataSources, ObservationSources, RelativePath, WatcherKind,
 };
+
+const PER_CHILD_IDENTITY: DomainId = DomainId::new(7);
+const NO_IDENTITY: DomainId = DomainId::new(8);
 
 fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
@@ -35,6 +38,18 @@ fn populated() -> Arc<FakeFileSystem> {
     fs.mkdir("c");
     fs.create_file("root.txt", 5);
     fs
+}
+
+fn published_causes(h: &Harness) -> Vec<ErrorCause> {
+    h.events()
+        .iter()
+        .flat_map(|event| match event {
+            UpdateEvent::Delta(update) => update.errors.clone(),
+            UpdateEvent::Health { errors, .. } | UpdateEvent::Reset { errors, .. } => errors.clone(),
+            UpdateEvent::Terminal { .. } => Vec::new(),
+        })
+        .map(|e| e.error)
+        .collect()
 }
 
 fn per_child_metadata_operations(fs: &FakeFileSystem) -> Vec<(FakeOp, RelativePath)> {
@@ -307,4 +322,115 @@ fn a_domain_declares_per_item_whether_observation_costs_a_per_child_operation() 
         "RFC 10.1: on Unix every metadata field requires a per-child read while the inode is inline"
     );
     assert_eq!(child.metadata.inline(), MetadataFields::NONE);
+}
+
+#[test]
+fn a_listing_rejected_for_an_unresolved_child_reports_a_typed_error_and_no_filesystem_error() {
+    let fs = populated();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    h.take_events();
+
+    fs.set_default_sources(ObservationSources {
+        kind: KindSource::Sometimes,
+        identity: IdentitySource::Inline,
+        metadata: MetadataSources::INLINE,
+    });
+    fs.report_unknown_kind("a/late");
+    fs.fail("a/late", FakeOp::ResolveKind, FailureMode::Always(FsError::Transient("no kind".into())));
+    fs.add_silently("a/late", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    h.run_until_idle();
+
+    assert_eq!(
+        h.result(t),
+        Some(Err(Error::UnresolvedKind)),
+        "RFC 13.1 and 10.1: a listing rejected for an unresolved child kind is a core-generated outcome, so its \
+         command completes with that outcome"
+    );
+    let causes = published_causes(&h);
+    assert!(
+        causes.iter().any(|c| matches!(c, ErrorCause::UnresolvedKind(_))),
+        "RFC 10.1: the unresolved child must be reported; the tree published {causes:?}"
+    );
+    assert!(
+        !causes.iter().any(|c| matches!(c, ErrorCause::Fs(_))),
+        "RFC 13.1: the core must not fabricate a filesystem error for an outcome it generated itself; it \
+         published {causes:?}"
+    );
+
+    fs.clear_failures();
+    h.run_round();
+    h.run_until_idle();
+    assert!(
+        h.paths().contains(&"a/late".to_string()),
+        "RFC 10.1: unknown-kind resolution is not a failure threshold, so the retry must converge"
+    );
+}
+
+#[test]
+fn a_domain_acquiring_identity_per_child_counts_one_operation_per_child_and_a_none_domain_counts_none() {
+    let fs = populated();
+    fs.create_file("c/g", 3);
+    fs.set_domain("a", PER_CHILD_IDENTITY);
+    fs.set_sources(
+        PER_CHILD_IDENTITY,
+        ObservationSources {
+            kind: KindSource::Always,
+            identity: IdentitySource::PerChildRead,
+            metadata: MetadataSources::INLINE,
+        },
+    );
+    fs.set_domain("c", NO_IDENTITY);
+    fs.set_sources(
+        NO_IDENTITY,
+        ObservationSources {
+            kind: KindSource::Always,
+            identity: IdentitySource::None,
+            metadata: MetadataSources::INLINE,
+        },
+    );
+    let config = Config { operations_per_lease: 1, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    fs.clear_ops();
+    h.run_until_idle();
+
+    assert!(
+        h.entry("a/b").and_then(|e| e.identity).is_some() && h.entry("a/f2").and_then(|e| e.identity).is_some(),
+        "RFC 10.1: a domain that supplies identity through a per-child read must still supply it"
+    );
+    assert_eq!(
+        (fs.count_ops(FakeOp::ResolveIdentity, "a/b"), fs.count_ops(FakeOp::ResolveIdentity, "a/f2")),
+        (1, 1),
+        "RFC 10.1: obtaining identity on that domain costs one additional operation per child; the session \
+         performed {:?}",
+        fs.ops().iter().filter(|(op, _)| *op == FakeOp::ResolveIdentity).collect::<Vec<_>>()
+    );
+
+    assert!(
+        h.entry("c/g").and_then(|e| e.identity).is_none(),
+        "RFC 10.1: a domain declaring no identity source must supply none"
+    );
+    assert_eq!(
+        fs.count_ops(FakeOp::ResolveIdentity, "c/g"),
+        0,
+        "RFC 10.1: a domain declaring no identity source performs no per-child identity operation"
+    );
+
+    let stats = h.stats();
+    assert!(
+        stats.identity_reads >= 2,
+        "RFC 15.2: every per-child operation the session performs is counted; it counted {}",
+        stats.identity_reads
+    );
+    assert!(
+        stats.lease_grants > 0,
+        "RFC 10.2: per-child identity reads hold lease, so a directory needing more of them than one lease \
+         covers must take a further lease"
+    );
+    assert_eq!(
+        stats.metadata_operations, 0,
+        "RFC 10.1: identity acquisition is not modelled as metadata I/O; the tree counted {} metadata operations",
+        stats.metadata_operations
+    );
 }

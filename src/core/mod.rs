@@ -21,15 +21,20 @@ pub use types::{Class, MonotonicTime};
 use crate::config::Config;
 use crate::entry::{LoadState, MetadataFields, Shape};
 use crate::error::Error;
-use crate::fs::{DirectoryListing, Enrichment, EntryInfo, FsCapabilities, FsError, WatcherEvent, WatcherKind};
+use crate::fs::{
+    CancellationToken, Enrichment, EntryInfo, FsCapabilities, FsError, Lease, SessionCost, SessionStep, WatcherEvent,
+    WatcherKind,
+};
 use crate::ids::*;
 use crate::path::RelativePath;
 use crate::policy::{PolicyContext, ScanPolicy};
 use crate::snapshot::{Snapshot, new_entry};
 use crate::update::{
     ErrorCause, Health, InitialScanState, Operation, ReconciliationHealth, RecoverableError, ResourceHealth,
-    RootAvailability, ShutdownState, ThrottleCause, Update, UpdateEvent, WatcherHealth,
+    ResourceLimitEvent, RootAvailability, ShutdownState, ThrottleCause, Update, UpdateEvent, WatcherHealth,
 };
+
+const RESOURCE_LIMIT_HISTORY: usize = 64;
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -50,15 +55,40 @@ pub enum JobOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListingWork {
+    pub lease: Lease,
+    pub ceiling: usize,
+    pub cancel: CancellationToken,
+    pub resume: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Work {
+    Listing(ListingWork),
+    Metadata,
+    Enrichment { fields: MetadataFields },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSpec {
     pub id: JobId,
     pub path: RelativePath,
-    pub operation: JobOperation,
+    pub work: Work,
+}
+
+impl JobSpec {
+    pub fn operation(&self) -> JobOperation {
+        match &self.work {
+            Work::Listing(_) => JobOperation::Listing,
+            Work::Metadata => JobOperation::Metadata,
+            Work::Enrichment { fields } => JobOperation::Enrichment { fields: *fields },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobResult {
-    Listing(Result<DirectoryListing, FsError>),
+    Listing(SessionStep),
     Metadata(Result<EntryInfo, FsError>),
     Enrichment(Result<Enrichment, FsError>),
 }
@@ -143,8 +173,18 @@ pub struct Stats {
     pub degraded_paths: BTreeSet<RelativePath>,
     pub metadata_degraded_paths: BTreeSet<RelativePath>,
     pub metadata_operations: u64,
+    pub listing_operations: u64,
+    pub entries_enumerated: u64,
+    pub listing_bytes: u64,
+    pub in_flight_listing_bytes: u64,
+    pub reported_blocking: Duration,
     pub kind_resolutions: u64,
+    pub identity_reads: u64,
     pub unresolved_listings: u64,
+    pub suspended_sessions: usize,
+    pub lease_grants: u64,
+    pub cancelled_sessions: u64,
+    pub resource_limits: Vec<ResourceLimitEvent>,
     pub enrichments: u64,
     pub enrichment_failures: u64,
     pub pending_enrichments: usize,
@@ -208,8 +248,15 @@ pub struct Coordinator {
     stale_results: u64,
     lost_workers: u64,
     metadata_operations: u64,
+    listing_operations: u64,
+    entries_enumerated: u64,
+    listing_bytes: u64,
+    session_bytes: HashMap<JobId, u64>,
     kind_resolutions: u64,
+    identity_reads: u64,
     unresolved_listings: u64,
+    cancelled_sessions: u64,
+    resource_limits: VecDeque<ResourceLimitEvent>,
     enrichments: u64,
     enrichment_failures: u64,
     last_listing_duration: Option<Duration>,
@@ -293,8 +340,15 @@ impl Coordinator {
             stale_results: 0,
             lost_workers: 0,
             metadata_operations: 0,
+            listing_operations: 0,
+            entries_enumerated: 0,
+            listing_bytes: 0,
+            session_bytes: HashMap::new(),
             kind_resolutions: 0,
+            identity_reads: 0,
             unresolved_listings: 0,
+            cancelled_sessions: 0,
+            resource_limits: VecDeque::new(),
             enrichments: 0,
             enrichment_failures: 0,
             last_listing_duration: None,
@@ -340,6 +394,28 @@ impl Coordinator {
         self.jobs.get(&id).map(|job| Coordinator::operation_for(job.need))
     }
 
+    pub(super) fn record_session_cost(&mut self, job: JobId, cost: &SessionCost) {
+        self.listing_operations += u64::from(cost.listing_operations);
+        self.metadata_operations += u64::from(cost.metadata_operations);
+        self.kind_resolutions += u64::from(cost.kind_resolutions);
+        self.identity_reads += u64::from(cost.identity_reads);
+        self.entries_enumerated += cost.entries_enumerated;
+        self.session_bytes.insert(job, cost.bytes);
+    }
+
+    pub(super) fn release_session_bytes(&mut self, job: JobId) {
+        if let Some(bytes) = self.session_bytes.remove(&job) {
+            self.listing_bytes += bytes;
+        }
+    }
+
+    pub(super) fn record_resource_limit(&mut self, event: ResourceLimitEvent) {
+        if self.resource_limits.len() >= RESOURCE_LIMIT_HISTORY {
+            self.resource_limits.pop_front();
+        }
+        self.resource_limits.push_back(event);
+    }
+
     pub(super) fn operation_for(need: ReadNeed) -> JobOperation {
         match need {
             ReadNeed::Listing => JobOperation::Listing,
@@ -382,7 +458,17 @@ impl Coordinator {
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         match &input {
-            Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => {
+            Input::JobCompleted { job, result } => {
+                self.blocking_slots.remove(job);
+                let now = self.now;
+                if let JobResult::Listing(step) = result
+                    && let Some(blocking) = step.cost.blocking
+                {
+                    self.governor.report(GrantId::Job(*job), blocking, now);
+                }
+                self.governor.release(GrantId::Job(*job), now);
+            }
+            Input::WorkerLost(WorkerLoss::Job(job)) => {
                 self.blocking_slots.remove(job);
                 let now = self.now;
                 self.governor.release(GrantId::Job(*job), now);
@@ -422,8 +508,11 @@ impl Coordinator {
     }
 
     pub fn stats(&self) -> Stats {
-        let queued =
-            self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Queued | JobPhase::Registering(_))).count();
+        let queued = self
+            .jobs
+            .values()
+            .filter(|j| matches!(j.phase, JobPhase::Queued | JobPhase::Registering(_) | JobPhase::Suspended))
+            .count();
         let in_flight = self.jobs.values().filter(|j| j.phase.started().is_some()).count();
         let blocking_slots: Vec<BlockingSlot> = self
             .blocking_slots
@@ -481,8 +570,18 @@ impl Coordinator {
             degraded_paths: self.degraded_paths(),
             metadata_degraded_paths: self.metadata_degraded_paths(),
             metadata_operations: self.metadata_operations,
+            listing_operations: self.listing_operations,
+            entries_enumerated: self.entries_enumerated,
+            listing_bytes: self.listing_bytes,
+            in_flight_listing_bytes: self.session_bytes.values().sum(),
+            reported_blocking: self.governor.view(self.now).reported_blocking,
             kind_resolutions: self.kind_resolutions,
+            identity_reads: self.identity_reads,
             unresolved_listings: self.unresolved_listings,
+            suspended_sessions: self.jobs.values().filter(|j| j.phase == JobPhase::Suspended).count(),
+            lease_grants: self.governor.view(self.now).lease_grants,
+            cancelled_sessions: self.cancelled_sessions,
+            resource_limits: self.resource_limits.iter().cloned().collect(),
             enrichments: self.enrichments,
             enrichment_failures: self.enrichment_failures,
             pending_enrichments: self.pending_enrichment.len(),
@@ -499,6 +598,7 @@ impl Coordinator {
         self.check_round_end();
         self.check_initial_scan();
         self.maybe_dispatch();
+        self.resume_sessions();
         self.start_queued();
         self.publish();
         self.arm_timer();
@@ -537,12 +637,6 @@ impl Coordinator {
         id
     }
 
-    fn next_job_id(&mut self) -> JobId {
-        let id = self.next_job_id;
-        self.next_job_id = id.next();
-        id
-    }
-
     fn next_watch_request(&mut self) -> WatchRequestId {
         let id = self.next_watch_request;
         self.next_watch_request = id.next();
@@ -564,7 +658,8 @@ impl Coordinator {
         let exp = attempts.min(20);
         let scaled = base.checked_mul(1u32 << exp).unwrap_or(max).min(max);
         let jitter_max = scaled / 4;
-        let jitter_nanos = if jitter_max.is_zero() { 0 } else { self.random() % (jitter_max.as_nanos() as u64 + 1) };
+        let ceiling = u64::try_from(jitter_max.as_nanos()).unwrap_or(u64::MAX);
+        let jitter_nanos = if jitter_max.is_zero() { 0 } else { self.random() % ceiling.saturating_add(1) };
         (scaled + Duration::from_nanos(jitter_nanos)).min(max)
     }
 
@@ -582,7 +677,7 @@ impl Coordinator {
             self.errors.push(RecoverableError {
                 path: RelativePath::root(),
                 operation: Operation::Listing,
-                error: ErrorCause::Fs(FsError::Fatal(format!("root install failed: {err:?}"))),
+                error: ErrorCause::SnapshotRejected(err),
             });
         }
         let (snapshot, _) = builder.finish(self.snapshot.version().next());
@@ -755,7 +850,8 @@ impl Coordinator {
         let ids: Vec<JobId> = self.jobs.keys().copied().collect();
         for id in ids {
             if let Some(job) = self.jobs.remove(&id) {
-                if job.phase.started().is_some() {
+                job.cancel.cancel();
+                if job.phase.started().is_some() || job.session_open {
                     self.outputs.push(Output::CancelJob(id));
                 }
                 if let Some(entry) = job.entry() {
@@ -793,11 +889,16 @@ impl Coordinator {
         if !self.baseline_due && self.batch.is_none() {
             let due = match self.governor.resume_at(self.now) {
                 Some(at) => self.periodic_due.max(at),
-                None => self.periodic_due,
+                None => self.periodic_due.min(self.now + self.config.maximum_period),
             };
             consider(due);
         }
         if self.batch.is_none()
+            && let Some(at) = self.governor.resume_at(self.now)
+        {
+            consider(at);
+        }
+        if self.jobs.values().any(|j| j.phase == JobPhase::Suspended)
             && let Some(at) = self.governor.resume_at(self.now)
         {
             consider(at);

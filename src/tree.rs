@@ -12,10 +12,10 @@ use futures_util::StreamExt;
 
 use crate::config::{Config, LagMode};
 use crate::core::{
-    Command, Coordinator, Input, JobOperation, JobResult, MonotonicTime, Output, Stats, TerminalOutcome, WorkerLoss,
+    Command, Coordinator, Input, JobResult, MonotonicTime, Output, Stats, TerminalOutcome, Work, WorkerLoss,
 };
 use crate::error::{Error, Result};
-use crate::fs::{FileSystem, FsError, WatcherEvent, WatcherSink};
+use crate::fs::{Continuation, FileSystem, FsError, ListingSession, SessionStep, WatcherEvent, WatcherSink};
 use crate::ids::{CommandId, JobId, WatchId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
@@ -153,6 +153,7 @@ struct Shared {
     replies: Mutex<HashMap<CommandId, oneshot::Sender<Result<()>>>>,
     lifecycle: Mutex<Lifecycle>,
     next_command: AtomicU64,
+    held_sessions: AtomicU64,
     tx: mpsc::UnboundedSender<Message>,
     stream: Arc<Mutex<StreamInner>>,
 }
@@ -226,6 +227,12 @@ struct Actor {
     base: Instant,
     workers: HashMap<JobId, BoxTaskHandle>,
     registrations: HashSet<WatchRequestId>,
+    sessions: Arc<Mutex<HashMap<JobId, SessionSlot>>>,
+}
+
+enum SessionSlot {
+    Open(Box<dyn ListingSession>),
+    Cancelled,
 }
 
 impl Actor {
@@ -235,8 +242,13 @@ impl Actor {
 
     fn handle(&mut self, input: Input) -> Option<TerminalOutcome> {
         match &input {
-            Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => {
+            Input::JobCompleted { job, .. } => {
                 self.workers.remove(job);
+                Actor::forget_cancelled(&self.sessions, *job);
+            }
+            Input::WorkerLost(WorkerLoss::Job(job)) => {
+                self.workers.remove(job);
+                lock(&self.sessions).remove(job);
             }
             Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
                 self.registrations.remove(request);
@@ -272,20 +284,49 @@ impl Actor {
                     let fs = self.fs.clone();
                     let root = self.root.clone();
                     let job = spec.id;
+                    let sessions = self.sessions.clone();
                     let guard = WorkerGuard::new(WorkerLoss::Job(job), self.shared.tx.clone());
                     let handle = self.runtime.spawn_blocking(Box::new(move || {
-                        let result = match spec.operation {
-                            JobOperation::Listing => JobResult::Listing(fs.read_dir(&root, &spec.path)),
-                            JobOperation::Metadata => JobResult::Metadata(fs.metadata(&root, &spec.path)),
-                            JobOperation::Enrichment { fields } => {
-                                JobResult::Enrichment(fs.enrich(&root, &spec.path, fields))
+                        let result = match spec.work {
+                            Work::Listing(listing) => {
+                                let existing = match lock(&sessions).remove(&job) {
+                                    Some(SessionSlot::Open(session)) => Some(session),
+                                    Some(SessionSlot::Cancelled) | None => None,
+                                };
+                                let cancel = listing.cancel.clone();
+                                let session = existing.unwrap_or_else(|| {
+                                    fs.open_listing(&root, &spec.path, listing.ceiling, listing.cancel)
+                                });
+                                let (continuation, cost) = session.resume(listing.lease);
+                                let step = match continuation {
+                                    Continuation::Suspended(session) => {
+                                        let mut held = lock(&sessions);
+                                        match held.get(&job) {
+                                            Some(SessionSlot::Cancelled) => drop(session),
+                                            _ if cancel.is_cancelled() => drop(session),
+                                            _ => {
+                                                held.insert(job, SessionSlot::Open(session));
+                                            }
+                                        }
+                                        SessionStep::suspended(cost)
+                                    }
+                                    Continuation::Finished(outcome) => SessionStep::finished(cost, outcome),
+                                };
+                                JobResult::Listing(step)
                             }
+                            Work::Metadata => JobResult::Metadata(fs.metadata(&root, &spec.path)),
+                            Work::Enrichment { fields } => JobResult::Enrichment(fs.enrich(&root, &spec.path, fields)),
                         };
                         guard.finish(Input::JobCompleted { job, result });
                     }));
                     self.workers.insert(job, handle);
                 }
                 Output::CancelJob(id) => {
+                    let mut sessions = lock(&self.sessions);
+                    if sessions.remove(&id).is_none() && self.workers.contains_key(&id) {
+                        sessions.insert(id, SessionSlot::Cancelled);
+                    }
+                    drop(sessions);
                     if let Some(handle) = self.workers.get(&id) {
                         handle.cancel();
                     }
@@ -312,7 +353,7 @@ impl Actor {
                         _ => {}
                     }
                     *lock(&self.shared.health) = event.health().clone();
-                    *lock(&self.shared.stats) = self.coordinator.stats();
+                    self.publish_stats();
                     let latest = lock(&self.shared.snapshot).clone();
                     lock(&self.shared.stream).push(event, &latest);
                 }
@@ -336,8 +377,21 @@ impl Actor {
                 }
             }
         }
-        *lock(&self.shared.stats) = self.coordinator.stats();
+        self.publish_stats();
         stopped
+    }
+
+    fn publish_stats(&self) {
+        let held = u64::try_from(lock(&self.sessions).len()).unwrap_or(u64::MAX);
+        self.shared.held_sessions.store(held, Ordering::SeqCst);
+        *lock(&self.shared.stats) = self.coordinator.stats();
+    }
+
+    fn forget_cancelled(sessions: &Mutex<HashMap<JobId, SessionSlot>>, job: JobId) {
+        let mut held = lock(sessions);
+        if matches!(held.get(&job), Some(SessionSlot::Cancelled)) {
+            held.remove(&job);
+        }
     }
 
     fn unwatch(&self, id: WatchId) {
@@ -419,6 +473,7 @@ impl Tree {
             replies: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::Running),
             next_command: AtomicU64::new(1),
+            held_sessions: AtomicU64::new(0),
             tx: tx.clone(),
             stream: stream.clone(),
         });
@@ -441,6 +496,7 @@ impl Tree {
             base,
             workers: HashMap::new(),
             registrations: HashSet::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         };
         let _ = actor.execute(initial);
         while actor.coordinator.open_gate().is_none() {
@@ -497,6 +553,10 @@ impl TreeHandle {
 
     pub fn stats(&self) -> Stats {
         lock(&self.shared.stats).clone()
+    }
+
+    pub fn held_listing_sessions(&self) -> u64 {
+        self.shared.held_sessions.load(Ordering::SeqCst)
     }
 
     async fn command(&self, command: Command) -> Result<()> {

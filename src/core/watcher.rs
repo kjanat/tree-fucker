@@ -100,7 +100,7 @@ impl Coordinator {
         for (id, path, recursive) in targets {
             let request = self.next_watch_request();
             let now = self.now;
-            if self.governor.try_admit(GrantId::WatchRegistration(request), path.clone(), 0, 1, now).is_err() {
+            if self.governor.try_admit(GrantId::WatchRegistration(request), path.clone(), 0, 1, 0, now).is_err() {
                 deferred = true;
                 break;
             }

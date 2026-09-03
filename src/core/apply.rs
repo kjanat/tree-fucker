@@ -12,7 +12,7 @@ use crate::ids::*;
 use crate::path::{PathKey, RelativePath};
 use crate::policy::{PolicyContext, ScanDecision};
 use crate::snapshot::{SnapshotBuilder, new_entry};
-use crate::update::{ErrorCause, Operation, PathChange};
+use crate::update::{ErrorCause, Operation, PathChange, ResourceLimit, ResourceLimitEvent};
 
 pub(super) struct Observed<'a> {
     pub path: &'a RelativePath,
@@ -142,6 +142,13 @@ impl Coordinator {
             return Err(ListingRejection::MalformedNames);
         }
         if order.len() > self.config.entries_per_directory {
+            let limit = self.config.entries_per_directory;
+            self.record_resource_limit(ResourceLimitEvent {
+                path: dir.path.clone(),
+                resource: ResourceLimit::EntriesPerDirectory,
+                seen: u64::try_from(order.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            });
             return Err(ListingRejection::LimitExceeded);
         }
         let children: Vec<(RelativePath, PathKey, EntryInfo)> =
@@ -150,8 +157,6 @@ impl Coordinator {
         let mut effects = Effects::default();
         let was_loading = dir.shape == Shape::Directory(LoadState::Loading);
         let new_metadata = listing.directory.metadata.project(fields);
-        self.metadata_operations += u64::from(listing.metadata_operations);
-        self.kind_resolutions += u64::from(listing.metadata_operations);
         if was_loading || dir.metadata != new_metadata || dir.identity != listing.directory.identity {
             let _ = builder.update(dir_id, |e| {
                 e.metadata = new_metadata;
@@ -204,6 +209,13 @@ impl Coordinator {
             self.reevaluate_descendants(&mut builder, &mut effects, dir_id, &ctx, false, inherit);
         }
         if builder.len() > self.config.represented_entries {
+            let limit = self.config.represented_entries;
+            self.record_resource_limit(ResourceLimitEvent {
+                path: dir.path.clone(),
+                resource: ResourceLimit::RepresentedEntries,
+                seen: u64::try_from(builder.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            });
             return Err(ListingRejection::LimitExceeded);
         }
         duplicates.sort();
@@ -494,7 +506,6 @@ impl Coordinator {
             directory: EntryInfo { kind: dir.kind(), metadata: dir.metadata, identity: dir.identity },
             entries,
             supplied_fields,
-            metadata_operations: 0,
         }
     }
 

@@ -21,6 +21,9 @@ pub enum Error {
     WatcherRegistrationFailed,
     WorkerLost,
     Stuck,
+    InvalidListing,
+    UnresolvedKind,
+    AncestorNotDirectory,
     InitialScanDegraded(BTreeSet<RelativePath>),
     Io(FsError),
 }
@@ -43,6 +46,9 @@ impl fmt::Display for Error {
             Error::WatcherRegistrationFailed => f.write_str("watcher registration failed"),
             Error::WorkerLost => f.write_str("filesystem worker lost"),
             Error::Stuck => f.write_str("filesystem worker stuck"),
+            Error::InvalidListing => f.write_str("listing has an unrepresentable child name"),
+            Error::UnresolvedKind => f.write_str("listing has a child whose kind is unresolved"),
+            Error::AncestorNotDirectory => f.write_str("an ancestor is not a directory"),
             Error::InitialScanDegraded(paths) => {
                 write!(f, "initial scan degraded for {} paths", paths.len())
             }

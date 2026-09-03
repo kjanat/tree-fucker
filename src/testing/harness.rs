@@ -5,10 +5,11 @@ use std::time::Duration;
 use super::fake_fs::{DomainId, FakeFileSystem, FakeOp};
 use crate::config::Config;
 use crate::core::{
-    Class, Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, WorkerLoss,
+    Class, Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, Work,
+    WorkerLoss,
 };
 use crate::error::Error;
-use crate::fs::{FileSystem, HintKind, WatcherEvent};
+use crate::fs::{Continuation, FileSystem, HintKind, ListingSession, SessionStep, WatcherEvent};
 use crate::ids::{CommandId, JobId, TimerId, WatchId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
@@ -30,6 +31,7 @@ pub struct Admission {
     pub entry: RelativePath,
     pub batch: usize,
     pub reserved: Duration,
+    pub lease: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +60,11 @@ impl crate::fs::WatcherSink for Sink {
     }
 }
 
+enum SessionSlot {
+    Open(Box<dyn ListingSession>),
+    Cancelled,
+}
+
 pub struct Harness {
     pub fs: Arc<FakeFileSystem>,
     pub coordinator: Coordinator,
@@ -78,7 +85,9 @@ pub struct Harness {
     job_domain: HashMap<JobId, DomainId>,
     charges: Vec<Charge>,
     admissions: Vec<Admission>,
-    admitted: HashSet<JobId>,
+    admitted: HashSet<(JobId, u32)>,
+    sessions: HashMap<JobId, SessionSlot>,
+    entries_seen: HashMap<JobId, usize>,
     batch_index: usize,
     batch_members: BTreeSet<JobId>,
     waited_at: Option<MonotonicTime>,
@@ -113,6 +122,8 @@ impl Harness {
             charges: Vec::new(),
             admissions: Vec::new(),
             admitted: HashSet::new(),
+            sessions: HashMap::new(),
+            entries_seen: HashMap::new(),
             batch_index: 0,
             batch_members: BTreeSet::new(),
             waited_at: None,
@@ -146,10 +157,16 @@ impl Harness {
                 }
                 Output::CancelJob(id) => {
                     self.cancelled.push(id);
-                    if let Some(index) = self.jobs.iter().position(|j| j.id == id)
-                        && let Some(spec) = self.jobs.remove(index)
-                    {
-                        self.outstanding.push_back(spec);
+                    match self.jobs.iter().position(|j| j.id == id) {
+                        Some(index) => {
+                            if let Some(spec) = self.jobs.remove(index) {
+                                self.outstanding.push_back(spec);
+                            }
+                            if self.sessions.remove(&id).is_none() {
+                                self.sessions.insert(id, SessionSlot::Cancelled);
+                            }
+                        }
+                        None => self.drop_session(id),
                     }
                 }
                 Output::RegisterWatch { request, path, recursive } => {
@@ -188,7 +205,7 @@ impl Harness {
             let Some(job) = grant.id.job() else {
                 continue;
             };
-            if self.admitted.contains(&job) {
+            if self.admitted.contains(&(job, grant.lease)) {
                 continue;
             }
             let Some(class) = self.coordinator.job_class(job) else {
@@ -197,7 +214,7 @@ impl Harness {
             let Some(operation) = self.coordinator.job_operation(job) else {
                 continue;
             };
-            self.admitted.insert(job);
+            self.admitted.insert((job, grant.lease));
             let batch = self.batch_of(job);
             self.admissions.push(Admission {
                 at: grant.admitted,
@@ -207,6 +224,7 @@ impl Harness {
                 entry: grant.path.clone(),
                 batch,
                 reserved: grant.reserved,
+                lease: grant.lease,
             });
         }
     }
@@ -223,16 +241,28 @@ impl Harness {
 
     fn begin_work(&mut self, spec: &JobSpec) {
         self.settle_work(spec.id);
-        let cost = match spec.operation {
-            JobOperation::Listing => self.fs.listing_cost(&spec.path),
-            JobOperation::Metadata => self.fs.cost_of(FakeOp::Metadata, &spec.path),
-            JobOperation::Enrichment { .. } => self.fs.enrichment_cost(&spec.path),
+        let cost = match &spec.work {
+            Work::Listing(listing) => {
+                let skip = self.entries_seen.get(&spec.id).copied().unwrap_or(0);
+                self.fs.lease_cost(&spec.path, !listing.resume, skip, listing.lease.entries)
+            }
+            Work::Metadata => self.fs.cost_of(FakeOp::Metadata, &spec.path),
+            Work::Enrichment { .. } => self.fs.enrichment_cost(&spec.path),
         };
         let domain = self.fs.domain_of(&spec.path);
         let due = self.now + cost;
         self.job_domain.insert(spec.id, domain);
         self.running.insert(spec.id, Running { started: self.now, due, domain });
         self.schedule.insert((due, spec.id));
+    }
+
+    fn drop_session(&mut self, job: JobId) {
+        self.sessions.remove(&job);
+        self.entries_seen.remove(&job);
+    }
+
+    pub fn held_listing_sessions(&self) -> usize {
+        self.sessions.values().filter(|slot| matches!(slot, SessionSlot::Open(_))).count()
     }
 
     fn settle_work(&mut self, job: JobId) {
@@ -333,13 +363,38 @@ impl Harness {
         true
     }
 
-    fn perform(&self, spec: &JobSpec) -> JobResult {
-        match spec.operation {
-            JobOperation::Listing => JobResult::Listing(self.fs.read_dir(self.fs.root(), &spec.path)),
-            JobOperation::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
-            JobOperation::Enrichment { fields } => {
-                JobResult::Enrichment(self.fs.enrich(self.fs.root(), &spec.path, fields))
+    fn perform(&mut self, spec: &JobSpec) -> JobResult {
+        match &spec.work {
+            Work::Listing(listing) => {
+                let fs = self.fs.clone();
+                let existing = match self.sessions.remove(&spec.id) {
+                    Some(SessionSlot::Open(session)) => Some(session),
+                    Some(SessionSlot::Cancelled) | None => None,
+                };
+                let session = existing
+                    .unwrap_or_else(|| fs.open_listing(fs.root(), &spec.path, listing.ceiling, listing.cancel.clone()));
+                let (continuation, cost) = session.resume(listing.lease);
+                *self.entries_seen.entry(spec.id).or_default() +=
+                    usize::try_from(cost.entries_enumerated).unwrap_or(usize::MAX);
+                let step = match continuation {
+                    Continuation::Suspended(session) => {
+                        let cancelled = matches!(self.sessions.get(&spec.id), Some(SessionSlot::Cancelled));
+                        if cancelled || listing.cancel.is_cancelled() {
+                            drop(session);
+                        } else {
+                            self.sessions.insert(spec.id, SessionSlot::Open(session));
+                        }
+                        SessionStep::suspended(cost)
+                    }
+                    Continuation::Finished(outcome) => {
+                        self.entries_seen.remove(&spec.id);
+                        SessionStep::finished(cost, outcome)
+                    }
+                };
+                JobResult::Listing(step)
             }
+            Work::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
+            Work::Enrichment { fields } => JobResult::Enrichment(self.fs.enrich(self.fs.root(), &spec.path, *fields)),
         }
     }
 
@@ -348,6 +403,7 @@ impl Harness {
             return false;
         };
         self.jobs.remove(index);
+        self.drop_session(id);
         self.settle_work(id);
         self.feed(Input::JobCompleted { job: id, result });
         true
@@ -358,6 +414,7 @@ impl Harness {
             return false;
         };
         self.jobs.remove(index);
+        self.drop_session(id);
         self.settle_work(id);
         self.feed(Input::WorkerLost(WorkerLoss::Job(id)));
         true
@@ -385,6 +442,7 @@ impl Harness {
             return false;
         };
         self.outstanding.remove(index);
+        self.drop_session(id);
         self.settle_work(id);
         self.feed(Input::WorkerLost(WorkerLoss::Job(id)));
         true

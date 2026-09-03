@@ -32,6 +32,7 @@ pub enum AdmissionDecision {
 pub struct Grant {
     pub id: GrantId,
     pub path: RelativePath,
+    pub lease: u32,
     pub reserved: Duration,
     pub charged: Duration,
     pub admitted: MonotonicTime,
@@ -46,9 +47,11 @@ pub struct GovernorView {
     pub debt: Duration,
     pub reserved: Duration,
     pub charged: Duration,
+    pub reported_blocking: Duration,
     pub running_occupancy: Duration,
     pub in_flight: usize,
     pub grants: u64,
+    pub lease_grants: u64,
     pub watch_registration_grants: u64,
     pub denials: u64,
     pub throttled_duration: Duration,
@@ -57,7 +60,7 @@ pub struct GovernorView {
 }
 
 pub struct Governor {
-    rate: f64,
+    rate: u128,
     capacity: i128,
     level: i128,
     updated: MonotonicTime,
@@ -66,7 +69,9 @@ pub struct Governor {
     grants: BTreeMap<GrantId, Grant>,
     reserved_total: i128,
     charged_total: i128,
+    reported_total: i128,
     granted: u64,
+    lease_granted: u64,
     watch_registration_grants: u64,
     denials: u64,
     throttled_since: Option<MonotonicTime>,
@@ -75,7 +80,7 @@ pub struct Governor {
     last_decision: Option<AdmissionDecision>,
 }
 
-const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 fn nanos(value: Duration) -> i128 {
     i128::try_from(value.as_nanos()).unwrap_or(i128::MAX)
@@ -92,7 +97,7 @@ impl Governor {
     pub fn new(config: &Config, now: MonotonicTime) -> Governor {
         let capacity = nanos(config.background_burst);
         Governor {
-            rate: config.background_duty,
+            rate: Duration::try_from_secs_f64(config.background_duty).unwrap_or(Duration::ZERO).as_nanos(),
             capacity,
             level: capacity,
             updated: now,
@@ -101,7 +106,9 @@ impl Governor {
             grants: BTreeMap::new(),
             reserved_total: 0,
             charged_total: 0,
+            reported_total: 0,
             granted: 0,
+            lease_granted: 0,
             watch_registration_grants: 0,
             denials: 0,
             throttled_since: None,
@@ -124,7 +131,8 @@ impl Governor {
             self.updated = now;
             return;
         }
-        let refill = (self.rate * elapsed.as_secs_f64() * NANOS_PER_SECOND) as i128;
+        let refill =
+            i128::try_from(elapsed.as_nanos().saturating_mul(self.rate) / NANOS_PER_SECOND).unwrap_or(i128::MAX);
         if refill <= 0 {
             return;
         }
@@ -157,6 +165,7 @@ impl Governor {
         path: RelativePath,
         reads: u32,
         registrations: u32,
+        lease: u32,
         now: MonotonicTime,
     ) -> Result<Duration, ThrottleCause> {
         self.account(now);
@@ -177,15 +186,39 @@ impl Governor {
         self.reserved_total += nanos(cost);
         self.charged_total += nanos(cost);
         self.granted += 1;
+        if lease > 0 {
+            self.lease_granted += 1;
+        }
         self.denied_cost = None;
         self.watch_registration_grants += u64::from(registrations);
         self.last_decision = Some(AdmissionDecision::Granted);
         if let Some(since) = self.throttled_since.take() {
             self.throttled_total += now.since(since);
         }
-        self.grants
-            .insert(id, Grant { id, path, reserved: cost, charged: cost, admitted: now, started: None, stuck: false });
+        self.grants.insert(
+            id,
+            Grant { id, path, lease, reserved: cost, charged: cost, admitted: now, started: None, stuck: false },
+        );
         Ok(cost)
+    }
+
+    pub fn report(&mut self, id: GrantId, blocking: Duration, now: MonotonicTime) {
+        self.account(now);
+        let Some(grant) = self.grants.get_mut(&id) else {
+            return;
+        };
+        self.reported_total += nanos(blocking);
+        let Some(started) = grant.started else {
+            return;
+        };
+        let occupancy = now.since(started);
+        let charge = blocking.min(occupancy).max(grant.reserved);
+        if charge > grant.charged {
+            let extra = nanos(charge - grant.charged);
+            grant.charged = charge;
+            self.level -= extra;
+            self.charged_total += extra;
+        }
     }
 
     pub fn start(&mut self, id: GrantId, at: MonotonicTime) {
@@ -246,8 +279,13 @@ impl Governor {
         if self.level >= cost {
             return None;
         }
-        let deficit = (cost - self.level) as f64;
-        let wait = Duration::from_nanos(1).max(duration((deficit / self.rate) as i128));
+        let rate = i128::try_from(self.rate).unwrap_or(i128::MAX);
+        if rate <= 0 {
+            return Some(now + Duration::MAX);
+        }
+        let per_second = i128::try_from(NANOS_PER_SECOND).unwrap_or(i128::MAX);
+        let deficit = (cost - self.level).saturating_mul(per_second);
+        let wait = Duration::from_nanos(1).max(duration(deficit / rate));
         Some(now + wait)
     }
 
@@ -262,9 +300,11 @@ impl Governor {
             debt: duration(-self.level),
             reserved: duration(self.reserved_total),
             charged: duration(self.charged_total),
+            reported_blocking: duration(self.reported_total),
             running_occupancy: self.running_occupancy(now),
             in_flight: self.in_flight(),
             grants: self.granted,
+            lease_grants: self.lease_granted,
             watch_registration_grants: self.watch_registration_grants,
             denials: self.denials,
             throttled_duration: match self.throttled_since {

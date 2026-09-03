@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tree_fucker::core::{Class, Command, JobSpec, MonotonicTime};
+use tree_fucker::core::{Class, Command, JobResult, JobSpec, MonotonicTime};
 use tree_fucker::testing::{Admission, CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{ErrorCause, RoundResult, UpdateEvent};
-use tree_fucker::{Config, EntryKind, FsError, HintKind, LoadAll, RelativePath, WatcherKind};
+use tree_fucker::update::{ErrorCause, ResourceLimit, RoundResult, UpdateEvent};
+use tree_fucker::{
+    CancellationToken, Config, Continuation, EntryKind, FileSystem, FsError, HintKind, Lease, LoadAll, RelativePath,
+    SessionOutcome, SessionStep, WatcherKind,
+};
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
 const BACKGROUND_BURST_GLOBAL: Duration = Duration::from_millis(500);
@@ -142,7 +145,7 @@ fn watch_registration_correlates_with_a_governor_admission() {
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
     h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
 
-    let registered = fs.ops().iter().filter(|(op, _)| *op == FakeOp::Watch).count() as u64;
+    let registered = u64::try_from(fs.ops().iter().filter(|(op, _)| *op == FakeOp::Watch).count()).unwrap_or(u64::MAX);
     let granted = h.governor().watch_registration_grants;
     assert!(registered > 0, "the workload registered no watch");
     assert!(
@@ -591,7 +594,7 @@ fn opening_with_a_higher_entry_limit_accepts_the_previously_rejected_listing() {
 }
 
 fn listings_under(fs: &FakeFileSystem, paths: &[&str]) -> u32 {
-    paths.iter().map(|p| fs.count_ops(FakeOp::ReadDir, p) as u32).sum()
+    paths.iter().map(|p| u32::try_from(fs.count_ops(FakeOp::ReadDir, p)).unwrap_or(u32::MAX)).sum()
 }
 
 #[test]
@@ -808,5 +811,435 @@ fn a_simulated_day_of_reconciliation_costs_no_real_time() {
     assert!(
         elapsed < Duration::from_secs(1),
         "RFC 17.5: no test may depend on wall-clock sleeps; a simulated day took {elapsed:?} of real time"
+    );
+}
+
+fn wide(children: usize) -> Arc<FakeFileSystem> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("aaa");
+    for i in 0..children {
+        fs.create_file(&format!("aaa/f{i}"), 1);
+    }
+    fs.mkdir("zzz");
+    fs.create_file("zzz/f", 1);
+    fs
+}
+
+#[test]
+fn a_listing_session_yields_at_every_lease_boundary_and_performs_no_operation_beyond_its_lease() {
+    let fs = wide(7);
+    fs.set_chunk_size(1);
+    let mut session = fs.open_listing(fs.root(), &path("aaa"), 1000, CancellationToken::new());
+    let lease = Lease { entries: 2, operations: 4 };
+    let entry_lease = u64::try_from(lease.entries).unwrap_or(u64::MAX);
+    let operation_lease = u32::try_from(lease.operations).unwrap_or(u32::MAX);
+
+    let mut suspensions = 0;
+    let mut enumerated = 0;
+    let listing = loop {
+        let (continuation, cost) = session.resume(lease);
+        assert!(
+            cost.entries_enumerated <= entry_lease,
+            "RFC 10.2 and 17.5: a session must perform no operation beyond its lease; one step enumerated {} \
+             entries under a lease of {}",
+            cost.entries_enumerated,
+            lease.entries
+        );
+        assert!(
+            cost.per_child_operations() <= operation_lease,
+            "RFC 10.2: a session must perform no per-child read beyond its lease; one step performed {} against \
+             a lease of {}",
+            cost.per_child_operations(),
+            lease.operations
+        );
+        enumerated += cost.entries_enumerated;
+        match continuation {
+            Continuation::Suspended(next) => {
+                suspensions += 1;
+                assert_eq!(cost.entries_enumerated, entry_lease, "RFC 10.2: a session yields only at a lease boundary");
+                session = next;
+            }
+            Continuation::Finished(SessionOutcome::Complete(listing)) => break listing,
+            Continuation::Finished(other) => panic!("the session ended {other:?} instead of completing"),
+        }
+    };
+
+    assert_eq!(enumerated, 7);
+    assert_eq!(listing.entries.len(), 7);
+    assert_eq!(
+        suspensions, 3,
+        "RFC 10.2: a seven-entry directory under a two-entry lease must yield at every lease boundary"
+    );
+    assert_eq!(
+        fs.count_ops(FakeOp::ReadDir, "aaa"),
+        1,
+        "RFC 10.2: one session enumerates one directory, however many leases it consumes"
+    );
+}
+
+#[test]
+fn a_session_suspended_between_leases_holds_no_worker_slot() {
+    let fs = wide(8);
+    fs.set_chunk_size(1);
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    let config = Config { entries_per_lease: 2, max_in_flight: 1, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    assert!(h.advance_to_next_completion(), "the root listing never ran");
+    let big = h.pending_job_for("aaa").expect("the wide listing started");
+    assert!(
+        h.stats().blocking_slots.iter().any(|slot| slot.job == big.id),
+        "the wide listing never occupied a worker slot"
+    );
+    assert!(h.pending_job_for("zzz").is_none(), "a max_in_flight of one dispatched two workers");
+
+    assert!(h.advance_to_next_completion(), "the first lease never returned");
+    let stats = h.stats();
+    assert_eq!(
+        stats.suspended_sessions, 1,
+        "RFC 10.2: a session whose lease is exhausted and whose renewal the governor denies stays suspended"
+    );
+    assert!(
+        !stats.blocking_slots.iter().any(|slot| slot.job == big.id),
+        "RFC 10.2: a session waiting for a subsequent lease MUST NOT occupy a physical filesystem-worker slot; \
+         it held {:?}",
+        stats.blocking_slots
+    );
+    assert!(
+        h.pending_job_for("zzz").is_some(),
+        "RFC 10.2: yielding a lease returns physical execution capacity to the host governor, so the freed slot \
+         must be available to another job"
+    );
+    assert!(
+        stats.resource.is_throttled(),
+        "RFC 15.6: a session waiting on the duty budget must be reported as throttled"
+    );
+}
+
+#[test]
+fn cancellation_between_enumeration_chunks_ends_the_session_cancelled_carrying_no_children() {
+    let fs = wide(6);
+    fs.set_chunk_size(1);
+    let cancel = CancellationToken::new();
+    let session = fs.open_listing(fs.root(), &path("aaa"), 1000, cancel.clone());
+    let lease = Lease { entries: 2, operations: 8 };
+    let Continuation::Suspended(session) = session.resume(lease).0 else {
+        panic!("the session finished before the cancellation could land between chunks");
+    };
+
+    cancel.cancel();
+    let (continuation, cost) = session.resume(lease);
+    let Continuation::Finished(outcome) = continuation else {
+        panic!("the session did not end after its cancellation token was set");
+    };
+    assert_eq!(
+        outcome,
+        SessionOutcome::Cancelled,
+        "RFC 10.2: a session whose cancellation token was set between chunks ends Cancelled, and only a Complete \
+         outcome carries children"
+    );
+    assert_eq!(
+        cost.entries_enumerated, 0,
+        "RFC 10.2: the worst-case latency of cooperative cancellation is one chunk of enumeration, so no further \
+         chunk may run after the token is set"
+    );
+}
+
+#[test]
+fn a_cancelled_listing_session_commits_nothing_and_retains_its_retry() {
+    let fs = tree(&["a"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(5));
+    let mut h = scanned(fs.clone(), Config::default());
+    let t = h.command(Command::Refresh(vec![path("a")]));
+    let job = dispatched_job(&mut h, "a");
+    fs.add_silently("a/late", EntryKind::File);
+    let version = h.snapshot().version();
+    assert!(h.complete_job_with(job.id, JobResult::Listing(SessionStep::cancelled())));
+    assert_eq!(
+        h.snapshot().version(),
+        version,
+        "RFC 10.2 and 11.5: a Complete session outcome is the only one that reaches the apply procedure, so a \
+         Cancelled session commits nothing"
+    );
+    assert!(!h.paths().contains(&"a/late".to_string()), "a cancelled session published part of its enumeration");
+    assert_eq!(h.stats().cancelled_sessions, 1);
+
+    let target = h.now() + Duration::from_secs(600);
+    h.run_jobs_until(target);
+    assert!(
+        h.paths().contains(&"a/late".to_string()),
+        "RFC 13.1 and 13.5: a cancelled read leaves its target queued again, so work never disappears silently"
+    );
+    assert_eq!(h.result(t), Some(Ok(())));
+}
+
+#[test]
+fn a_listing_at_the_entry_ceiling_stops_within_one_chunk_and_reports_the_count_seen() {
+    let fs = wide(10);
+    fs.set_chunk_size(2);
+    let ceiling = 3;
+    let mut session = fs.open_listing(fs.root(), &path("aaa"), ceiling, CancellationToken::new());
+    let outcome = loop {
+        match session.resume(Lease { entries: 64, operations: 64 }).0 {
+            Continuation::Suspended(next) => session = next,
+            Continuation::Finished(outcome) => break outcome,
+        }
+    };
+    let SessionOutcome::ResourceLimited { seen } = outcome else {
+        panic!("RFC 10.2: a session that reaches the entry ceiling ends ResourceLimited, not {outcome:?}");
+    };
+    assert_eq!(
+        seen, 4,
+        "RFC 10.2: the ResourceLimited outcome carries the count seen so far, and an adapter MUST NOT accumulate \
+         more than the entry ceiling plus one chunk before stopping"
+    );
+    assert!(seen <= ceiling + fs.chunk_size());
+}
+
+#[test]
+fn a_listing_over_the_entry_ceiling_reports_the_count_seen_and_the_configured_limit() {
+    let fs = limited_tree();
+    let config = Config { entries_per_directory: 3, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    grow_beyond_limit(&fs);
+    h.run_round();
+
+    let events = h.stats().resource_limits;
+    let event = events
+        .iter()
+        .find(|e| e.path == path("big"))
+        .unwrap_or_else(|| panic!("RFC 15.6 and 16: a resource-limit event must name the directory that hit it"));
+    assert_eq!(event.resource, ResourceLimit::EntriesPerDirectory);
+    assert_eq!(
+        (event.seen, event.limit),
+        (5, 3),
+        "RFC 13.1 and 16: a resource-limit event names the resource, the count seen, and the configured limit"
+    );
+}
+
+#[test]
+fn worker_loss_during_a_chunked_listing_leaves_the_previous_snapshot_and_schedules_the_retry() {
+    let fs = tree(&["wide"]);
+    for i in 0..6 {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    let config = Config { entries_per_lease: 2, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    let version = h.snapshot().version();
+    let before = h.paths();
+    fs.add_silently("wide/late", EntryKind::File);
+
+    let t = h.command(Command::Refresh(vec![path("wide")]));
+    let first = h.pending_job_for("wide").expect("the refresh listing started");
+    assert!(h.complete_job(first.id), "the first lease never ran");
+    assert!(
+        h.stats().lease_grants >= 1,
+        "a seven-entry directory under a two-entry lease must take a further lease grant"
+    );
+    let resumed = h.pending_job_for("wide").expect("the suspended session never resumed");
+    let lost_before = h.stats().lost_workers;
+    assert!(h.lose_job(resumed.id));
+
+    assert_eq!(
+        h.snapshot().version(),
+        version,
+        "RFC 10.2 and 13.5: a session lost mid-enumeration leaves the previous snapshot intact"
+    );
+    assert_eq!(h.paths(), before, "a lost chunked listing published part of its enumeration");
+    assert_eq!(h.stats().lost_workers, lost_before + 1);
+
+    let target = h.now() + Duration::from_secs(600);
+    h.run_jobs_until(target);
+    assert!(
+        h.paths().contains(&"wide/late".to_string()),
+        "RFC 13.5: a lost worker must return its read target to schedulable state, so work never disappears silently"
+    );
+    assert_eq!(h.result(t), Some(Ok(())));
+}
+
+#[test]
+fn a_directory_larger_than_one_lease_is_charged_per_lease_within_the_reserved_envelope() {
+    let fs = wide(24);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, INITIAL_COST_ESTIMATE);
+    fs.set_cost(CostScope::Everything, FakeOp::Chunk, INITIAL_COST_ESTIMATE);
+    let config = Config { entries_per_lease: 4, ..Default::default() };
+    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+    h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(1800));
+
+    let leases: Vec<Admission> = h.admissions().into_iter().filter(|a| a.entry == path("aaa")).collect();
+    let renewals = leases.iter().filter(|a| a.lease > 0).count();
+    assert!(
+        renewals >= 5,
+        "RFC 10.2 and 15.2: a directory larger than one lease is charged per lease; twenty-four children under a \
+         four-entry lease took {renewals} further lease grants"
+    );
+
+    let budget = envelope(BACKGROUND_DUTY_GLOBAL, BACKGROUND_BURST_GLOBAL, MAXIMUM_PERIOD);
+    let (at, worst) = h.worst_reserved_window(MAXIMUM_PERIOD);
+    assert!(
+        worst <= budget,
+        "RFC 15.3: worker time reserved at admission over the {MAXIMUM_PERIOD:?} window ending at {at:?} was \
+         {worst:?}, above the rate times window plus burst budget of {budget:?}, with every lease charged"
+    );
+}
+
+#[test]
+fn the_periodic_timer_is_due_no_later_than_the_maximum_period_while_capacity_exists() {
+    let fs = tree(&["a"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(1));
+    let maximum = Duration::from_secs(60);
+    let config =
+        Config { fixed_interval: Some(Duration::from_secs(600)), maximum_period: maximum, ..Default::default() };
+    let mut h = scanned(fs, config);
+    run_one_round(&mut h);
+
+    assert!(!h.stats().resource.is_throttled(), "the tree was throttled, so this test measures nothing");
+    let (_, due) = h.timer().expect("periodic timer armed");
+    assert!(
+        due <= h.now() + maximum,
+        "RFC 12: when capacity exists the periodic timer is due no later than now plus maximum_period, however \
+         long the configured fixed interval is; it was armed for {due:?} at {:?}",
+        h.now()
+    );
+}
+
+#[test]
+fn a_throttled_periodic_timer_waits_for_the_governor_beyond_the_maximum_period() {
+    let fs = tree(&["slow"]);
+    fs.set_cost(CostScope::path("slow"), FakeOp::ReadDir, Duration::from_secs(30));
+    let maximum = Duration::from_secs(60);
+    let config = Config { maximum_period: maximum, stuck_threshold: Duration::from_secs(300), ..Default::default() };
+    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+    h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(60));
+
+    assert!(h.governor().debt > Duration::ZERO, "the slow listing left no debt, so nothing throttles the timer");
+    assert!(h.stats().resource.is_throttled());
+    let (_, due) = h.timer().expect("timer armed");
+    assert!(
+        due > h.now() + maximum,
+        "RFC 12 and 15.3: the periodic timer MUST NOT fire earlier than the resume time the governor reports, \
+         even when that is later than maximum_period; it was armed for {due:?} at {:?}",
+        h.now()
+    );
+}
+
+#[test]
+fn a_session_reports_its_blocking_time_and_result_bytes_with_every_lease() {
+    let fs = wide(6);
+    fs.set_chunk_size(1);
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_millis(30));
+    fs.set_cost(CostScope::path("aaa"), FakeOp::Chunk, Duration::from_millis(5));
+    let session = fs.open_listing(fs.root(), &path("aaa"), 1000, CancellationToken::new());
+    let lease = Lease { entries: 2, operations: 8 };
+
+    let (continuation, first) = session.resume(lease);
+    assert_eq!(
+        first.blocking,
+        Some(Duration::from_millis(30)),
+        "RFC 15.2: the adapter reports the blocking time occupied by the job with every lease it consumes"
+    );
+    assert!(first.bytes > 0, "RFC 15.2: the adapter reports the bytes owned by the returned result");
+    let Continuation::Suspended(session) = continuation else {
+        panic!("a six-entry directory under a two-entry lease did not yield");
+    };
+
+    let (_, second) = session.resume(lease);
+    assert_eq!(
+        second.blocking,
+        Some(Duration::from_millis(5)),
+        "RFC 15.2: every lease reports its own cost, not the session's total"
+    );
+    assert!(
+        second.bytes > first.bytes,
+        "RFC 15.2: the reported byte count covers the result the session holds; it went from {} to {}",
+        first.bytes,
+        second.bytes
+    );
+}
+
+#[test]
+fn the_coordinator_records_reported_blocking_and_the_bytes_a_session_holds() {
+    let fs = wide(8);
+    fs.set_chunk_size(1);
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    fs.set_cost(CostScope::path("aaa"), FakeOp::Chunk, Duration::from_millis(10));
+    let config = Config { entries_per_lease: 2, max_in_flight: 1, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    assert!(h.advance_to_next_completion(), "the root listing never ran");
+    let big = h.pending_job_for("aaa").expect("the wide listing started");
+    assert!(h.advance_to_next_completion(), "the first lease never returned");
+
+    let suspended = h.stats();
+    assert_eq!(suspended.suspended_sessions, 1, "the first lease did not leave the session suspended");
+    assert!(
+        suspended.in_flight_listing_bytes > 0,
+        "RFC 15.2 and 16: the bytes a suspended session holds must be visible while it waits"
+    );
+    assert_eq!(
+        suspended.reported_blocking,
+        Duration::from_secs(5),
+        "RFC 15.2: the coordinator records the blocking time the adapter reported"
+    );
+    assert!(
+        suspended.governor.charged >= Duration::from_secs(5),
+        "RFC 15.2: a job whose reported blocking time is at most its occupancy is charged for it"
+    );
+
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_millis(1));
+    fs.set_cost(CostScope::path("aaa"), FakeOp::Chunk, Duration::from_millis(1));
+    for _ in 0..200 {
+        if h.held_listing_sessions() == 0 && h.pending_jobs().is_empty() {
+            break;
+        }
+        let next = h.now() + Duration::from_secs(30);
+        h.run_jobs_until(next);
+    }
+    assert_eq!(h.held_listing_sessions(), 0, "no session finished within the horizon this test allows");
+
+    let settled = h.stats();
+    assert_eq!(
+        settled.in_flight_listing_bytes, 0,
+        "RFC 15.2: a session that reached a terminal outcome holds no result bytes"
+    );
+    assert!(
+        settled.listing_bytes >= suspended.in_flight_listing_bytes,
+        "RFC 16: the bytes a finished session produced must be observable; it produced {} against the {} it held \
+         while suspended",
+        settled.listing_bytes,
+        suspended.in_flight_listing_bytes
+    );
+    assert!(h.admissions().iter().any(|a| a.job == big.id && a.lease > 0));
+}
+
+#[test]
+fn a_suspended_session_whose_guards_go_stale_is_discarded_and_holds_no_session() {
+    let fs = wide(8);
+    fs.set_chunk_size(1);
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    let config = Config { entries_per_lease: 2, max_in_flight: 1, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    assert!(h.advance_to_next_completion(), "the root listing never ran");
+    let big = h.pending_job_for("aaa").expect("the wide listing started");
+    assert!(h.advance_to_next_completion(), "the first lease never returned");
+    assert_eq!(h.stats().suspended_sessions, 1, "the first lease did not leave the session suspended");
+    assert_eq!(h.held_listing_sessions(), 1, "the suspended session was not held for its next lease");
+
+    let stale_before = h.stats().stale_results;
+    h.command(Command::InvalidatePolicy(vec![RelativePath::root()]));
+
+    assert_eq!(
+        h.stats().stale_results,
+        stale_before + 1,
+        "RFC 11.4: a suspended session whose publication guard is stale must be discarded"
+    );
+    assert!(
+        h.cancelled().contains(&big.id),
+        "RFC 10.2: a discarded suspended session must be cancelled so its handle and buffer are released"
+    );
+    assert_eq!(
+        h.held_listing_sessions(),
+        0,
+        "RFC 10.2: a session that outlives its job keeps an open handle and a partial buffer for nothing"
     );
 }

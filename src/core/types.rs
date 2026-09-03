@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Add;
 use std::time::Duration;
 
-use crate::entry::MetadataFields;
+use crate::entry::{Entry, LoadState, MetadataFields, Shape};
 use crate::fs::FsError;
 use crate::ids::*;
 use crate::path::{PathKey, RelativePath};
@@ -120,6 +120,35 @@ impl Reasons {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadKind {
+    Metadata,
+    Listing,
+}
+
+impl ReadKind {
+    pub fn need(self) -> ReadNeed {
+        match self {
+            ReadKind::Metadata => ReadNeed::Metadata,
+            ReadKind::Listing => ReadNeed::Listing,
+        }
+    }
+
+    pub fn operation(self) -> super::Operation {
+        match self {
+            ReadKind::Metadata => super::Operation::Metadata,
+            ReadKind::Listing => super::Operation::Listing,
+        }
+    }
+
+    pub fn still_required(self, current: &Entry) -> bool {
+        match self {
+            ReadKind::Listing => matches!(current.shape, Shape::Directory(LoadState::Loaded | LoadState::Loading)),
+            ReadKind::Metadata => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReadNeed {
     Metadata,
     Listing,
@@ -129,6 +158,14 @@ pub enum ReadNeed {
 impl ReadNeed {
     pub fn observes_children(self) -> bool {
         matches!(self, ReadNeed::Listing | ReadNeed::Enrichment(_))
+    }
+
+    pub fn kind(self) -> Option<ReadKind> {
+        match self {
+            ReadNeed::Metadata => Some(ReadKind::Metadata),
+            ReadNeed::Listing => Some(ReadKind::Listing),
+            ReadNeed::Enrichment(_) => None,
+        }
     }
 }
 
@@ -204,6 +241,7 @@ pub struct Guards {
 pub enum JobPhase {
     Registering(WatchRequestId),
     Queued,
+    Suspended,
     Running(MonotonicTime),
     Confirming(MonotonicTime),
 }
@@ -212,7 +250,7 @@ impl JobPhase {
     pub fn started(self) -> Option<MonotonicTime> {
         match self {
             JobPhase::Running(at) | JobPhase::Confirming(at) => Some(at),
-            JobPhase::Registering(_) | JobPhase::Queued => None,
+            JobPhase::Registering(_) | JobPhase::Queued | JobPhase::Suspended => None,
         }
     }
 }
@@ -258,6 +296,9 @@ pub struct ActiveJob {
     pub reasons: Reasons,
     pub barriers: Vec<CommandId>,
     pub designated: bool,
+    pub cancel: crate::fs::CancellationToken,
+    pub leases: u32,
+    pub session_open: bool,
 }
 
 impl ActiveJob {
@@ -274,10 +315,10 @@ pub enum RetryPhase {
 }
 
 impl RetryPhase {
-    pub fn required_need(self) -> ReadNeed {
+    pub fn required_kind(self) -> ReadKind {
         match self {
-            RetryPhase::Metadata => ReadNeed::Metadata,
-            RetryPhase::Listing | RetryPhase::WatchRegistrationThenListing => ReadNeed::Listing,
+            RetryPhase::Metadata => ReadKind::Metadata,
+            RetryPhase::Listing | RetryPhase::WatchRegistrationThenListing => ReadKind::Listing,
         }
     }
 }
@@ -872,7 +913,9 @@ pub enum JobOutcome {
     Accepted,
     Removed,
     Failed(FsError),
-    LimitExceeded,
+    Rejected(ListingRejection),
+    AncestorNotDirectory,
+    ResultMismatch,
     WatcherRegistrationFailed,
     Stale,
     Cancelled,
