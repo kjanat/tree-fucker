@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::domain::DomainCrossing;
 use crate::entry::MetadataFields;
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -58,6 +59,7 @@ pub struct Config {
     pub baseline_share: f64,
     pub class_weights: ClassWeights,
     pub metadata_fields: MetadataFields,
+    pub domain_crossing: DomainCrossing,
     pub lag_mode: LagMode,
     pub jitter_seed: u64,
 }
@@ -90,6 +92,7 @@ impl Default for Config {
             baseline_share: 0.5,
             class_weights: ClassWeights::default(),
             metadata_fields: MetadataFields::NONE,
+            domain_crossing: DomainCrossing::LoadOnDemand,
             lag_mode: LagMode::Reset,
             jitter_seed: 0,
         }

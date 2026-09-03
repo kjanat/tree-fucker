@@ -14,11 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use governor::Governor;
-pub use governor::{AdmissionDecision, GovernorView, Grant, GrantId};
+pub use governor::{AdmissionDecision, DomainAccount, GovernorView, Grant, GrantId};
 use types::*;
 pub use types::{Class, MonotonicTime};
 
 use crate::config::Config;
+use crate::domain::{DomainCapabilities, DomainCrossing, DomainIdentity, ProbeResult, StorageDomainId};
 use crate::entry::{LoadState, MetadataFields, Shape};
 use crate::error::Error;
 use crate::fs::{
@@ -35,6 +36,30 @@ use crate::update::{
 };
 
 const RESOURCE_LIMIT_HISTORY: usize = 64;
+const CROSSING_HISTORY: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossingEvent {
+    pub path: RelativePath,
+    pub parent: Option<StorageDomainId>,
+    pub child: StorageDomainId,
+    pub mode: DomainCrossing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainStat {
+    pub id: StorageDomainId,
+    pub identity: DomainIdentity,
+    pub capabilities: DomainCapabilities,
+    pub granted: Duration,
+    pub charged: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DomainRecord {
+    identity: DomainIdentity,
+    capabilities: DomainCapabilities,
+}
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -51,6 +76,7 @@ pub enum Command {
 pub enum JobOperation {
     Listing,
     Metadata,
+    DomainResolution,
     Enrichment { fields: MetadataFields },
 }
 
@@ -66,6 +92,7 @@ pub struct ListingWork {
 pub enum Work {
     Listing(ListingWork),
     Metadata,
+    ResolveDomain { parent: Option<Box<ProbeResult>> },
     Enrichment { fields: MetadataFields },
 }
 
@@ -81,6 +108,7 @@ impl JobSpec {
         match &self.work {
             Work::Listing(_) => JobOperation::Listing,
             Work::Metadata => JobOperation::Metadata,
+            Work::ResolveDomain { .. } => JobOperation::DomainResolution,
             Work::Enrichment { fields } => JobOperation::Enrichment { fields: *fields },
         }
     }
@@ -90,6 +118,7 @@ impl JobSpec {
 pub enum JobResult {
     Listing(SessionStep),
     Metadata(Result<EntryInfo, FsError>),
+    Domain(Result<ProbeResult, FsError>),
     Enrichment(Result<Enrichment, FsError>),
 }
 
@@ -188,6 +217,10 @@ pub struct Stats {
     pub enrichments: u64,
     pub enrichment_failures: u64,
     pub pending_enrichments: usize,
+    pub domains: Vec<DomainStat>,
+    pub crossings: Vec<CrossingEvent>,
+    pub domain_resolutions: u64,
+    pub pending_domain_resolutions: usize,
 }
 
 pub struct Coordinator {
@@ -210,6 +243,11 @@ pub struct Coordinator {
     entries: EntryStates,
     pending: HashMap<EntryId, PendingRequest>,
     pending_enrichment: HashMap<EntryId, EnrichmentRequest>,
+    pending_domain: HashMap<EntryId, DomainRequest>,
+    domain_records: BTreeMap<StorageDomainId, DomainRecord>,
+    unknown_domain: Option<StorageDomainId>,
+    crossing_events: VecDeque<CrossingEvent>,
+    domain_resolutions: u64,
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
     jobs: HashMap<JobId, ActiveJob>,
@@ -298,6 +336,11 @@ impl Coordinator {
             entries: EntryStates::default(),
             pending: HashMap::new(),
             pending_enrichment: HashMap::new(),
+            pending_domain: HashMap::new(),
+            domain_records: BTreeMap::new(),
+            unknown_domain: None,
+            crossing_events: VecDeque::new(),
+            domain_resolutions: 0,
             root_probe: None,
             probe_attempts: 0,
             jobs: HashMap::new(),
@@ -420,6 +463,7 @@ impl Coordinator {
         match need {
             ReadNeed::Listing => JobOperation::Listing,
             ReadNeed::Metadata => JobOperation::Metadata,
+            ReadNeed::Domain => JobOperation::DomainResolution,
             ReadNeed::Enrichment(fields) => JobOperation::Enrichment { fields },
         }
     }
@@ -461,6 +505,10 @@ impl Coordinator {
             Input::JobCompleted { job, result } => {
                 self.blocking_slots.remove(job);
                 let now = self.now;
+                if let Some(probe) = reported_domain(result) {
+                    let binding = self.bind_domain(&probe);
+                    self.governor.attribute(GrantId::Job(*job), binding.id);
+                }
                 if let JobResult::Listing(step) = result
                     && let Some(blocking) = step.cost.blocking
                 {
@@ -585,7 +633,80 @@ impl Coordinator {
             enrichments: self.enrichments,
             enrichment_failures: self.enrichment_failures,
             pending_enrichments: self.pending_enrichment.len(),
+            domains: self.domain_stats(),
+            crossings: self.crossing_events.iter().cloned().collect(),
+            domain_resolutions: self.domain_resolutions,
+            pending_domain_resolutions: self.pending_domain.len(),
         }
+    }
+
+    fn domain_stats(&self) -> Vec<DomainStat> {
+        let accounts = self.governor.view(self.now).domains;
+        self.domain_records
+            .iter()
+            .map(|(id, record)| {
+                let account = accounts.get(id).copied().unwrap_or_default();
+                DomainStat {
+                    id: *id,
+                    identity: record.identity.clone(),
+                    capabilities: record.capabilities.clone(),
+                    granted: account.granted,
+                    charged: account.charged,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn bind_domain(&mut self, probe: &ProbeResult) -> DomainBinding {
+        let (id, record) = match probe.identity.key() {
+            Some(key) => (
+                StorageDomainId::of(key),
+                DomainRecord { identity: probe.identity.clone(), capabilities: probe.capabilities.clone() },
+            ),
+            None => {
+                let id = match self.unknown_domain {
+                    Some(id) => id,
+                    None => {
+                        let id = StorageDomainId::fresh();
+                        self.unknown_domain = Some(id);
+                        id
+                    }
+                };
+                (id, DomainRecord { identity: DomainIdentity::Unknown, capabilities: DomainCapabilities::default() })
+            }
+        };
+        self.domain_records.insert(id, record);
+        DomainBinding { id, probe: probe.clone() }
+    }
+
+    pub(super) fn domain_of(&self, entry: EntryId) -> Option<StorageDomainId> {
+        if let Some(binding) = self.dir_state(entry).and_then(|d| d.domain.as_ref()) {
+            return Some(binding.id);
+        }
+        let parent = self.parent_of(entry)?;
+        self.dir_state(parent).and_then(|d| d.domain.as_ref()).map(|binding| binding.id)
+    }
+
+    pub(super) fn parent_domain_probe(&self, entry: EntryId) -> Option<ProbeResult> {
+        let parent = self.parent_of(entry)?;
+        self.dir_state(parent).and_then(|d| d.domain.as_ref()).map(|binding| binding.probe.clone())
+    }
+
+    pub(super) fn crossing_mode(
+        &self,
+        entry: EntryId,
+        path: &RelativePath,
+        child: &DomainCapabilities,
+    ) -> DomainCrossing {
+        let context = self.parent_context(entry).unwrap_or_else(PolicyContext::unit);
+        self.policy.crossing(&context, path, child, self.config.domain_crossing)
+    }
+
+    pub(super) fn record_crossing(&mut self, event: CrossingEvent) {
+        if self.crossing_events.len() >= CROSSING_HISTORY {
+            self.crossing_events.pop_front();
+        }
+        self.crossing_events.push_back(event);
     }
 
     fn after_input(&mut self) {
@@ -813,7 +934,12 @@ impl Coordinator {
         }
     }
 
-    fn publish_delta(&mut self, previous: SnapshotVersion, changes: Vec<crate::update::PathChange>) {
+    fn publish_delta(
+        &mut self,
+        previous: SnapshotVersion,
+        changes: Vec<crate::update::PathChange>,
+        crossings: Vec<CrossingEvent>,
+    ) {
         let health = self.compute_health();
         let errors = std::mem::take(&mut self.errors);
         self.last_published_health = Some(health.clone());
@@ -823,6 +949,7 @@ impl Coordinator {
             new_version: self.snapshot.version(),
             snapshot: self.snapshot.clone(),
             changes,
+            crossings,
             health,
             errors,
         }))));
@@ -917,6 +1044,9 @@ impl Coordinator {
         if let Some(t) = self.pending_enrichment.values().filter_map(|r| r.due).min() {
             consider(t);
         }
+        if let Some(t) = self.pending_domain.values().filter_map(|r| r.due).min() {
+            consider(t);
+        }
         if let Some(t) = self.watcher_restart_due {
             consider(t);
         }
@@ -943,5 +1073,16 @@ impl Coordinator {
             self.watcher_restart_due = None;
             self.restart_watcher();
         }
+    }
+}
+
+fn reported_domain(result: &JobResult) -> Option<ProbeResult> {
+    match result {
+        JobResult::Listing(SessionStep {
+            state: crate::fs::SessionState::Finished(crate::fs::SessionOutcome::Complete(listing)),
+            ..
+        }) => Some((*listing.domain).clone()),
+        JobResult::Domain(Ok(probe)) => Some(probe.clone()),
+        JobResult::Domain(Err(_)) | JobResult::Listing(_) | JobResult::Metadata(_) | JobResult::Enrichment(_) => None,
     }
 }

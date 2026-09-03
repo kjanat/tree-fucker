@@ -3,11 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use crate::domain::{
+    DeclaredProbe, DomainCapabilities, DomainIdentity, DomainKey, DomainProbe, IdentitySource, IdentitySpace,
+    IdentitySpaceKey, KindSource, ProbeResult,
+};
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
     CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
-    FsError, HintKind, IdentitySource, KindSource, Lease, ListingSession, Observation, ObservationSources,
-    ObservedKind, SessionCost, SessionOutcome, WatcherEvent, WatcherKind, WatcherSink, entry_bytes,
+    FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome, WatcherEvent,
+    WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -19,6 +23,7 @@ pub enum FakeOp {
     Chunk,
     ResolveKind,
     ResolveIdentity,
+    ResolveDomain,
     Enrich,
     Watch,
 }
@@ -107,8 +112,11 @@ struct Inner {
     root_kind: EntryKind,
     costs: HashMap<(CostScope, FakeOp), Duration>,
     domains: Vec<(RelativePath, DomainId)>,
-    sources: HashMap<DomainId, ObservationSources>,
-    default_sources: ObservationSources,
+    capabilities: HashMap<DomainId, DomainCapabilities>,
+    default_capabilities: DomainCapabilities,
+    identity_spaces: HashMap<DomainId, u64>,
+    unknown_identities: BTreeSet<DomainId>,
+    inline_domains: bool,
     unknown_kinds: BTreeSet<RelativePath>,
     chunk: usize,
     ignore_cancellation: bool,
@@ -130,11 +138,7 @@ fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
 
 impl FakeFileSystem {
     pub fn new(watcher: WatcherKind) -> FakeFileSystem {
-        FakeFileSystem::with_capabilities(FsCapabilities {
-            case: CaseSensitivity::Sensitive,
-            stable_identity: true,
-            watcher,
-        })
+        FakeFileSystem::with_capabilities(FsCapabilities { case: CaseSensitivity::Sensitive, watcher })
     }
 
     pub fn with_capabilities(caps: FsCapabilities) -> FakeFileSystem {
@@ -174,8 +178,11 @@ impl FakeFileSystem {
                 root_kind: EntryKind::Directory,
                 costs: HashMap::new(),
                 domains: Vec::new(),
-                sources: HashMap::new(),
-                default_sources: ObservationSources::INLINE,
+                capabilities: HashMap::new(),
+                default_capabilities: DomainCapabilities::inline(),
+                identity_spaces: HashMap::new(),
+                unknown_identities: BTreeSet::new(),
+                inline_domains: true,
                 unknown_kinds: BTreeSet::new(),
                 chunk: DEFAULT_CHUNK,
                 ignore_cancellation: false,
@@ -472,12 +479,24 @@ impl FakeFileSystem {
         Self::scoped_cost(&lock(&self.inner), op, path)
     }
 
-    pub fn set_sources(&self, domain: DomainId, sources: ObservationSources) {
-        lock(&self.inner).sources.insert(domain, sources);
+    pub fn set_capabilities(&self, domain: DomainId, capabilities: DomainCapabilities) {
+        lock(&self.inner).capabilities.insert(domain, capabilities);
     }
 
-    pub fn set_default_sources(&self, sources: ObservationSources) {
-        lock(&self.inner).default_sources = sources;
+    pub fn set_default_capabilities(&self, capabilities: DomainCapabilities) {
+        lock(&self.inner).default_capabilities = capabilities;
+    }
+
+    pub fn set_identity_space(&self, domain: DomainId, space: u64) {
+        lock(&self.inner).identity_spaces.insert(domain, space);
+    }
+
+    pub fn report_unknown_domain_identity(&self, domain: DomainId) {
+        lock(&self.inner).unknown_identities.insert(domain);
+    }
+
+    pub fn report_inline_domains(&self, inline: bool) {
+        lock(&self.inner).inline_domains = inline;
     }
 
     pub fn report_unknown_kind(&self, p: &str) {
@@ -485,21 +504,61 @@ impl FakeFileSystem {
         lock(&self.inner).unknown_kinds.insert(path);
     }
 
-    pub fn sources_of(&self, path: &RelativePath) -> ObservationSources {
-        let inner = lock(&self.inner);
-        Self::sources_for(&inner, path)
+    pub fn domain_key(domain: DomainId) -> DomainKey {
+        DomainKey::declared(domain.get())
     }
 
-    fn sources_for(inner: &Inner, path: &RelativePath) -> ObservationSources {
+    pub fn capabilities_of(&self, path: &RelativePath) -> DomainCapabilities {
+        let inner = lock(&self.inner);
+        Self::capabilities_for(&inner, path)
+    }
+
+    pub fn is_domain_root(&self, p: &str) -> bool {
+        let path = Self::path(p);
+        let inner = lock(&self.inner);
+        Self::domain_root(&inner, &path)
+    }
+
+    fn capabilities_for(inner: &Inner, path: &RelativePath) -> DomainCapabilities {
+        Self::capabilities_of_domain(inner, Self::domain_for(inner, path))
+    }
+
+    fn capabilities_of_domain(inner: &Inner, domain: DomainId) -> DomainCapabilities {
+        let mut capabilities =
+            inner.capabilities.get(&domain).cloned().unwrap_or_else(|| inner.default_capabilities.clone());
+        let space = inner.identity_spaces.get(&domain).copied().unwrap_or(0);
+        capabilities.identity_space = IdentitySpace::Known(IdentitySpaceKey::declared(space));
+        capabilities
+    }
+
+    fn domain_root(inner: &Inner, path: &RelativePath) -> bool {
         let domain = Self::domain_for(inner, path);
-        inner.sources.get(&domain).copied().unwrap_or(inner.default_sources)
+        match path.parent() {
+            Some(parent) => Self::domain_for(inner, &parent) != domain,
+            None => true,
+        }
+    }
+
+    fn probe_for(inner: &Inner, path: &RelativePath, parent: Option<&ProbeResult>) -> ProbeResult {
+        let domain = Self::domain_for(inner, path);
+        let identity = if inner.unknown_identities.contains(&domain) {
+            DomainIdentity::Unknown
+        } else {
+            DomainIdentity::Known(Self::domain_key(domain))
+        };
+        let probe =
+            DeclaredProbe::new(identity, Self::capabilities_of_domain(inner, domain), Self::domain_root(inner, path));
+        match probe.probe(Path::new("."), parent) {
+            Ok(result) => result,
+            Err(_) => ProbeResult::unknown(),
+        }
     }
 
     fn enumerated_kind(inner: &Inner, path: &RelativePath, kind: EntryKind) -> ObservedKind {
-        match Self::sources_for(inner, path).kind {
+        match Self::capabilities_for(inner, path).kind_source {
             KindSource::Always => ObservedKind::Resolved(kind),
             KindSource::Never => ObservedKind::Unresolved,
-            KindSource::Sometimes => {
+            KindSource::Sometimes | KindSource::Unknown => {
                 if inner.unknown_kinds.contains(path) {
                     ObservedKind::Unresolved
                 } else {
@@ -510,8 +569,8 @@ impl FakeFileSystem {
     }
 
     fn observe(inner: &mut Inner, path: &RelativePath, info: EntryInfo) -> (Observation, ChildWork) {
-        let sources = Self::sources_for(inner, path);
-        let metadata = info.metadata.project(sources.metadata.inline());
+        let sources = Self::capabilities_for(inner, path);
+        let metadata = info.metadata.project(sources.metadata_sources.inline());
         let mut work = ChildWork::default();
         let kind = match Self::enumerated_kind(inner, path, info.kind) {
             ObservedKind::Resolved(kind) => ObservedKind::Resolved(kind),
@@ -528,9 +587,9 @@ impl FakeFileSystem {
                 }
             }
         };
-        let identity = match sources.identity {
+        let identity = match sources.identity_source {
             IdentitySource::Inline => info.identity,
-            IdentitySource::None => None,
+            IdentitySource::None | IdentitySource::Unknown => None,
             IdentitySource::PerChildRead => {
                 work.identity_reads += 1;
                 work.blocking += Self::scoped_cost(inner, FakeOp::ResolveIdentity, path);
@@ -545,22 +604,26 @@ impl FakeFileSystem {
     }
 
     fn child_operations(inner: &Inner, path: &RelativePath, kind: EntryKind) -> usize {
-        let sources = Self::sources_for(inner, path);
+        let sources = Self::capabilities_for(inner, path);
         let unresolved = usize::from(Self::enumerated_kind(inner, path, kind) == ObservedKind::Unresolved);
-        let identity = usize::from(sources.identity == IdentitySource::PerChildRead);
+        let identity = usize::from(sources.identity_source == IdentitySource::PerChildRead);
         unresolved + identity
     }
 
     fn child_cost(inner: &Inner, path: &RelativePath, kind: EntryKind) -> Duration {
-        let sources = Self::sources_for(inner, path);
+        let sources = Self::capabilities_for(inner, path);
         let mut total = Duration::ZERO;
         if Self::enumerated_kind(inner, path, kind) == ObservedKind::Unresolved {
             total += Self::scoped_cost(inner, FakeOp::ResolveKind, path);
         }
-        if sources.identity == IdentitySource::PerChildRead {
+        if sources.identity_source == IdentitySource::PerChildRead {
             total += Self::scoped_cost(inner, FakeOp::ResolveIdentity, path);
         }
         total
+    }
+
+    pub fn domain_resolution_cost(&self, path: &RelativePath) -> Duration {
+        Self::scoped_cost(&lock(&self.inner), FakeOp::ResolveDomain, path)
     }
 
     pub fn ignore_cancellation(&self, ignore: bool) {
@@ -841,8 +904,23 @@ impl FileSystem for FakeFileSystem {
         })
     }
 
-    fn observation_sources(&self, path: &RelativePath) -> ObservationSources {
-        Self::sources_for(&lock(&self.inner), path)
+    fn resolve_domain(
+        &self,
+        _root: &Path,
+        path: &RelativePath,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, FsError> {
+        let mut inner = lock(&self.inner);
+        inner.ops.push((FakeOp::ResolveDomain, path.clone()));
+        if Self::take_panic(&mut inner, path, FakeOp::ResolveDomain) {
+            drop(inner);
+            panic!("injected domain resolution panic for {path}");
+        }
+        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::ResolveDomain) {
+            return Err(err);
+        }
+        Self::lookup(&inner, path)?;
+        Ok(Self::probe_for(&inner, path, parent))
     }
 
     fn enrich(&self, _root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError> {
@@ -916,6 +994,8 @@ struct ChildWork {
 struct OpenedDirectory {
     directory: EntryInfo,
     supplied_fields: MetadataFields,
+    domain: ProbeResult,
+    inline_domains: bool,
     order: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)>,
 }
 
@@ -953,9 +1033,11 @@ impl FakeSession {
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let supplied_fields = FakeFileSystem::sources_for(&inner, &self.path).metadata.inline();
+        let supplied_fields = FakeFileSystem::capabilities_for(&inner, &self.path).metadata_sources.inline();
+        let domain = FakeFileSystem::probe_for(&inner, &self.path, None);
+        let inline_domains = inner.inline_domains;
         let order = FakeFileSystem::enumeration_order(&inner, &self.path);
-        self.opened = Some(OpenedDirectory { directory, supplied_fields, order });
+        self.opened = Some(OpenedDirectory { directory, supplied_fields, domain, inline_domains, order });
         Ok(())
     }
 
@@ -986,22 +1068,29 @@ impl FakeSession {
         let Some(opened) = self.opened.as_ref() else {
             return;
         };
+        let inline_domains = opened.inline_domains;
+        let parent = opened.domain.clone();
         let mut inner = lock(&self.inner);
         for offset in 0..count {
             let (name, child, info) = opened.order[self.cursor + offset].clone();
-            let observation = match child {
+            let (observation, domain) = match child {
                 Some(child) => {
                     let (observation, work) = FakeFileSystem::observe(&mut inner, &child, info);
                     cost.kind_resolutions += work.kind_resolutions;
                     cost.metadata_operations += work.kind_resolutions;
                     cost.identity_reads += work.identity_reads;
                     *blocking += work.blocking;
-                    observation
+                    let domain = if inline_domains && info.kind == EntryKind::Directory {
+                        Some(Box::new(FakeFileSystem::probe_for(&inner, &child, Some(&parent))))
+                    } else {
+                        None
+                    };
+                    (observation, domain)
                 }
-                None => Observation::resolved(info),
+                None => (Observation::resolved(info), None),
             };
             self.bytes += entry_bytes(&name);
-            self.entries.push(DirEntry { name, info: observation });
+            self.entries.push(DirEntry { name, info: observation, domain });
         }
         drop(inner);
         self.cursor += count;
@@ -1020,6 +1109,7 @@ impl FakeSession {
             directory: opened.directory,
             entries: std::mem::take(&mut self.entries),
             supplied_fields: opened.supplied_fields,
+            domain: Box::new(opened.domain.clone()),
         })
     }
 }

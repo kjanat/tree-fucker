@@ -315,6 +315,9 @@ impl Actor {
                                 JobResult::Listing(step)
                             }
                             Work::Metadata => JobResult::Metadata(fs.metadata(&root, &spec.path)),
+                            Work::ResolveDomain { parent } => {
+                                JobResult::Domain(fs.resolve_domain(&root, &spec.path, parent.as_deref()))
+                            }
                             Work::Enrichment { fields } => JobResult::Enrichment(fs.enrich(&root, &spec.path, fields)),
                         };
                         guard.finish(Input::JobCompleted { job, result });

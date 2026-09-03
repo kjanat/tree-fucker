@@ -173,6 +173,7 @@ pub struct Health {
 pub enum Operation {
     Listing,
     Metadata,
+    DomainResolution,
     WatchRegistration,
     RootProbe,
     Watcher,
@@ -234,6 +235,7 @@ pub struct Update {
     pub new_version: SnapshotVersion,
     pub snapshot: Snapshot,
     pub changes: Vec<PathChange>,
+    pub crossings: Vec<crate::core::CrossingEvent>,
     pub health: Health,
     pub errors: Vec<RecoverableError>,
 }

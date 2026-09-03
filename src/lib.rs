@@ -15,13 +15,18 @@ pub mod tree;
 pub mod update;
 
 pub use config::{ClassWeights, Config, LagMode, WatchRegistrationFailure};
+pub use domain::{
+    AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
+    DomainCrossing, DomainIdentity, DomainKey, DomainProbe, FilesystemSemantics, IdentityReliability, IdentitySource,
+    IdentitySpace, IdentitySpaceKey, KindSource, MediaHint, MetadataSource, MetadataSources, ProbeError, ProbeResult,
+    StorageDomainId, TimestampGranularity, TransportHint, WatcherAvailability, WatcherCapabilities, WatcherScope,
+};
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};
 pub use fs::{
-    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FieldSource, FileSystem,
-    FsCapabilities, FsError, HintKind, IdentitySource, KindSource, Lease, ListingSession, MetadataSources, Observation,
-    ObservationSources, ObservedKind, SessionCost, SessionOutcome, SessionState, SessionStep, WatcherEvent,
-    WatcherKind, WatcherSink, entry_bytes, list_directory,
+    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
+    FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome, SessionState,
+    SessionStep, WatcherEvent, WatcherKind, WatcherSink, entry_bytes, list_directory,
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,

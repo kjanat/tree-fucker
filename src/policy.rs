@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::domain::{DomainCapabilities, DomainCrossing};
 use crate::entry::EntryKind;
 use crate::fs::{DirectoryListing, EntryInfo};
 use crate::ids::PolicyRevision;
@@ -53,6 +54,16 @@ pub trait ScanPolicy: Send + Sync {
     fn root_context(&self, root: &EntryInfo) -> PolicyContext;
     fn classify(&self, parent: &PolicyContext, path: &RelativePath, info: &EntryInfo) -> ScanDecision;
     fn child_context(&self, parent: &PolicyContext, path: &RelativePath, listing: &DirectoryListing) -> PolicyContext;
+
+    fn crossing(
+        &self,
+        _parent: &PolicyContext,
+        _path: &RelativePath,
+        _child: &DomainCapabilities,
+        configured: DomainCrossing,
+    ) -> DomainCrossing {
+        configured
+    }
 }
 
 pub struct PathPredicate<F> {

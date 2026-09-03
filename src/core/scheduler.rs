@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use super::governor::GrantId;
+use super::governor::{GrantId, Reservation};
 use super::types::*;
 use super::{Coordinator, JobSpec, ListingWork, Output, Work};
 use crate::entry::{LoadState, Shape};
@@ -17,6 +17,7 @@ impl Coordinator {
         let periodic = self.baseline_due;
         self.materialize_retries();
         self.materialize_enrichment();
+        self.materialize_domain_requests();
         if periodic {
             self.ensure_round();
             self.materialize_priority();
@@ -63,8 +64,17 @@ impl Coordinator {
     fn try_grant(&mut self, entry: Option<EntryId>, need: ReadNeed, path: &RelativePathOwned) -> Option<JobGrant> {
         let id = self.next_job_id;
         let registration = entry.map(|e| self.needs_registration(e, need)).unwrap_or(false);
+        let domain = entry.and_then(|e| self.domain_of(e));
         let now = self.now;
-        match self.governor.try_admit(GrantId::Job(id), path.clone(), 1, u32::from(registration), 0, now) {
+        let reservation = Reservation {
+            id: GrantId::Job(id),
+            path: path.clone(),
+            reads: 1,
+            registrations: u32::from(registration),
+            lease: 0,
+            domain,
+        };
+        match self.governor.try_admit(reservation, now) {
             Ok(_) => {
                 self.next_job_id = id.next();
                 Some(JobGrant { id, registration })
@@ -91,7 +101,10 @@ impl Coordinator {
             }
             let now = self.now;
             let lease = job.leases;
-            if self.governor.try_admit(GrantId::Job(id), job.path.clone(), 1, 0, lease, now).is_err() {
+            let domain = job.entry().and_then(|entry| self.domain_of(entry));
+            let reservation =
+                Reservation { id: GrantId::Job(id), path: job.path.clone(), reads: 1, registrations: 0, lease, domain };
+            if self.governor.try_admit(reservation, now).is_err() {
                 continue;
             }
             if let Some(job) = self.jobs.get_mut(&id) {
@@ -117,6 +130,9 @@ impl Coordinator {
                 resume: job.session_open,
             }),
             ReadNeed::Metadata => Work::Metadata,
+            ReadNeed::Domain => Work::ResolveDomain {
+                parent: job.entry().and_then(|entry| self.parent_domain_probe(entry)).map(Box::new),
+            },
             ReadNeed::Enrichment(fields) => Work::Enrichment { fields },
         }
     }
@@ -126,10 +142,23 @@ impl Coordinator {
     }
 
     fn ready_expedited(&self) -> Vec<Ready> {
+        let mut domains: Vec<(crate::path::PathKey, EntryId)> = self
+            .pending_domain
+            .iter()
+            .filter(|(id, request)| {
+                !self.active_by_entry.contains_key(id) && self.snapshot.contains_id(**id) && request.ready(self.now)
+            })
+            .map(|(id, request)| (self.snapshot.key(&request.path), *id))
+            .collect();
+        domains.sort();
         let mut reads: Vec<(crate::path::PathKey, EntryId)> = self
             .pending
             .iter()
-            .filter(|(id, _)| !self.active_by_entry.contains_key(id) && self.snapshot.contains_id(**id))
+            .filter(|(id, _)| {
+                !self.active_by_entry.contains_key(id)
+                    && self.snapshot.contains_id(**id)
+                    && !self.pending_domain.contains_key(id)
+            })
             .map(|(id, request)| (self.snapshot.key(&request.path), *id))
             .collect();
         reads.sort();
@@ -145,11 +174,21 @@ impl Coordinator {
             .map(|(id, request)| (self.snapshot.key(&request.path), *id))
             .collect();
         enrichments.sort();
-        reads
+        domains
             .into_iter()
-            .map(|(_, id)| Ready::Read(id))
+            .map(|(_, id)| Ready::Domain(id))
+            .chain(reads.into_iter().map(|(_, id)| Ready::Read(id)))
             .chain(enrichments.into_iter().map(|(_, id)| Ready::Enrich(id)))
             .collect()
+    }
+
+    fn materialize_domain_requests(&mut self) {
+        let now = self.now;
+        for request in self.pending_domain.values_mut() {
+            if request.due.is_some_and(|at| at <= now) {
+                request.due = None;
+            }
+        }
     }
 
     fn materialize_retries(&mut self) {
@@ -350,6 +389,7 @@ impl Coordinator {
             }
             let reasons = match candidate {
                 Ready::Read(id) => self.pending.get(&id).map(|request| request.reasons),
+                Ready::Domain(id) => self.pending_domain.get(&id).map(|request| request.reasons),
                 Ready::Enrich(id) => self.pending_enrichment.get(&id).map(|request| request.reasons),
             };
             let Some(reasons) = reasons else {
@@ -427,6 +467,13 @@ impl Coordinator {
             for candidate in by_class[i].clone().into_iter().take(take) {
                 let request = match candidate {
                     Ready::Read(id) => self.pending.get(&id).cloned(),
+                    Ready::Domain(id) => self.pending_domain.get(&id).map(|request| PendingRequest {
+                        path: request.path.clone(),
+                        need: ReadNeed::Domain,
+                        reasons: request.reasons,
+                        barriers: Vec::new(),
+                        designate_for_round: None,
+                    }),
                     Ready::Enrich(id) => self.pending_enrichment.get(&id).map(|request| PendingRequest {
                         path: request.path.clone(),
                         need: ReadNeed::Enrichment(request.fields),
@@ -445,6 +492,9 @@ impl Coordinator {
                 match candidate {
                     Ready::Read(id) => {
                         self.pending.remove(&id);
+                    }
+                    Ready::Domain(id) => {
+                        self.pending_domain.remove(&id);
                     }
                     Ready::Enrich(id) => {
                         self.pending_enrichment.remove(&id);
@@ -719,13 +769,14 @@ pub(super) struct JobGrant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Ready {
     Read(EntryId),
+    Domain(EntryId),
     Enrich(EntryId),
 }
 
 impl Ready {
     fn entry(self) -> EntryId {
         match self {
-            Ready::Read(id) | Ready::Enrich(id) => id,
+            Ready::Read(id) | Ready::Domain(id) | Ready::Enrich(id) => id,
         }
     }
 }

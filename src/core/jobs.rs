@@ -26,6 +26,7 @@ impl Coordinator {
                 ..
             })
             | JobResult::Metadata(Err(FsError::Fatal(m)))
+            | JobResult::Domain(Err(FsError::Fatal(m)))
             | JobResult::Enrichment(Err(FsError::Fatal(m))) => Some(m.clone()),
             _ => None,
         };
@@ -125,6 +126,12 @@ impl Coordinator {
                 let outcome = self.commit_metadata(&job, info);
                 self.finish_job(id, outcome);
             }
+            (ReadNeed::Domain, _, JobResult::Domain(Ok(probe))) => {
+                let outcome = self.commit_domain(&job, probe);
+                self.finish_job(id, outcome);
+            }
+            (ReadNeed::Domain, _, JobResult::Domain(Err(FsError::NotFound))) => self.on_not_found(&job),
+            (ReadNeed::Domain, _, JobResult::Domain(Err(err))) => self.finish_job(id, JobOutcome::Failed(err)),
             (ReadNeed::Enrichment(fields), _, JobResult::Enrichment(Ok(read))) => {
                 let outcome = self.commit_enrichment(&job, fields, read);
                 self.finish_job(id, outcome);
@@ -222,7 +229,7 @@ impl Coordinator {
                 self.finish_job(job.id, JobOutcome::Accepted);
                 self.schedule_probe(true);
             }
-            JobResult::Listing(_) | JobResult::Enrichment(_) => {
+            JobResult::Listing(_) | JobResult::Enrichment(_) | JobResult::Domain(_) => {
                 self.finish_job(job.id, JobOutcome::Accepted);
                 self.schedule_probe(true);
             }
@@ -292,11 +299,11 @@ impl Coordinator {
         self.queue_order.retain(|q| *q != id);
         if let Some(entry) = job.entry() {
             match job.need.kind() {
-                None => {
-                    if let ReadNeed::Enrichment(fields) = job.need {
-                        self.settle_enrichment(entry, &job, fields, &outcome);
-                    }
-                }
+                None => match job.need {
+                    ReadNeed::Enrichment(fields) => self.settle_enrichment(entry, &job, fields, &outcome),
+                    ReadNeed::Domain => self.settle_domain(entry, &job, &outcome),
+                    ReadNeed::Metadata | ReadNeed::Listing => {}
+                },
                 Some(kind) => {
                     self.settle_obligations(&job, &outcome);
                     self.settle_commands(&job, &outcome);
@@ -640,6 +647,61 @@ impl Coordinator {
                 self.retry_enrichment(entry, job, fields);
             }
         }
+    }
+
+    fn settle_domain(&mut self, entry: EntryId, job: &ActiveJob, outcome: &JobOutcome) {
+        match outcome {
+            JobOutcome::Accepted | JobOutcome::Removed => {
+                self.pending_domain.remove(&entry);
+            }
+            JobOutcome::Stale | JobOutcome::Cancelled => {
+                if self.snapshot.contains_id(entry) {
+                    self.request_domain(entry, job.path.clone(), job.reasons);
+                }
+            }
+            JobOutcome::Failed(err) => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, err.clone());
+                self.retry_domain(entry, job);
+            }
+            JobOutcome::Rejected(ListingRejection::LimitExceeded) => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::LimitExceeded);
+                self.retry_domain(entry, job);
+            }
+            JobOutcome::Rejected(ListingRejection::MalformedNames | ListingRejection::UnresolvedChild)
+            | JobOutcome::WatcherRegistrationFailed => self.retry_domain(entry, job),
+            JobOutcome::AncestorNotDirectory => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::Fs(FsError::NotDirectory));
+                self.retry_domain(entry, job);
+            }
+            JobOutcome::ResultMismatch => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::ResultMismatch);
+                self.retry_domain(entry, job);
+            }
+            JobOutcome::WorkerLost => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::WorkerLost);
+                self.retry_domain(entry, job);
+            }
+            JobOutcome::Stuck => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::WorkerStuck);
+                self.retry_domain(entry, job);
+            }
+        }
+    }
+
+    fn retry_domain(&mut self, entry: EntryId, job: &ActiveJob) {
+        let Some(current) = self.snapshot.get_by_id(entry).cloned() else {
+            return;
+        };
+        if !current.is_directory() {
+            self.pending_domain.remove(&entry);
+            return;
+        }
+        let attempts = self.pending_domain.get(&entry).map(|r| r.attempts + 1).unwrap_or(1);
+        let due = self.now + self.backoff(attempts);
+        let mut reasons = job.reasons;
+        reasons.retry = true;
+        self.pending_domain
+            .insert(entry, DomainRequest { path: current.path.clone(), reasons, attempts, due: Some(due) });
     }
 
     fn retry_enrichment(&mut self, entry: EntryId, job: &ActiveJob, fields: crate::entry::MetadataFields) {

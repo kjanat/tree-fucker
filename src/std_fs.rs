@@ -2,17 +2,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::domain::{DeclarationSource, DomainProbe, IdentitySource, KindSource, MetadataSources, ProbeResult};
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
     CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
-    FsError, IdentitySource, KindSource, Lease, ListingSession, MetadataSources, Observation, ObservationSources,
-    ObservedKind, SessionCost, SessionOutcome, WatcherKind, WatcherSink, entry_bytes,
+    FsError, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome, WatcherKind, WatcherSink,
+    entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
 
 pub struct StdFileSystem {
     case: CaseSensitivity,
+    probe: Arc<dyn DomainProbe>,
+}
+
+fn platform_probe() -> Arc<dyn DomainProbe> {
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(crate::domain::LinuxProbe::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(crate::domain::MacOsProbe::new())
+    }
+    #[cfg(windows)]
+    {
+        Arc::new(crate::domain::WindowsProbe::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        Arc::new(crate::domain::UnknownProbe)
+    }
 }
 
 impl StdFileSystem {
@@ -23,12 +44,26 @@ impl StdFileSystem {
             } else {
                 CaseSensitivity::Sensitive
             },
+            probe: platform_probe(),
         }
     }
 
     pub fn with_case(case: CaseSensitivity) -> StdFileSystem {
-        StdFileSystem { case }
+        StdFileSystem { case, probe: platform_probe() }
     }
+
+    pub fn with_probe(case: CaseSensitivity, probe: Arc<dyn DomainProbe>) -> StdFileSystem {
+        StdFileSystem { case, probe }
+    }
+}
+
+fn probe_at(probe: &dyn DomainProbe, full: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, FsError> {
+    let mut result = probe.probe(full, parent)?;
+    result.capabilities.kind_source = KindSource::Sometimes;
+    result.capabilities.identity_source = if cfg!(unix) { IdentitySource::Inline } else { IdentitySource::None };
+    result.capabilities.metadata_sources = MetadataSources::PER_CHILD_READ;
+    result.capabilities.sources.observation = DeclarationSource::Declared;
+    Ok(result)
 }
 
 impl Default for StdFileSystem {
@@ -97,11 +132,20 @@ fn identity_of(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
 
 impl FileSystem for StdFileSystem {
     fn capabilities(&self) -> FsCapabilities {
-        FsCapabilities { case: self.case, stable_identity: cfg!(unix), watcher: WatcherKind::None }
+        FsCapabilities { case: self.case, watcher: WatcherKind::None }
     }
 
     fn canonicalize(&self, root: &Path) -> Result<PathBuf, FsError> {
         Ok(std::fs::canonicalize(root)?)
+    }
+
+    fn resolve_domain(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, FsError> {
+        probe_at(self.probe.as_ref(), &path.under(root), parent)
     }
 
     fn metadata(&self, root: &Path, path: &RelativePath) -> Result<EntryInfo, FsError> {
@@ -117,15 +161,15 @@ impl FileSystem for StdFileSystem {
         ceiling: usize,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession> {
-        Box::new(StdSession { full: path.under(root), ceiling, cancel, opened: None, entries: Vec::new(), bytes: 0 })
-    }
-
-    fn observation_sources(&self, _path: &RelativePath) -> ObservationSources {
-        ObservationSources {
-            kind: KindSource::Sometimes,
-            identity: if cfg!(unix) { IdentitySource::Inline } else { IdentitySource::None },
-            metadata: MetadataSources::PER_CHILD_READ,
-        }
+        Box::new(StdSession {
+            full: path.under(root),
+            probe: self.probe.clone(),
+            ceiling,
+            cancel,
+            opened: None,
+            entries: Vec::new(),
+            bytes: 0,
+        })
     }
 
     fn enrich(&self, root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError> {
@@ -166,11 +210,13 @@ struct Opened {
     directory: EntryInfo,
     own: std::fs::Metadata,
     iterator: std::fs::ReadDir,
+    domain: ProbeResult,
     exhausted: bool,
 }
 
 struct StdSession {
     full: PathBuf,
+    probe: Arc<dyn DomainProbe>,
     ceiling: usize,
     cancel: CancellationToken,
     opened: Option<Opened>,
@@ -189,8 +235,9 @@ impl StdSession {
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
+        let domain = probe_at(self.probe.as_ref(), &self.full, None)?;
         let iterator = std::fs::read_dir(&self.full)?;
-        self.opened = Some(Opened { directory, own, iterator, exhausted: false });
+        self.opened = Some(Opened { directory, own, iterator, domain, exhausted: false });
         Ok(())
     }
 
@@ -222,7 +269,7 @@ impl StdSession {
                 Observation { kind, metadata: Metadata::default(), identity: inline_identity(&opened.own, &item) };
             let name = item.file_name();
             self.bytes += entry_bytes(&name);
-            self.entries.push(DirEntry { name, info });
+            self.entries.push(DirEntry::new(name, info));
             taken += 1;
             cost.entries_enumerated += 1;
         }
@@ -237,6 +284,7 @@ impl StdSession {
             directory: opened.directory,
             entries: std::mem::take(&mut self.entries),
             supplied_fields: MetadataSources::PER_CHILD_READ.inline(),
+            domain: Box::new(opened.domain.clone()),
         })
     }
 }

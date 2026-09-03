@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use super::types::*;
-use super::{Coordinator, Output};
+use super::{Coordinator, CrossingEvent, Output};
+use crate::domain::{Crossing, DomainCapabilities, DomainCrossing, ProbeResult};
 use crate::entry::{Entry, EntryKind, LoadState, Metadata, MetadataFields, Shape};
 use crate::error::Error;
 use crate::fs::{DirEntry, DirectoryListing, Enrichment, EntryInfo, Observation};
@@ -23,6 +24,12 @@ pub(super) struct Classification<'a> {
     pub ctx: &'a PolicyContext,
     pub inherit: Reasons,
     pub fields: MetadataFields,
+    pub parent_domain: Option<&'a ProbeResult>,
+}
+
+fn crossed(parent: Option<&ProbeResult>, child: &ProbeResult) -> Crossing {
+    let mount_root = if child.is_domain_root { Crossing::Proven } else { Crossing::NotCrossed };
+    child.crossed.stronger(Crossing::between(parent, &child.identity)).stronger(mount_root)
 }
 
 enum IdentityMatch {
@@ -41,6 +48,7 @@ struct Chosen {
     name: OsString,
     path: RelativePath,
     info: EntryInfo,
+    domain: Option<Box<ProbeResult>>,
 }
 
 type CollisionKey<'a> =
@@ -77,6 +85,8 @@ pub(super) struct Effects {
     pub loaded: Vec<EntryId>,
     pub contexts: Vec<(EntryId, PolicyContext)>,
     pub kind_changed: Vec<EntryId>,
+    pub domains: Vec<(EntryId, DomainBinding)>,
+    pub crossings: Vec<(EntryId, Option<CrossingEvent>)>,
 }
 
 impl Coordinator {
@@ -100,7 +110,7 @@ impl Coordinator {
         let mut malformed: Vec<ErrorCause> = Vec::new();
         let mut duplicates: Vec<OsString> = Vec::new();
         let mut unresolved: Vec<OsString> = Vec::new();
-        for DirEntry { name, info } in &listing.entries {
+        for DirEntry { name, info, domain } in &listing.entries {
             let Some(info) = info.info() else {
                 unresolved.push(name.clone());
                 continue;
@@ -112,7 +122,7 @@ impl Coordinator {
                     continue;
                 }
             };
-            let candidate = Chosen { name: name.clone(), path, info };
+            let candidate = Chosen { name: name.clone(), path, info, domain: domain.clone() };
             match chosen.get_mut(&key) {
                 Some(kept) => {
                     if collision_key(&candidate) < collision_key(kept) {
@@ -151,10 +161,17 @@ impl Coordinator {
             });
             return Err(ListingRejection::LimitExceeded);
         }
-        let children: Vec<(RelativePath, PathKey, EntryInfo)> =
-            order.into_iter().filter_map(|key| chosen.remove(&key).map(|kept| (kept.path, key, kept.info))).collect();
+        let children: Vec<(RelativePath, PathKey, EntryInfo, Option<Box<ProbeResult>>)> = order
+            .into_iter()
+            .filter_map(|key| chosen.remove(&key).map(|kept| (kept.path, key, kept.info, kept.domain)))
+            .collect();
         let mut builder = self.snapshot.builder();
         let mut effects = Effects::default();
+        let previous_domain =
+            self.dir_state(dir_id).and_then(|d| d.domain.as_ref()).map(|b| b.probe.capabilities.clone());
+        let binding = self.bind_domain(&listing.domain);
+        let own_domain = binding.probe.clone();
+        effects.domains.push((dir_id, binding));
         let was_loading = dir.shape == Shape::Directory(LoadState::Loading);
         let new_metadata = listing.directory.metadata.project(fields);
         if was_loading || dir.metadata != new_metadata || dir.identity != listing.directory.identity {
@@ -177,27 +194,29 @@ impl Coordinator {
             effects.contexts.push((dir_id, ctx.clone()));
         }
         let inherit = Reasons { initial_scan: job.reasons.initial_scan, ..Default::default() };
-        let classification = Classification { ctx: &ctx, inherit, fields: observed_fields };
+        let classification =
+            Classification { ctx: &ctx, inherit, fields: observed_fields, parent_domain: Some(&own_domain) };
         let existing: HashMap<PathKey, Arc<Entry>> =
             builder.children(dir_id).into_iter().map(|e| (e.path.key(case), e)).collect();
         let mut seen_ids: HashSet<EntryId> = HashSet::new();
-        for (path, key, info) in children {
+        for (path, key, info, child_domain) in children {
             let Some(old) = existing.get(&key) else {
-                self.insert_new(&mut builder, &mut effects, path, info, &classification);
+                self.insert_new(&mut builder, &mut effects, path, info, child_domain.as_deref(), &classification);
                 continue;
             };
             seen_ids.insert(old.id);
-            let bound = match self.bind_child(old, &path, &info) {
+            let bound = match self.bind_child(previous_domain.as_ref(), &own_domain.capabilities, old, &path, &info) {
                 ChildBinding::Retained => true,
                 ChildBinding::Renamed => builder.rename_subtree(old.id, path.clone()).is_ok(),
                 ChildBinding::Replaced => false,
             };
             if bound {
+                self.rebind_child_domain(&mut effects, old.id, &path, child_domain.as_deref(), &own_domain);
                 let observed = Observed { path: &path, info };
                 self.reconcile_existing(&mut builder, &mut effects, old, observed, &classification);
             } else {
                 effects.removed.extend(builder.remove_subtree(old.id));
-                self.insert_new(&mut builder, &mut effects, path, info, &classification);
+                self.insert_new(&mut builder, &mut effects, path, info, child_domain.as_deref(), &classification);
             }
         }
         for old in existing.values() {
@@ -306,8 +325,17 @@ impl Coordinator {
         JobOutcome::Accepted
     }
 
-    fn identity_match(&self, old: &Entry, info: &EntryInfo) -> IdentityMatch {
-        if !self.caps.stable_identity {
+    fn identity_match(
+        &self,
+        previous: Option<&DomainCapabilities>,
+        incoming: &DomainCapabilities,
+        old: &Entry,
+        info: &EntryInfo,
+    ) -> IdentityMatch {
+        let Some(previous) = previous else {
+            return IdentityMatch::Unavailable;
+        };
+        if !previous.establishes_rename(incoming) {
             return IdentityMatch::Unavailable;
         }
         match (old.identity, info.identity) {
@@ -317,8 +345,15 @@ impl Coordinator {
         }
     }
 
-    fn bind_child(&self, old: &Entry, path: &RelativePath, info: &EntryInfo) -> ChildBinding {
-        match (old.path == *path, self.identity_match(old, info)) {
+    fn bind_child(
+        &self,
+        previous: Option<&DomainCapabilities>,
+        incoming: &DomainCapabilities,
+        old: &Entry,
+        path: &RelativePath,
+        info: &EntryInfo,
+    ) -> ChildBinding {
+        match (old.path == *path, self.identity_match(previous, incoming, old, info)) {
             (_, IdentityMatch::Different) => ChildBinding::Replaced,
             (true, _) => ChildBinding::Retained,
             (false, IdentityMatch::Same) => ChildBinding::Renamed,
@@ -332,15 +367,25 @@ impl Coordinator {
         effects: &mut Effects,
         path: RelativePath,
         info: EntryInfo,
+        domain: Option<&ProbeResult>,
         classification: &Classification<'_>,
     ) {
-        let Classification { ctx, inherit, fields } = *classification;
+        let Classification { ctx, inherit, fields, parent_domain } = *classification;
         let decision = self.policy.classify(ctx, &path, &info);
+        let crossing = match (info.kind, domain) {
+            (EntryKind::Directory, Some(probe)) => crossed(parent_domain, probe)
+                .is_proven()
+                .then(|| self.policy.crossing(ctx, &path, &probe.capabilities, self.config.domain_crossing)),
+            _ => None,
+        };
         let shape = match info.kind {
-            EntryKind::Directory => match decision {
-                ScanDecision::Excluded => Shape::Directory(LoadState::Excluded),
-                ScanDecision::Eligible { initially_loaded: true } => Shape::Directory(LoadState::Loading),
-                ScanDecision::Eligible { initially_loaded: false } => Shape::Directory(LoadState::Unloaded),
+            EntryKind::Directory => match (crossing, decision) {
+                (_, ScanDecision::Excluded) | (Some(DomainCrossing::Exclude), _) => {
+                    Shape::Directory(LoadState::Excluded)
+                }
+                (Some(DomainCrossing::LoadOnDemand), _) => Shape::Directory(LoadState::Unloaded),
+                (_, ScanDecision::Eligible { initially_loaded: true }) => Shape::Directory(LoadState::Loading),
+                (_, ScanDecision::Eligible { initially_loaded: false }) => Shape::Directory(LoadState::Unloaded),
             },
             other => {
                 if decision == ScanDecision::Excluded {
@@ -353,7 +398,19 @@ impl Coordinator {
         let mut entry = new_entry(id, path.clone(), shape);
         entry.metadata = info.metadata.project(fields);
         entry.identity = info.identity;
-        if builder.insert(entry).is_ok() && shape == Shape::Directory(LoadState::Loading) {
+        if builder.insert(entry).is_err() {
+            return;
+        }
+        if let (EntryKind::Directory, Some(probe)) = (info.kind, domain) {
+            let binding = self.bind_domain(probe);
+            let child = binding.id;
+            effects.domains.push((id, binding));
+            if let Some(mode) = crossing {
+                let parent = parent_domain.map(|probe| self.bind_domain(probe).id);
+                effects.crossings.push((id, Some(CrossingEvent { path: path.clone(), parent, child, mode })));
+            }
+        }
+        if shape == Shape::Directory(LoadState::Loading) {
             effects.new_loading.push((id, path, inherit));
         }
     }
@@ -366,7 +423,7 @@ impl Coordinator {
         observed: Observed<'_>,
         classification: &Classification<'_>,
     ) {
-        let Classification { ctx, inherit, fields } = *classification;
+        let Classification { ctx, inherit, fields, .. } = *classification;
         let Observed { path, info } = observed;
         let metadata = old.metadata.merged(info.metadata, fields);
         let current = Entry { path: path.clone(), metadata, identity: info.identity, ..old.clone() };
@@ -393,7 +450,7 @@ impl Coordinator {
         info: EntryInfo,
         classification: &Classification<'_>,
     ) {
-        let Classification { ctx, inherit, fields } = *classification;
+        let Classification { ctx, inherit, fields, .. } = *classification;
         let decision = self.policy.classify(ctx, &old.path, &info);
         if old.is_directory() {
             for child in builder.child_ids(old.id) {
@@ -441,6 +498,15 @@ impl Coordinator {
                     return;
                 }
                 let override_load = self.dir_state(entry.id).and_then(|d| d.override_load);
+                let crossing = self.dir_state(entry.id).and_then(|d| d.crossing);
+                let decision = match crossing {
+                    Some(DomainCrossing::Exclude) => ScanDecision::Excluded,
+                    Some(DomainCrossing::LoadOnDemand) if override_load != Some(true) => match decision {
+                        ScanDecision::Excluded => ScanDecision::Excluded,
+                        ScanDecision::Eligible { .. } => ScanDecision::Eligible { initially_loaded: false },
+                    },
+                    _ => decision,
+                };
                 let target = match decision {
                     ScanDecision::Excluded => {
                         if current == LoadState::Excluded {
@@ -492,6 +558,7 @@ impl Coordinator {
         builder: &SnapshotBuilder,
         dir: &Entry,
         supplied_fields: MetadataFields,
+        domain: ProbeResult,
     ) -> DirectoryListing {
         let entries = builder
             .children(dir.id)
@@ -499,13 +566,14 @@ impl Coordinator {
             .filter_map(|child| {
                 let name = child.path.file_name()?.to_os_string();
                 let info = EntryInfo { kind: child.kind(), metadata: child.metadata, identity: child.identity };
-                Some(DirEntry { name, info: Observation::resolved(info) })
+                Some(DirEntry::new(name, Observation::resolved(info)))
             })
             .collect();
         DirectoryListing {
             directory: EntryInfo { kind: dir.kind(), metadata: dir.metadata, identity: dir.identity },
             entries,
             supplied_fields,
+            domain: Box::new(domain),
         }
     }
 
@@ -524,7 +592,12 @@ impl Coordinator {
                 if child.shape != Shape::Directory(LoadState::Loaded) {
                     continue;
                 }
-                let view = Self::listing_view(builder, &child, self.config.metadata_fields);
+                let domain = self
+                    .dir_state(child.id)
+                    .and_then(|d| d.domain.as_ref())
+                    .map(|binding| binding.probe.clone())
+                    .unwrap_or_else(ProbeResult::unknown);
+                let view = Self::listing_view(builder, &child, self.config.metadata_fields, domain);
                 let child_ctx = self.policy.child_context(&parent_ctx, &child.path, &view);
                 let changed = self
                     .dir_state(child.id)
@@ -594,7 +667,8 @@ impl Coordinator {
                 return JobOutcome::Removed;
             }
             let was_directory = entry.is_directory();
-            let classification = Classification { ctx: &parent_ctx, inherit, fields: self.config.metadata_fields };
+            let classification =
+                Classification { ctx: &parent_ctx, inherit, fields: self.config.metadata_fields, parent_domain: None };
             self.change_kind(&mut builder, &mut effects, &entry, info, &classification);
             self.commit(builder, effects, Some(job));
             return if was_directory { JobOutcome::Removed } else { JobOutcome::Accepted };
@@ -692,6 +766,28 @@ impl Coordinator {
                 self.entries.insert(*id, if is_dir { EntryState::directory() } else { EntryState::default() });
             }
         }
+        for (id, binding) in effects.domains {
+            if removed_ids.contains(&id) {
+                continue;
+            }
+            self.entries.set_directory(id, true);
+            if let Some(dir) = self.dir_state_mut(id) {
+                dir.domain = Some(binding);
+            }
+        }
+        let mut crossing_events: Vec<CrossingEvent> = Vec::new();
+        for (id, event) in effects.crossings {
+            if removed_ids.contains(&id) {
+                continue;
+            }
+            if let Some(dir) = self.dir_state_mut(id) {
+                dir.crossing = event.as_ref().map(|event| event.mode);
+            }
+            if let Some(event) = event {
+                self.record_crossing(event.clone());
+                crossing_events.push(event);
+            }
+        }
         for (id, path, reasons) in effects.new_loading {
             if removed_ids.contains(&id) {
                 continue;
@@ -707,6 +803,10 @@ impl Coordinator {
             }
             let mut request_reasons = Reasons::control();
             request_reasons.merge(reasons);
+            let resolved = self.dir_state(id).map(|d| d.domain.is_some()).unwrap_or(false) || path.is_root();
+            if !resolved {
+                self.request_domain(id, path.clone(), request_reasons);
+            }
             self.request(id, path, ReadNeed::Listing, request_reasons, Vec::new());
         }
         for change in &changes {
@@ -746,8 +846,101 @@ impl Coordinator {
             }
         }
         if self.snapshot.version() != previous {
-            self.publish_delta(previous, changes);
+            self.publish_delta(previous, changes, crossing_events);
         }
+    }
+
+    fn rebind_child_domain(
+        &mut self,
+        effects: &mut Effects,
+        child: EntryId,
+        path: &RelativePath,
+        domain: Option<&ProbeResult>,
+        parent: &ProbeResult,
+    ) {
+        let Some(probe) = domain else {
+            return;
+        };
+        let unchanged = self
+            .dir_state(child)
+            .and_then(|d| d.domain.as_ref())
+            .map(|binding| binding.probe.identity == probe.identity)
+            .unwrap_or(false);
+        if unchanged {
+            return;
+        }
+        let binding = self.bind_domain(probe);
+        let id = binding.id;
+        effects.domains.push((child, binding));
+        if crossed(Some(parent), probe).is_proven() {
+            let mode = self.crossing_mode(child, path, &probe.capabilities);
+            let parent_domain = self.bind_domain(parent).id;
+            effects.crossings.push((
+                child,
+                Some(CrossingEvent { path: path.clone(), parent: Some(parent_domain), child: id, mode }),
+            ));
+        } else {
+            effects.crossings.push((child, None));
+        }
+    }
+
+    pub(super) fn request_domain(&mut self, entry: EntryId, path: RelativePath, reasons: Reasons) {
+        match self.pending_domain.get_mut(&entry) {
+            Some(existing) => {
+                existing.path = path;
+                existing.reasons.merge(reasons);
+                existing.due = None;
+            }
+            None => {
+                self.pending_domain.insert(entry, DomainRequest { path, reasons, attempts: 0, due: None });
+            }
+        }
+    }
+
+    pub(super) fn commit_domain(&mut self, job: &ActiveJob, probe: ProbeResult) -> JobOutcome {
+        let Some(id) = job.entry() else {
+            return JobOutcome::Accepted;
+        };
+        let Some(entry) = self.snapshot.get_by_id(id).cloned() else {
+            return JobOutcome::Stale;
+        };
+        self.domain_resolutions += 1;
+        let parent_probe = self.parent_domain_probe(id);
+        let parent_domain = self.parent_of(id).and_then(|parent| self.domain_of(parent));
+        let proven = crossed(parent_probe.as_ref(), &probe).is_proven();
+        let binding = self.bind_domain(&probe);
+        let child = binding.id;
+        let override_load = self.dir_state(id).and_then(|d| d.override_load);
+        let mut builder = self.snapshot.builder();
+        let mut effects = Effects::default();
+        effects.domains.push((id, binding));
+        if proven && entry.is_directory() {
+            let mode = if override_load == Some(true) {
+                DomainCrossing::Follow
+            } else {
+                self.crossing_mode(id, &entry.path, &probe.capabilities)
+            };
+            effects
+                .crossings
+                .push((id, Some(CrossingEvent { path: entry.path.clone(), parent: parent_domain, child, mode })));
+            let target = match mode {
+                DomainCrossing::Follow => None,
+                DomainCrossing::Exclude => Some(LoadState::Excluded),
+                DomainCrossing::LoadOnDemand => Some(LoadState::Unloaded),
+            };
+            if let Some(target) = target {
+                for grandchild in builder.child_ids(id) {
+                    effects.removed.extend(builder.remove_subtree(grandchild));
+                }
+                let _ = builder.update(id, |e| e.shape = Shape::Directory(target));
+                effects.unloaded.push(id);
+                if target == LoadState::Excluded {
+                    effects.excluded.push(id);
+                }
+            }
+        }
+        self.commit(builder, effects, Some(job));
+        JobOutcome::Accepted
     }
 
     fn invalidate_directory_work(&mut self, id: EntryId, except: Option<JobId>) {
@@ -758,6 +951,7 @@ impl Coordinator {
         }
         self.pending.remove(&id);
         self.pending_enrichment.remove(&id);
+        self.pending_domain.remove(&id);
         self.entries.clear_retry(id);
         self.entries.set_degraded(id, None);
         self.entries.set_metadata_degraded(id, None);
@@ -782,6 +976,7 @@ impl Coordinator {
         }
         self.pending.remove(&id);
         self.pending_enrichment.remove(&id);
+        self.pending_domain.remove(&id);
         if let Some(state) = self.entries.remove(id)
             && let Some(dir) = state.dir()
             && let WatchState::Registered(watch) = dir.watch
@@ -807,6 +1002,7 @@ impl Coordinator {
         self.entries.clear();
         self.pending.clear();
         self.pending_enrichment.clear();
+        self.pending_domain.clear();
         self.round = None;
         self.cancel_all_jobs();
         self.unwatch_all();
@@ -820,7 +1016,7 @@ impl Coordinator {
         }
         self.initial_scan = InitialScan::new();
         self.probe_attempts = 0;
-        self.publish_delta(previous, changes);
+        self.publish_delta(previous, changes, Vec::new());
         if self.config.root_reappearance_monitoring {
             self.schedule_probe(false);
         }
@@ -850,6 +1046,6 @@ impl Coordinator {
                 }
             }
         }
-        self.publish_delta(previous, changes);
+        self.publish_delta(previous, changes, Vec::new());
     }
 }

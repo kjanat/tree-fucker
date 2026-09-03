@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Add;
 use std::time::Duration;
 
+use crate::domain::{DomainCrossing, ProbeResult, StorageDomainId};
 use crate::entry::{Entry, LoadState, MetadataFields, Shape};
 use crate::fs::FsError;
 use crate::ids::*;
@@ -150,6 +151,7 @@ impl ReadKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReadNeed {
+    Domain,
     Metadata,
     Listing,
     Enrichment(MetadataFields),
@@ -164,8 +166,28 @@ impl ReadNeed {
         match self {
             ReadNeed::Metadata => Some(ReadKind::Metadata),
             ReadNeed::Listing => Some(ReadKind::Listing),
-            ReadNeed::Enrichment(_) => None,
+            ReadNeed::Domain | ReadNeed::Enrichment(_) => None,
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainBinding {
+    pub id: StorageDomainId,
+    pub probe: ProbeResult,
+}
+
+#[derive(Clone, Debug)]
+pub struct DomainRequest {
+    pub path: RelativePath,
+    pub reasons: Reasons,
+    pub attempts: u32,
+    pub due: Option<MonotonicTime>,
+}
+
+impl DomainRequest {
+    pub fn ready(&self, now: MonotonicTime) -> bool {
+        self.due.map(|at| at <= now).unwrap_or(true)
     }
 }
 
@@ -380,6 +402,8 @@ pub struct DirState {
     pub context: Option<PolicyContext>,
     pub context_generation: ContextGeneration,
     pub override_load: Option<bool>,
+    pub domain: Option<DomainBinding>,
+    pub crossing: Option<DomainCrossing>,
     coverage: Coverage,
     pub watch: WatchState,
 }
@@ -392,6 +416,8 @@ impl Default for DirState {
             context: None,
             context_generation: ContextGeneration::new(0),
             override_load: None,
+            domain: None,
+            crossing: None,
             coverage: Coverage::Unloaded,
             watch: WatchState::NotRegistered,
         }

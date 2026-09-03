@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use super::types::MonotonicTime;
 use crate::config::Config;
+use crate::domain::StorageDomainId;
 use crate::ids::{JobId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::update::ThrottleCause;
@@ -33,11 +34,42 @@ pub struct Grant {
     pub id: GrantId,
     pub path: RelativePath,
     pub lease: u32,
+    pub domain: Option<StorageDomainId>,
     pub reserved: Duration,
     pub charged: Duration,
     pub admitted: MonotonicTime,
     pub started: Option<MonotonicTime>,
     pub stuck: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DomainAccount {
+    pub granted: Duration,
+    pub charged: Duration,
+    pub grants: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    pub id: GrantId,
+    pub path: RelativePath,
+    pub reads: u32,
+    pub registrations: u32,
+    pub lease: u32,
+    pub domain: Option<StorageDomainId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Account {
+    granted: i128,
+    charged: i128,
+    grants: u64,
+}
+
+impl Account {
+    fn view(self) -> DomainAccount {
+        DomainAccount { granted: duration(self.granted), charged: duration(self.charged), grants: self.grants }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +89,8 @@ pub struct GovernorView {
     pub throttled_duration: Duration,
     pub next_admissible: Option<MonotonicTime>,
     pub last_decision: Option<AdmissionDecision>,
+    pub bootstrap: DomainAccount,
+    pub domains: BTreeMap<StorageDomainId, DomainAccount>,
 }
 
 pub struct Governor {
@@ -78,6 +112,8 @@ pub struct Governor {
     throttled_total: Duration,
     denied_cost: Option<Duration>,
     last_decision: Option<AdmissionDecision>,
+    bootstrap: Account,
+    accounts: BTreeMap<StorageDomainId, Account>,
 }
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -115,7 +151,37 @@ impl Governor {
             throttled_total: Duration::ZERO,
             denied_cost: None,
             last_decision: None,
+            bootstrap: Account::default(),
+            accounts: BTreeMap::new(),
         }
+    }
+
+    fn account_mut(&mut self, domain: Option<StorageDomainId>) -> &mut Account {
+        match domain {
+            Some(domain) => self.accounts.entry(domain).or_default(),
+            None => &mut self.bootstrap,
+        }
+    }
+
+    pub fn attribute(&mut self, id: GrantId, domain: StorageDomainId) {
+        let Some(grant) = self.grants.get_mut(&id) else {
+            return;
+        };
+        if grant.domain == Some(domain) {
+            return;
+        }
+        let previous = grant.domain;
+        grant.domain = Some(domain);
+        let granted = nanos(grant.reserved);
+        let charged = nanos(grant.charged);
+        let from = self.account_mut(previous);
+        from.granted -= granted;
+        from.charged -= charged;
+        from.grants -= 1;
+        let to = self.account_mut(Some(domain));
+        to.granted += granted;
+        to.charged += charged;
+        to.grants += 1;
     }
 
     pub fn cost_of(&self, operations: u32) -> Duration {
@@ -143,15 +209,21 @@ impl Governor {
     pub fn account(&mut self, now: MonotonicTime) {
         self.refill(now);
         let mut extra: i128 = 0;
+        let mut per_domain: Vec<(Option<StorageDomainId>, i128)> = Vec::new();
         for grant in self.grants.values_mut() {
             let Some(started) = grant.started else {
                 continue;
             };
             let occupancy = now.since(started);
             if occupancy > grant.charged {
-                extra += nanos(occupancy - grant.charged);
+                let delta = nanos(occupancy - grant.charged);
+                extra += delta;
+                per_domain.push((grant.domain, delta));
                 grant.charged = occupancy;
             }
+        }
+        for (domain, delta) in per_domain {
+            self.account_mut(domain).charged += delta;
         }
         if extra > 0 {
             self.level -= extra;
@@ -159,15 +231,8 @@ impl Governor {
         }
     }
 
-    pub fn try_admit(
-        &mut self,
-        id: GrantId,
-        path: RelativePath,
-        reads: u32,
-        registrations: u32,
-        lease: u32,
-        now: MonotonicTime,
-    ) -> Result<Duration, ThrottleCause> {
+    pub fn try_admit(&mut self, reservation: Reservation, now: MonotonicTime) -> Result<Duration, ThrottleCause> {
+        let Reservation { id, path, reads, registrations, lease, domain } = reservation;
         self.account(now);
         let cost = self.cost_of(reads + registrations);
         if self.level < nanos(cost) {
@@ -195,9 +260,23 @@ impl Governor {
         if let Some(since) = self.throttled_since.take() {
             self.throttled_total += now.since(since);
         }
+        let account = self.account_mut(domain);
+        account.granted += nanos(cost);
+        account.charged += nanos(cost);
+        account.grants += 1;
         self.grants.insert(
             id,
-            Grant { id, path, lease, reserved: cost, charged: cost, admitted: now, started: None, stuck: false },
+            Grant {
+                id,
+                path,
+                lease,
+                domain,
+                reserved: cost,
+                charged: cost,
+                admitted: now,
+                started: None,
+                stuck: false,
+            },
         );
         Ok(cost)
     }
@@ -215,9 +294,11 @@ impl Governor {
         let charge = blocking.min(occupancy).max(grant.reserved);
         if charge > grant.charged {
             let extra = nanos(charge - grant.charged);
+            let domain = grant.domain;
             grant.charged = charge;
             self.level -= extra;
             self.charged_total += extra;
+            self.account_mut(domain).charged += extra;
         }
     }
 
@@ -313,6 +394,8 @@ impl Governor {
             },
             next_admissible: self.next_admissible(now, 1),
             last_decision: self.last_decision,
+            bootstrap: self.bootstrap.view(),
+            domains: self.accounts.iter().map(|(id, account)| (*id, account.view())).collect(),
         }
     }
 }

@@ -8,8 +8,8 @@ use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness, InjectedPosition};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RoundResult, UpdateEvent, WatcherHealth};
 use tree_fucker::{
-    CaseSensitivity, Config, EntryKind, Error, FsError, LoadAll, LoadState, MetadataFields, PathChange, PathPredicate,
-    PolicyRevision, RelativePath, WatchRegistrationFailure, WatcherKind,
+    CaseSensitivity, Config, DomainCapabilities, EntryKind, Error, FsError, IdentityReliability, LoadAll, LoadState,
+    MetadataFields, PathChange, PathPredicate, PolicyRevision, RelativePath, WatchRegistrationFailure, WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
@@ -273,7 +273,6 @@ fn closed_batch_admits_nothing_until_every_member_settles() {
 fn case_insensitive_filesystem_folds_lookups() {
     let fs = Arc::new(FakeFileSystem::with_capabilities(FsCapabilities {
         case: CaseSensitivity::Insensitive,
-        stable_identity: true,
         watcher: WatcherKind::None,
     }));
     fs.mkdir("Docs");
@@ -290,11 +289,16 @@ fn case_insensitive_filesystem_folds_lookups() {
 }
 
 fn case_insensitive_fs(stable_identity: bool) -> Arc<FakeFileSystem> {
-    Arc::new(FakeFileSystem::with_capabilities(FsCapabilities {
+    let fs = Arc::new(FakeFileSystem::with_capabilities(FsCapabilities {
         case: CaseSensitivity::Insensitive,
-        stable_identity,
         watcher: WatcherKind::None,
-    }))
+    }));
+    let reliability = if stable_identity { IdentityReliability::Stable } else { IdentityReliability::None };
+    fs.set_default_capabilities(DomainCapabilities {
+        identity_reliability: reliability,
+        ..DomainCapabilities::inline()
+    });
+    fs
 }
 
 fn published_changes(h: &Harness) -> Vec<PathChange> {

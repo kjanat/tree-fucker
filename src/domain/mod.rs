@@ -8,8 +8,11 @@ mod tests;
 #[cfg(windows)]
 mod windows;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use declared::{DeclaredProbe, UnknownProbe};
@@ -20,7 +23,63 @@ pub use macos::MacOsProbe;
 #[cfg(windows)]
 pub use windows::WindowsProbe;
 
+use crate::entry::MetadataFields;
 use crate::path::CaseSensitivity;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StorageDomainId(u64);
+
+static NEXT_STORAGE_DOMAIN: AtomicU64 = AtomicU64::new(1);
+static INTERNED_DOMAINS: Mutex<BTreeMap<DomainKey, StorageDomainId>> = Mutex::new(BTreeMap::new());
+
+impl StorageDomainId {
+    pub fn fresh() -> StorageDomainId {
+        StorageDomainId(NEXT_STORAGE_DOMAIN.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn of(key: &DomainKey) -> StorageDomainId {
+        let mut interned = match INTERNED_DOMAINS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match interned.get(key) {
+            Some(id) => *id,
+            None => {
+                let id = StorageDomainId(NEXT_STORAGE_DOMAIN.fetch_add(1, Ordering::Relaxed));
+                interned.insert(key.clone(), id);
+                id
+            }
+        }
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for StorageDomainId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "storage domain {}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DomainCrossing {
+    Follow,
+    Exclude,
+    #[default]
+    LoadOnDemand,
+}
+
+impl fmt::Display for DomainCrossing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DomainCrossing::Follow => f.write_str("follow"),
+            DomainCrossing::Exclude => f.write_str("exclude"),
+            DomainCrossing::LoadOnDemand => f.write_str("load on demand"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DomainKey(Key);
@@ -272,12 +331,36 @@ pub struct MetadataSources {
 }
 
 impl MetadataSources {
+    pub const INLINE: MetadataSources = MetadataSources {
+        modified: MetadataSource::Inline,
+        created: MetadataSource::Inline,
+        size: MetadataSource::Inline,
+        permissions: MetadataSource::Inline,
+    };
     pub const PER_CHILD_READ: MetadataSources = MetadataSources {
         modified: MetadataSource::PerChildRead,
         created: MetadataSource::PerChildRead,
         size: MetadataSource::PerChildRead,
         permissions: MetadataSource::PerChildRead,
     };
+
+    pub fn inline(self) -> MetadataFields {
+        MetadataFields {
+            modified: self.modified == MetadataSource::Inline,
+            created: self.created == MetadataSource::Inline,
+            size: self.size == MetadataSource::Inline,
+            permissions: self.permissions == MetadataSource::Inline,
+        }
+    }
+
+    pub fn per_child_read(self) -> MetadataFields {
+        MetadataFields {
+            modified: self.modified == MetadataSource::PerChildRead,
+            created: self.created == MetadataSource::PerChildRead,
+            size: self.size == MetadataSource::PerChildRead,
+            permissions: self.permissions == MetadataSource::PerChildRead,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -370,8 +453,30 @@ pub struct DomainCapabilities {
 }
 
 impl DomainCapabilities {
+    pub fn inline() -> DomainCapabilities {
+        DomainCapabilities {
+            identity_reliability: IdentityReliability::Stable,
+            kind_source: KindSource::Always,
+            identity_source: IdentitySource::Inline,
+            metadata_sources: MetadataSources::INLINE,
+            sources: DeclarationSources {
+                identity_space: DeclarationSource::Declared,
+                identity_reliability: DeclarationSource::Declared,
+                observation: DeclarationSource::Declared,
+                ..DeclarationSources::default()
+            },
+            ..DomainCapabilities::default()
+        }
+    }
+
     pub fn identities_comparable(&self, other: &DomainCapabilities) -> bool {
         self.identity_space.comparable_with(&other.identity_space)
+    }
+
+    pub fn establishes_rename(&self, other: &DomainCapabilities) -> bool {
+        self.identity_reliability.establishes_rename()
+            && other.identity_reliability.establishes_rename()
+            && self.identities_comparable(other)
     }
 }
 
@@ -383,6 +488,18 @@ pub enum Crossing {
 }
 
 impl Crossing {
+    pub fn is_proven(self) -> bool {
+        matches!(self, Crossing::Proven)
+    }
+
+    pub fn stronger(self, other: Crossing) -> Crossing {
+        match (self, other) {
+            (Crossing::Proven, _) | (_, Crossing::Proven) => Crossing::Proven,
+            (Crossing::NotCrossed, Crossing::NotCrossed) => Crossing::NotCrossed,
+            _ => Crossing::Inconclusive,
+        }
+    }
+
     pub fn between(parent: Option<&ProbeResult>, identity: &DomainIdentity) -> Crossing {
         let Some(parent) = parent else {
             return Crossing::NotCrossed;

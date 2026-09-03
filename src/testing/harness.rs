@@ -8,6 +8,7 @@ use crate::core::{
     Class, Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, Work,
     WorkerLoss,
 };
+use crate::domain::StorageDomainId;
 use crate::error::Error;
 use crate::fs::{Continuation, FileSystem, HintKind, ListingSession, SessionStep, WatcherEvent};
 use crate::ids::{CommandId, JobId, TimerId, WatchId, WatchRequestId};
@@ -32,6 +33,7 @@ pub struct Admission {
     pub batch: usize,
     pub reserved: Duration,
     pub lease: u32,
+    pub domain: Option<StorageDomainId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,6 +227,7 @@ impl Harness {
                 batch,
                 reserved: grant.reserved,
                 lease: grant.lease,
+                domain: grant.domain,
             });
         }
     }
@@ -247,6 +250,7 @@ impl Harness {
                 self.fs.lease_cost(&spec.path, !listing.resume, skip, listing.lease.entries)
             }
             Work::Metadata => self.fs.cost_of(FakeOp::Metadata, &spec.path),
+            Work::ResolveDomain { .. } => self.fs.domain_resolution_cost(&spec.path),
             Work::Enrichment { .. } => self.fs.enrichment_cost(&spec.path),
         };
         let domain = self.fs.domain_of(&spec.path);
@@ -394,6 +398,9 @@ impl Harness {
                 JobResult::Listing(step)
             }
             Work::Metadata => JobResult::Metadata(self.fs.metadata(self.fs.root(), &spec.path)),
+            Work::ResolveDomain { parent } => {
+                JobResult::Domain(self.fs.resolve_domain(self.fs.root(), &spec.path, parent.as_deref()))
+            }
             Work::Enrichment { fields } => JobResult::Enrichment(self.fs.enrich(self.fs.root(), &spec.path, *fields)),
         }
     }

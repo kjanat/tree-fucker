@@ -6,8 +6,8 @@ use tree_fucker::testing::DomainId;
 use tree_fucker::testing::{CostScope, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ErrorCause, RoundResult, UpdateEvent};
 use tree_fucker::{
-    Config, EntryKind, Error, FieldSource, FsError, IdentitySource, KindSource, LoadAll, MetadataFields,
-    MetadataSources, ObservationSources, RelativePath, WatcherKind,
+    Config, DomainCapabilities, DomainCrossing, EntryKind, Error, FsError, IdentitySource, KindSource, LoadAll,
+    MetadataFields, MetadataSource, MetadataSources, RelativePath, WatcherKind,
 };
 
 const PER_CHILD_IDENTITY: DomainId = DomainId::new(7);
@@ -21,12 +21,19 @@ fn sizes() -> MetadataFields {
     MetadataFields { size: true, ..MetadataFields::NONE }
 }
 
-fn per_child_sizes() -> ObservationSources {
-    ObservationSources {
-        kind: KindSource::Always,
-        identity: IdentitySource::Inline,
-        metadata: MetadataSources { size: FieldSource::PerChildRead, ..MetadataSources::INLINE },
+fn per_child_sizes() -> DomainCapabilities {
+    DomainCapabilities {
+        metadata_sources: MetadataSources { size: MetadataSource::PerChildRead, ..MetadataSources::INLINE },
+        ..DomainCapabilities::inline()
     }
+}
+
+fn sometimes_kinds() -> DomainCapabilities {
+    DomainCapabilities { kind_source: KindSource::Sometimes, ..DomainCapabilities::inline() }
+}
+
+fn follow() -> Config {
+    Config { domain_crossing: DomainCrossing::Follow, ..Default::default() }
 }
 
 fn populated() -> Arc<FakeFileSystem> {
@@ -85,11 +92,7 @@ fn a_listing_with_metadata_none_performs_no_metadata_operation_on_an_inline_doma
 #[test]
 fn a_domain_reporting_unknown_kinds_resolves_them_in_the_session_and_charges_them_as_metadata_operations() {
     let fs = populated();
-    fs.set_default_sources(ObservationSources {
-        kind: KindSource::Sometimes,
-        identity: IdentitySource::Inline,
-        metadata: MetadataSources::INLINE,
-    });
+    fs.set_default_capabilities(sometimes_kinds());
     fs.report_unknown_kind("a/b");
     fs.report_unknown_kind("a/f2");
     fs.set_cost(CostScope::Everything, FakeOp::ResolveKind, Duration::from_millis(200));
@@ -130,11 +133,7 @@ fn a_listing_with_an_unresolved_child_commits_nothing() {
     h.run_until_idle();
     let before = h.paths();
 
-    fs.set_default_sources(ObservationSources {
-        kind: KindSource::Sometimes,
-        identity: IdentitySource::Inline,
-        metadata: MetadataSources::INLINE,
-    });
+    fs.set_default_capabilities(sometimes_kinds());
     fs.report_unknown_kind("a/late");
     fs.fail("a/late", FakeOp::ResolveKind, FailureMode::Always(FsError::Transient("no kind".into())));
     fs.add_silently("a/late", EntryKind::File);
@@ -179,7 +178,7 @@ fn a_listing_with_an_unresolved_child_commits_nothing() {
 #[test]
 fn enabling_a_field_admits_enrichment_separately_from_the_listing() {
     let fs = populated();
-    fs.set_default_sources(per_child_sizes());
+    fs.set_default_capabilities(per_child_sizes());
     let config = Config { metadata_fields: sizes(), ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
@@ -218,7 +217,7 @@ fn enabling_a_field_admits_enrichment_separately_from_the_listing() {
 #[test]
 fn a_failed_enrichment_leaves_the_membership_committed_and_reports_a_metadata_degradation() {
     let fs = populated();
-    fs.set_default_sources(per_child_sizes());
+    fs.set_default_capabilities(per_child_sizes());
     fs.fail("a", FakeOp::Enrich, FailureMode::Always(FsError::Transient("enrichment refused".into())));
     let config = Config { metadata_fields: sizes(), ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
@@ -258,7 +257,7 @@ fn a_failed_enrichment_leaves_the_membership_committed_and_reports_a_metadata_de
 #[test]
 fn a_baseline_round_refreshes_every_enabled_field_for_each_loaded_directory() {
     let fs = populated();
-    fs.set_default_sources(per_child_sizes());
+    fs.set_default_capabilities(per_child_sizes());
     let config = Config { metadata_fields: sizes(), ..Default::default() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     h.run_until_idle();
@@ -307,21 +306,28 @@ fn a_domain_declares_per_item_whether_observation_costs_a_per_child_operation() 
     let fs = populated();
     let media = DomainId::new(2);
     fs.set_domain("a", media);
-    fs.set_sources(media, ObservationSources::UNIX);
+    fs.set_capabilities(
+        media,
+        DomainCapabilities {
+            kind_source: KindSource::Sometimes,
+            metadata_sources: MetadataSources::PER_CHILD_READ,
+            ..DomainCapabilities::inline()
+        },
+    );
 
-    let root = fs.sources_of(&path("c"));
-    assert_eq!(root, ObservationSources::INLINE);
-    assert_eq!(root.metadata.per_child_read(), MetadataFields::NONE);
+    let root = fs.capabilities_of(&path("c"));
+    assert_eq!(root.kind_source, KindSource::Always);
+    assert_eq!(root.metadata_sources.per_child_read(), MetadataFields::NONE);
 
-    let child = fs.sources_of(&path("a/f2"));
-    assert_eq!(child.kind, KindSource::Sometimes);
-    assert_eq!(child.identity, IdentitySource::Inline);
+    let child = fs.capabilities_of(&path("a/f2"));
+    assert_eq!(child.kind_source, KindSource::Sometimes);
+    assert_eq!(child.identity_source, IdentitySource::Inline);
     assert_eq!(
-        child.metadata.per_child_read(),
+        child.metadata_sources.per_child_read(),
         MetadataFields::ALL,
         "RFC 10.1: on Unix every metadata field requires a per-child read while the inode is inline"
     );
-    assert_eq!(child.metadata.inline(), MetadataFields::NONE);
+    assert_eq!(child.metadata_sources.inline(), MetadataFields::NONE);
 }
 
 #[test]
@@ -331,11 +337,7 @@ fn a_listing_rejected_for_an_unresolved_child_reports_a_typed_error_and_no_files
     h.run_until_idle();
     h.take_events();
 
-    fs.set_default_sources(ObservationSources {
-        kind: KindSource::Sometimes,
-        identity: IdentitySource::Inline,
-        metadata: MetadataSources::INLINE,
-    });
+    fs.set_default_capabilities(sometimes_kinds());
     fs.report_unknown_kind("a/late");
     fs.fail("a/late", FakeOp::ResolveKind, FailureMode::Always(FsError::Transient("no kind".into())));
     fs.add_silently("a/late", EntryKind::File);
@@ -373,24 +375,16 @@ fn a_domain_acquiring_identity_per_child_counts_one_operation_per_child_and_a_no
     let fs = populated();
     fs.create_file("c/g", 3);
     fs.set_domain("a", PER_CHILD_IDENTITY);
-    fs.set_sources(
+    fs.set_capabilities(
         PER_CHILD_IDENTITY,
-        ObservationSources {
-            kind: KindSource::Always,
-            identity: IdentitySource::PerChildRead,
-            metadata: MetadataSources::INLINE,
-        },
+        DomainCapabilities { identity_source: IdentitySource::PerChildRead, ..DomainCapabilities::inline() },
     );
     fs.set_domain("c", NO_IDENTITY);
-    fs.set_sources(
+    fs.set_capabilities(
         NO_IDENTITY,
-        ObservationSources {
-            kind: KindSource::Always,
-            identity: IdentitySource::None,
-            metadata: MetadataSources::INLINE,
-        },
+        DomainCapabilities { identity_source: IdentitySource::None, ..DomainCapabilities::inline() },
     );
-    let config = Config { operations_per_lease: 1, ..Default::default() };
+    let config = Config { operations_per_lease: 1, ..follow() };
     let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
     fs.clear_ops();
     h.run_until_idle();

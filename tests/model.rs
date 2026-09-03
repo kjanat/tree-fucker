@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tree_fucker::testing::{CostScope, FailureMode, FakeFileSystem, FakeOp, Harness};
+use tree_fucker::core::JobOperation;
+use tree_fucker::testing::{CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::RoundResult;
 use tree_fucker::{
-    Config, EntryKind, FieldSource, FileSystem, FsError, IdentitySource, KindSource, LoadAll, MetadataFields,
-    MetadataSources, ObservationSources, RelativePath, WatcherKind,
+    Config, DomainCapabilities, DomainCrossing, EntryKind, FileSystem, FsError, KindSource, LoadAll, MetadataFields,
+    MetadataSource, MetadataSources, RelativePath, WatcherKind,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -428,10 +429,10 @@ fn random_silent_mutations_converge_after_successful_round() {
 fn enrichment_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
     let mut rng = Lcg(seed);
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
-    fs.set_default_sources(ObservationSources {
-        kind: KindSource::Sometimes,
-        identity: IdentitySource::Inline,
-        metadata: MetadataSources { size: FieldSource::PerChildRead, ..MetadataSources::INLINE },
+    fs.set_default_capabilities(DomainCapabilities {
+        kind_source: KindSource::Sometimes,
+        metadata_sources: MetadataSources { size: MetadataSource::PerChildRead, ..MetadataSources::INLINE },
+        ..DomainCapabilities::inline()
     });
     let mut known: Vec<String> = Vec::new();
     for i in 0..6 {
@@ -528,5 +529,114 @@ fn enrichment_never_changes_membership_and_is_never_required_for_round_success()
             "RFC 10.1: enrichment is separately admitted metadata work and must never change membership; seed {seed}"
         );
         assert!(h.stats().enrichments > 0, "seed {seed} exercised no enrichment, so the property was never tested");
+    }
+}
+
+fn domained_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
+    let mut rng = Lcg(seed);
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    let mut known: Vec<String> = Vec::new();
+    for i in 0..6 {
+        let name = format!("d{i}");
+        fs.mkdir(&name);
+        known.push(name.clone());
+        let file = format!("{name}/f");
+        fs.create_file(&file, 1);
+        known.push(file);
+    }
+    for (index, domain) in [(1u64, DomainId::new(11)), (3, DomainId::new(13)), (5, DomainId::new(15))] {
+        fs.set_domain(&format!("d{index}"), domain);
+        fs.set_cost(CostScope::Domain(domain), FakeOp::ReadDir, Duration::from_millis(1 + index * 4));
+        fs.set_identity_space(domain, index);
+    }
+    fs.report_inline_domains(seed.is_multiple_of(2));
+    let config = Config { domain_crossing: DomainCrossing::Follow, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    for step in 0..40 {
+        let dirs = directories(&fs, &known);
+        let dir = rng.pick(&dirs).cloned().unwrap_or_default();
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        match rng.next() % 5 {
+            0 => {
+                let name = format!("{prefix}n{step}");
+                fs.add_silently(&name, EntryKind::File);
+                known.push(name);
+            }
+            1 => {
+                let name = format!("{prefix}sub{step}");
+                fs.add_silently(&name, EntryKind::Directory);
+                known.push(name);
+            }
+            2 => {
+                if let Some(victim) = rng.pick(&known).cloned() {
+                    fs.remove_silently(&victim);
+                }
+            }
+            3 => {
+                if reachable(&fs, "d3") == Some(EntryKind::Directory) && step % 11 == 0 {
+                    fs.remount("d3", DomainId::new(23));
+                }
+            }
+            _ => {
+                if step % 7 == 0 {
+                    h.run_round();
+                }
+            }
+        }
+    }
+    for _ in 0..50 {
+        h.run_round();
+        if h.health().reconciliation.last_round == Some(RoundResult::Successful) && h.pending_jobs().is_empty() {
+            break;
+        }
+    }
+    h.run_round();
+    (h, fs, known)
+}
+
+#[test]
+fn a_random_history_over_several_domains_converges_and_every_operation_carries_a_domain() {
+    for seed in 1..6u64 {
+        let (h, fs, known) = domained_history(seed);
+        assert_eq!(
+            h.health().reconciliation.last_round,
+            Some(RoundResult::Successful),
+            "RFC 5.2 and 14.3: a tree spanning several storage domains must still converge; seed {seed}"
+        );
+        let mut expected: Vec<String> = Vec::new();
+        for name in &known {
+            if reachable(&fs, name).is_some() {
+                expected.push(name.clone());
+            }
+        }
+        expected.push(".".into());
+        expected.sort();
+        expected.dedup();
+        let mut actual = h.paths();
+        actual.sort();
+        assert_eq!(actual, expected, "seed {seed}");
+
+        for admission in h.admissions() {
+            assert!(
+                admission.domain.is_some()
+                    || admission.operation == JobOperation::DomainResolution
+                    || admission.entry.is_root(),
+                "RFC 11.4: every job captures its storage domain; seed {seed} admitted {:?} for {} without one",
+                admission.operation,
+                admission.entry
+            );
+        }
+        let domains = h.stats().domains;
+        assert!(
+            domains.len() >= 4,
+            "seed {seed} entered {} domains, too few to exercise several domains in one tree",
+            domains.len()
+        );
+        assert!(
+            domains.iter().all(|domain| domain.granted > Duration::ZERO),
+            "RFC 16: every domain entered must report the worker time granted against it; seed {seed} reports \
+             {domains:?}"
+        );
     }
 }

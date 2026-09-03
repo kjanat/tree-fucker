@@ -6,8 +6,8 @@ use tree_fucker::core::{Class, Command, JobResult, JobSpec, MonotonicTime};
 use tree_fucker::testing::{Admission, CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ErrorCause, ResourceLimit, RoundResult, UpdateEvent};
 use tree_fucker::{
-    CancellationToken, Config, Continuation, EntryKind, FileSystem, FsError, HintKind, Lease, LoadAll, RelativePath,
-    SessionOutcome, SessionStep, WatcherKind,
+    CancellationToken, Config, Continuation, DomainCrossing, EntryKind, FileSystem, FsError, HintKind, Lease, LoadAll,
+    RelativePath, SessionOutcome, SessionStep, WatcherKind,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -90,6 +90,10 @@ fn scanned(fs: Arc<FakeFileSystem>, config: Config) -> Harness {
     let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
     h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
     h
+}
+
+fn follow() -> Config {
+    Config { domain_crossing: DomainCrossing::Follow, ..Default::default() }
 }
 
 fn by_batch(admissions: &[Admission]) -> BTreeMap<usize, Vec<Admission>> {
@@ -633,7 +637,7 @@ fn descending_into_a_child_domain_charges_the_child_domain() {
     fs.set_domain("sub", MEDIA);
     fs.set_cost(CostScope::Domain(HOME), FakeOp::ReadDir, Duration::from_millis(10));
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_millis(40));
-    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).expect("open");
     h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(5));
     let charged = h.charged_work_by_domain();
     let child = listings_under(&fs, &["sub", "sub/inner"]);
@@ -658,7 +662,7 @@ fn a_slow_domain_does_not_delay_the_fast_domains_baseline_coverage() {
     fs.set_domain("", HOME);
     fs.set_domain("slow", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let config = Config { max_in_flight: 2, batch_size: 8, ..Default::default() };
+    let config = Config { max_in_flight: 2, batch_size: 8, ..follow() };
     let mut h = scanned(fs.clone(), config);
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(120));
 
@@ -717,7 +721,7 @@ fn a_stuck_worker_quarantines_its_domain_until_it_returns() {
     fs.set_domain("", HOME);
     fs.set_domain("stuck", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
-    let mut h = scanned(fs.clone(), Config::default());
+    let mut h = scanned(fs.clone(), follow());
     fs.set_cost(CostScope::path("stuck/child"), FakeOp::ReadDir, Duration::from_secs(36_000));
 
     let target = h.now() + Duration::from_secs(600);
@@ -778,7 +782,7 @@ fn a_domain_that_becomes_fast_again_converges_within_one_round() {
     fs.set_domain("media", MEDIA);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(60));
-    let config = Config { stuck_threshold: Duration::from_secs(300), ..Default::default() };
+    let config = Config { stuck_threshold: Duration::from_secs(300), ..follow() };
     let mut h = scanned(fs.clone(), config);
     run_one_round(&mut h);
 
