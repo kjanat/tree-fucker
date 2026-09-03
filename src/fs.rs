@@ -9,6 +9,7 @@ use crate::domain::{ProbeError, ProbeResult};
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
+use crate::update::{ResourceLimit, ResourceLimited};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FsError {
@@ -167,6 +168,40 @@ impl Lease {
     pub const UNBOUNDED: Lease = Lease { entries: usize::MAX, operations: usize::MAX };
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ceilings {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+impl Ceilings {
+    pub const UNBOUNDED: Ceilings = Ceilings { entries: usize::MAX, bytes: u64::MAX };
+
+    pub fn entries(entries: usize) -> Ceilings {
+        Ceilings { entries, bytes: u64::MAX }
+    }
+
+    pub fn exceeded_by(&self, entries: usize, bytes: u64) -> Option<ResourceLimited> {
+        if entries > self.entries {
+            return Some(ResourceLimited {
+                limit: ResourceLimit::EntriesPerDirectory,
+                configured: u64::try_from(self.entries).unwrap_or(u64::MAX),
+                observed: u64::try_from(entries).unwrap_or(u64::MAX),
+                domain: None,
+            });
+        }
+        if bytes > self.bytes {
+            return Some(ResourceLimited {
+                limit: ResourceLimit::ListingBytes,
+                configured: self.bytes,
+                observed: bytes,
+                domain: None,
+            });
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionCost {
     pub blocking: Option<Duration>,
@@ -188,7 +223,7 @@ impl SessionCost {
 pub enum SessionOutcome {
     Complete(DirectoryListing),
     Cancelled,
-    ResourceLimited { seen: usize },
+    ResourceLimited(ResourceLimited),
     Failed(FsError),
 }
 
@@ -235,8 +270,13 @@ pub trait ListingSession: Send {
     fn resume(self: Box<Self>, lease: Lease) -> (Continuation, SessionCost);
 }
 
-pub fn list_directory(filesystem: &dyn FileSystem, root: &Path, path: &RelativePath, ceiling: usize) -> SessionOutcome {
-    let mut session = filesystem.open_listing(root, path, ceiling, CancellationToken::new());
+pub fn list_directory(
+    filesystem: &dyn FileSystem,
+    root: &Path,
+    path: &RelativePath,
+    ceilings: Ceilings,
+) -> SessionOutcome {
+    let mut session = filesystem.open_listing(root, path, ceilings, CancellationToken::new());
     loop {
         match session.resume(Lease::UNBOUNDED).0 {
             Continuation::Suspended(next) => session = next,
@@ -323,7 +363,7 @@ pub trait FileSystem: Send + Sync {
         &self,
         root: &Path,
         path: &RelativePath,
-        ceiling: usize,
+        ceilings: Ceilings,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession>;
     fn enrich(&self, root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError>;

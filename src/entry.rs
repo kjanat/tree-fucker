@@ -156,6 +156,11 @@ impl Entry {
     }
 }
 
+pub fn entry_bytes(entry: &Entry) -> u64 {
+    let path: usize = entry.path.components().iter().map(|name| name.len()).sum();
+    u64::try_from(std::mem::size_of::<Entry>() + path).unwrap_or(u64::MAX)
+}
+
 pub type CollisionKey<'a> = (
     &'a std::ffi::OsStr,
     u8,

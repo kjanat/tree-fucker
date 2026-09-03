@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 
-use super::types::MonotonicTime;
+use super::types::{MonotonicTime, WorkOrigin};
 use crate::config::Config;
 use crate::domain::{AccessTopology, DomainCapabilities, MediaHint, StorageDomainId};
 use crate::ids::{JobId, WatchRequestId};
@@ -19,13 +21,14 @@ const CONSERVATIVE_TOPOLOGY_CEILING: usize = 2;
 pub enum GrantId {
     Job(JobId),
     WatchRegistration(WatchRequestId),
+    Bootstrap(u64),
 }
 
 impl GrantId {
     pub fn job(self) -> Option<JobId> {
         match self {
             GrantId::Job(id) => Some(id),
-            GrantId::WatchRegistration(_) => None,
+            GrantId::WatchRegistration(_) | GrantId::Bootstrap(_) => None,
         }
     }
 }
@@ -42,6 +45,7 @@ pub struct Grant {
     pub path: RelativePath,
     pub lease: u32,
     pub domain: Option<StorageDomainId>,
+    pub origin: WorkOrigin,
     pub reserved: Duration,
     pub charged: Duration,
     pub admitted: MonotonicTime,
@@ -73,6 +77,10 @@ pub struct DomainView {
     pub capacity: Duration,
     pub level: Duration,
     pub debt: Duration,
+    pub foreground_capacity: Duration,
+    pub foreground_level: Duration,
+    pub foreground_debt: Duration,
+    pub bytes_estimate: u64,
     pub window: usize,
     pub ceiling: usize,
     pub in_flight: usize,
@@ -100,6 +108,8 @@ pub struct Reservation {
     pub registrations: u32,
     pub lease: u32,
     pub domain: Option<StorageDomainId>,
+    pub origin: WorkOrigin,
+    pub listing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,6 +130,15 @@ pub struct GovernorView {
     pub capacity: Duration,
     pub level: Duration,
     pub debt: Duration,
+    pub foreground_capacity: Duration,
+    pub foreground_level: Duration,
+    pub foreground_debt: Duration,
+    pub bootstrap_capacity: Duration,
+    pub bootstrap_outstanding: Duration,
+    pub accounted_memory: u64,
+    pub memory_ceiling: u64,
+    pub in_flight_bytes: u64,
+    pub in_flight_bytes_ceiling: u64,
     pub reserved: Duration,
     pub charged: Duration,
     pub surcharged: Duration,
@@ -129,6 +148,7 @@ pub struct GovernorView {
     pub grants: u64,
     pub lease_grants: u64,
     pub watch_registration_grants: u64,
+    pub watch_release_grants: u64,
     pub denials: u64,
     pub throttled_duration: Duration,
     pub next_admissible: Option<MonotonicTime>,
@@ -226,11 +246,15 @@ impl Bucket {
 #[derive(Clone, Debug)]
 struct DomainState {
     bucket: Bucket,
+    foreground: Bucket,
     account: Account,
     window: usize,
     ceiling: usize,
     estimate: Duration,
     latency: VecDeque<Duration>,
+    bytes: VecDeque<u64>,
+    bytes_total: u64,
+    bytes_estimate: u64,
     errors: VecDeque<bool>,
     completions: usize,
     queue: VecDeque<Duration>,
@@ -251,11 +275,15 @@ impl DomainState {
             .max(1);
         DomainState {
             bucket: Bucket::new(config.domain_background_duty, config.domain_background_burst, now),
+            foreground: Bucket::new(config.domain_foreground_duty, config.domain_foreground_burst, now),
             account: Account::default(),
             window: start_window(capabilities).clamp(1, ceiling),
             ceiling,
             estimate: config.initial_cost_estimate,
             latency: VecDeque::new(),
+            bytes: VecDeque::new(),
+            bytes_total: 0,
+            bytes_estimate: 0,
             errors: VecDeque::new(),
             completions: 0,
             queue: VecDeque::new(),
@@ -300,6 +328,17 @@ impl DomainState {
         self.recompute_summary();
         let ceiling = duration(self.bucket.capacity);
         self.estimate = self.summary.median.max(self.summary.minimum).min(ceiling).max(Duration::from_nanos(1));
+    }
+
+    fn record_bytes(&mut self, bytes: u64) {
+        if self.bytes.len() >= LATENCY_HISTORY
+            && let Some(oldest) = self.bytes.pop_front()
+        {
+            self.bytes_total = self.bytes_total.saturating_sub(oldest);
+        }
+        self.bytes.push_back(bytes);
+        self.bytes_total = self.bytes_total.saturating_add(bytes);
+        self.bytes_estimate = self.bytes_total / u64::try_from(self.bytes.len()).unwrap_or(1).max(1);
     }
 
     fn record_queue_delay(&mut self, delay: Duration) {
@@ -347,10 +386,22 @@ impl DomainState {
 pub struct Governor {
     config: Config,
     global: Bucket,
+    foreground: Bucket,
+    bootstrap_capacity: i128,
+    bootstrap_outstanding: i128,
+    memory: BTreeMap<u64, (u64, u64)>,
+    memory_total: u64,
+    in_flight_total: u64,
+    next_tree: u64,
+    next_bootstrap: u64,
     estimate: Duration,
     stuck_threshold: Duration,
     surcharge: Duration,
     grants: BTreeMap<GrantId, Grant>,
+    running: BTreeMap<Option<StorageDomainId>, usize>,
+    stuck: BTreeMap<Option<StorageDomainId>, usize>,
+    running_total: usize,
+    accounted_at: Option<MonotonicTime>,
     reserved_total: i128,
     charged_total: i128,
     surcharged_total: i128,
@@ -358,10 +409,12 @@ pub struct Governor {
     granted: u64,
     lease_granted: u64,
     watch_registration_grants: u64,
+    watch_release_grants: u64,
     denials: u64,
     throttled_since: Option<MonotonicTime>,
     throttled_total: Duration,
     denied: Option<(Option<StorageDomainId>, Duration)>,
+    denied_foreground: Option<(Option<StorageDomainId>, Duration)>,
     last_decision: Option<AdmissionDecision>,
     bootstrap: Account,
     domains: BTreeMap<StorageDomainId, DomainState>,
@@ -372,10 +425,22 @@ impl Governor {
         Governor {
             config: config.clone(),
             global: Bucket::new(config.background_duty, config.background_burst, now),
+            foreground: Bucket::new(config.foreground_duty, config.foreground_burst, now),
+            bootstrap_capacity: nanos(config.bootstrap_allowance),
+            bootstrap_outstanding: 0,
+            memory: BTreeMap::new(),
+            memory_total: 0,
+            in_flight_total: 0,
+            next_tree: 0,
+            next_bootstrap: 0,
             estimate: config.initial_cost_estimate,
             stuck_threshold: config.stuck_threshold,
             surcharge: config.failure_surcharge,
             grants: BTreeMap::new(),
+            running: BTreeMap::new(),
+            stuck: BTreeMap::new(),
+            running_total: 0,
+            accounted_at: None,
             reserved_total: 0,
             charged_total: 0,
             surcharged_total: 0,
@@ -383,22 +448,101 @@ impl Governor {
             granted: 0,
             lease_granted: 0,
             watch_registration_grants: 0,
+            watch_release_grants: 0,
             denials: 0,
             throttled_since: None,
             throttled_total: Duration::ZERO,
             denied: None,
+            denied_foreground: None,
             last_decision: None,
             bootstrap: Account::default(),
             domains: BTreeMap::new(),
         }
     }
 
-    pub fn register_domain(&mut self, id: StorageDomainId, capabilities: &DomainCapabilities, now: MonotonicTime) {
-        if self.domains.contains_key(&id) {
-            return;
+    pub fn register_domain(
+        &mut self,
+        id: StorageDomainId,
+        capabilities: &DomainCapabilities,
+        subordinate_ceiling: usize,
+        now: MonotonicTime,
+    ) {
+        match self.domains.get_mut(&id) {
+            Some(state) => {
+                state.ceiling = state.ceiling.min(subordinate_ceiling).max(1);
+                state.window = state.window.min(state.ceiling);
+            }
+            None => {
+                let mut state = DomainState::new(&self.config, capabilities, now);
+                state.ceiling = state.ceiling.min(subordinate_ceiling).max(1);
+                state.window = state.window.min(state.ceiling);
+                self.domains.insert(id, state);
+            }
         }
-        let state = DomainState::new(&self.config, capabilities, now);
-        self.domains.insert(id, state);
+    }
+
+    pub fn next_tree(&mut self) -> u64 {
+        self.next_tree += 1;
+        self.next_tree
+    }
+
+    pub fn next_bootstrap(&mut self) -> u64 {
+        self.next_bootstrap += 1;
+        self.next_bootstrap
+    }
+
+    pub fn report_memory(&mut self, tree: u64, snapshot_bytes: u64, in_flight_bytes: u64) {
+        let entry = self.memory.entry(tree).or_default();
+        let previous = *entry;
+        *entry = (snapshot_bytes, in_flight_bytes);
+        self.memory_total = self
+            .memory_total
+            .saturating_sub(previous.0.saturating_add(previous.1))
+            .saturating_add(snapshot_bytes.saturating_add(in_flight_bytes));
+        self.in_flight_total = self.in_flight_total.saturating_sub(previous.1).saturating_add(in_flight_bytes);
+    }
+
+    pub fn forget_tree(&mut self, tree: u64) {
+        if let Some(previous) = self.memory.remove(&tree) {
+            self.memory_total = self.memory_total.saturating_sub(previous.0.saturating_add(previous.1));
+            self.in_flight_total = self.in_flight_total.saturating_sub(previous.1);
+        }
+    }
+
+    pub fn accounted_memory(&self) -> u64 {
+        self.memory_total
+    }
+
+    pub fn accounted_memory_excluding(&self, tree: u64) -> u64 {
+        let own = self.memory.get(&tree).copied().unwrap_or((0, 0));
+        self.memory_total.saturating_sub(own.0.saturating_add(own.1))
+    }
+
+    pub fn memory_ceiling(&self) -> u64 {
+        self.config.accounted_memory_ceiling
+    }
+
+    pub fn in_flight_bytes(&self) -> u64 {
+        self.in_flight_total
+    }
+
+    pub fn bytes_estimate(&self, domain: Option<StorageDomainId>) -> u64 {
+        domain.and_then(|id| self.domains.get(&id)).map(|state| state.bytes_estimate).unwrap_or(0)
+    }
+
+    pub fn record_bytes(&mut self, domain: Option<StorageDomainId>, bytes: u64, now: MonotonicTime) {
+        let Some(id) = domain else {
+            return;
+        };
+        self.domain_mut(id, now).record_bytes(bytes);
+    }
+
+    fn memory_exceeded(&self, extra: u64) -> bool {
+        self.memory_total.saturating_add(extra) > self.config.accounted_memory_ceiling
+    }
+
+    fn in_flight_bytes_exceeded(&self, extra: u64) -> bool {
+        self.in_flight_total.saturating_add(extra) > self.config.in_flight_listing_bytes
     }
 
     fn domain_mut(&mut self, id: StorageDomainId, now: MonotonicTime) -> &mut DomainState {
@@ -409,6 +553,7 @@ impl Governor {
     fn credit(
         &mut self,
         domain: Option<StorageDomainId>,
+        origin: WorkOrigin,
         granted: i128,
         charged: i128,
         grants: i8,
@@ -419,7 +564,10 @@ impl Governor {
                 let state = self.domain_mut(id, now);
                 state.account.granted += granted;
                 state.account.charged += charged;
-                state.bucket.level -= charged;
+                match origin {
+                    WorkOrigin::Background => state.bucket.level -= charged,
+                    WorkOrigin::Foreground => state.foreground.level -= charged,
+                }
                 match grants {
                     delta if delta > 0 => state.account.grants += 1,
                     delta if delta < 0 => state.account.grants = state.account.grants.saturating_sub(1),
@@ -446,13 +594,34 @@ impl Governor {
             return;
         }
         let previous = grant.domain;
+        let origin = grant.origin;
         let granted = nanos(grant.reserved);
         let charged = nanos(grant.charged);
+        let moved = grant.clone();
+        self.move_counts(&moved, previous, Some(domain));
         if let Some(grant) = self.grants.get_mut(&id) {
             grant.domain = Some(domain);
         }
-        self.credit(previous, -granted, -charged, -1, now);
-        self.credit(Some(domain), granted, charged, 1, now);
+        if previous.is_none() {
+            self.bootstrap_outstanding = (self.bootstrap_outstanding - granted).max(0);
+        }
+        self.credit(previous, origin, -granted, -charged, -1, now);
+        self.credit(Some(domain), origin, granted, charged, 1, now);
+    }
+
+    fn capacity_for(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> Duration {
+        let global = match origin {
+            WorkOrigin::Background => self.global.capacity,
+            WorkOrigin::Foreground => self.foreground.capacity,
+        };
+        let local = domain
+            .and_then(|id| self.domains.get(&id))
+            .map(|state| match origin {
+                WorkOrigin::Background => state.bucket.capacity,
+                WorkOrigin::Foreground => state.foreground.capacity,
+            })
+            .unwrap_or(global);
+        duration(global.min(local))
     }
 
     pub fn estimate_of(&self, domain: Option<StorageDomainId>) -> Duration {
@@ -467,36 +636,70 @@ impl Governor {
     }
 
     pub fn account(&mut self, now: MonotonicTime) {
+        if self.accounted_at == Some(now) {
+            return;
+        }
+        self.accounted_at = Some(now);
         self.global.refill(now);
+        self.foreground.refill(now);
         for state in self.domains.values_mut() {
             state.bucket.refill(now);
+            state.foreground.refill(now);
         }
-        let mut deltas: Vec<(Option<StorageDomainId>, i128, bool)> = Vec::new();
+        let mut deltas: Vec<(Option<StorageDomainId>, WorkOrigin, i128, bool)> = Vec::new();
         for grant in self.grants.values_mut() {
             let Some(started) = grant.started else {
                 continue;
             };
             let occupancy = now.since(started);
             if occupancy > grant.charged {
-                deltas.push((grant.domain, nanos(occupancy - grant.charged), grant.stuck));
+                deltas.push((grant.domain, grant.origin, nanos(occupancy - grant.charged), grant.stuck));
                 grant.charged = occupancy;
             }
         }
-        for (domain, delta, stuck) in deltas {
+        for (domain, origin, delta, stuck) in deltas {
             self.charged_total += delta;
             if !stuck {
-                self.global.level -= delta;
+                self.global_bucket(origin).level -= delta;
             }
-            self.credit(domain, 0, delta, 0, now);
+            self.credit(domain, origin, 0, delta, 0, now);
+        }
+    }
+
+    fn global_bucket(&mut self, origin: WorkOrigin) -> &mut Bucket {
+        match origin {
+            WorkOrigin::Background => &mut self.global,
+            WorkOrigin::Foreground => &mut self.foreground,
         }
     }
 
     pub fn quarantined(&self, domain: Option<StorageDomainId>) -> bool {
-        self.grants.values().any(|grant| grant.stuck && grant.domain == domain)
+        self.stuck.get(&domain).copied().unwrap_or(0) > 0
     }
 
     pub fn in_flight_on(&self, domain: Option<StorageDomainId>) -> usize {
-        self.grants.values().filter(|grant| grant.started.is_some() && grant.domain == domain).count()
+        self.running.get(&domain).copied().unwrap_or(0)
+    }
+
+    fn move_counts(&mut self, grant: &Grant, from: Option<StorageDomainId>, to: Option<StorageDomainId>) {
+        if grant.started.is_some() {
+            Governor::decrement(&mut self.running, from);
+            *self.running.entry(to).or_insert(0) += 1;
+        }
+        if grant.stuck {
+            Governor::decrement(&mut self.stuck, from);
+            *self.stuck.entry(to).or_insert(0) += 1;
+        }
+    }
+
+    fn decrement(counts: &mut BTreeMap<Option<StorageDomainId>, usize>, domain: Option<StorageDomainId>) {
+        let Some(count) = counts.get_mut(&domain) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&domain);
+        }
     }
 
     pub fn window_of(&self, domain: Option<StorageDomainId>) -> usize {
@@ -506,8 +709,12 @@ impl Governor {
         }
     }
 
-    pub fn global_exhausted(&self, domain: Option<StorageDomainId>) -> bool {
-        !self.global.affordable(nanos(self.cost_of(domain, 1)))
+    pub fn global_exhausted(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> bool {
+        let cost = nanos(self.cost_of(domain, 1));
+        match origin {
+            WorkOrigin::Background => !self.global.affordable(cost),
+            WorkOrigin::Foreground => !self.foreground.affordable(cost),
+        }
     }
 
     pub fn may_start(&self, domain: Option<StorageDomainId>, in_flight: usize) -> Result<(), ThrottleCause> {
@@ -529,6 +736,12 @@ impl Governor {
                 _ => (domain, cost),
             });
         }
+        if cause == ThrottleCause::ForegroundCeiling {
+            self.denied_foreground = Some(match self.denied_foreground {
+                Some((previous, held)) if held >= cost => (previous, held),
+                _ => (domain, cost),
+            });
+        }
         if self.throttled_since.is_none() {
             self.throttled_since = Some(now);
         }
@@ -543,29 +756,58 @@ impl Governor {
     }
 
     pub fn try_admit(&mut self, reservation: Reservation, now: MonotonicTime) -> Result<Duration, ThrottleCause> {
-        let Reservation { id, path, reads, registrations, lease, domain } = reservation;
+        let Reservation { id, path, reads, registrations, lease, domain, origin, listing } = reservation;
         self.account(now);
         if self.quarantined(domain) {
             self.deny(ThrottleCause::StuckWorker, domain, Duration::ZERO, now);
             return Err(ThrottleCause::StuckWorker);
         }
-        let cost = self.cost_of(domain, reads + registrations);
+        let result_bytes = match listing {
+            true => self.bytes_estimate(domain),
+            false => 0,
+        };
+        if self.memory_exceeded(result_bytes) || (listing && self.in_flight_bytes_exceeded(result_bytes)) {
+            self.deny(ThrottleCause::Memory, domain, Duration::ZERO, now);
+            return Err(ThrottleCause::Memory);
+        }
+        let cost = self.cost_of(domain, reads + registrations).min(self.capacity_for(domain, origin));
         let local = domain
             .and_then(|id| self.domains.get(&id))
-            .map(|state| state.bucket.affordable(nanos(cost)))
+            .map(|state| match origin {
+                WorkOrigin::Background => state.bucket.affordable(nanos(cost)),
+                WorkOrigin::Foreground => state.foreground.affordable(nanos(cost)),
+            })
             .unwrap_or(true);
-        if !self.global.affordable(nanos(cost)) || !local {
+        let global = match origin {
+            WorkOrigin::Background => self.global.affordable(nanos(cost)),
+            WorkOrigin::Foreground => self.foreground.affordable(nanos(cost)),
+        };
+        if !global || !local {
+            let cause = match origin {
+                WorkOrigin::Background => ThrottleCause::DutyBudget,
+                WorkOrigin::Foreground => ThrottleCause::ForegroundCeiling,
+            };
+            self.deny(cause, domain, cost, now);
+            return Err(cause);
+        }
+        if domain.is_none() && self.bootstrap_outstanding + nanos(cost) > self.bootstrap_capacity {
             self.deny(ThrottleCause::DutyBudget, domain, cost, now);
             return Err(ThrottleCause::DutyBudget);
         }
-        self.global.level -= nanos(cost);
+        if domain.is_none() {
+            self.bootstrap_outstanding += nanos(cost);
+        }
+        self.global_bucket(origin).level -= nanos(cost);
         self.reserved_total += nanos(cost);
         self.charged_total += nanos(cost);
         self.granted += 1;
         if lease > 0 {
             self.lease_granted += 1;
         }
-        self.denied = None;
+        match origin {
+            WorkOrigin::Background => self.denied = None,
+            WorkOrigin::Foreground => self.denied_foreground = None,
+        }
         self.watch_registration_grants += u64::from(registrations);
         self.last_decision = Some(AdmissionDecision::Granted);
         if let Some(since) = self.throttled_since.take() {
@@ -577,7 +819,7 @@ impl Governor {
         {
             state.throttled_total += now.since(since);
         }
-        self.credit(domain, nanos(cost), nanos(cost), 1, now);
+        self.credit(domain, origin, nanos(cost), nanos(cost), 1, now);
         self.grants.insert(
             id,
             Grant {
@@ -585,6 +827,7 @@ impl Governor {
                 path,
                 lease,
                 domain,
+                origin,
                 reserved: cost,
                 charged: cost,
                 admitted: now,
@@ -611,13 +854,22 @@ impl Governor {
         }
         let extra = nanos(charge - grant.charged);
         let domain = grant.domain;
+        let origin = grant.origin;
         let stuck = grant.stuck;
         grant.charged = charge;
         self.charged_total += extra;
         if !stuck {
-            self.global.level -= extra;
+            self.global_bucket(origin).level -= extra;
         }
-        self.credit(domain, 0, extra, 0, now);
+        self.credit(domain, origin, 0, extra, 0, now);
+    }
+
+    pub fn charge_of(&self, id: GrantId) -> Option<Duration> {
+        self.grants.get(&id).map(|grant| grant.charged)
+    }
+
+    pub fn overshoot_of(&self, id: GrantId) -> Duration {
+        self.grants.get(&id).map(|grant| grant.charged.saturating_sub(grant.reserved)).unwrap_or_default()
     }
 
     pub fn charge_surcharge(&mut self, domain: Option<StorageDomainId>, now: MonotonicTime) {
@@ -627,7 +879,20 @@ impl Governor {
         self.account(now);
         let amount = nanos(self.surcharge);
         self.surcharged_total += amount;
-        self.credit(domain, 0, amount, 0, now);
+        self.credit(domain, WorkOrigin::Background, 0, amount, 0, now);
+    }
+
+    pub fn charge_release(&mut self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Duration {
+        self.account(now);
+        let cost = self.cost_of(domain, 1);
+        let amount = nanos(cost);
+        self.reserved_total += amount;
+        self.charged_total += amount;
+        self.granted += 1;
+        self.watch_release_grants += 1;
+        self.global.level -= amount;
+        self.credit(domain, WorkOrigin::Background, amount, amount, 0, now);
+        cost
     }
 
     pub fn start(&mut self, id: GrantId, at: MonotonicTime) {
@@ -640,6 +905,8 @@ impl Governor {
         grant.started = Some(at);
         let delay = at.since(grant.admitted);
         let domain = grant.domain;
+        *self.running.entry(domain).or_insert(0) += 1;
+        self.running_total += 1;
         if let Some(id) = domain
             && let Some(state) = self.domains.get_mut(&id)
         {
@@ -655,6 +922,16 @@ impl Governor {
         let Some(grant) = self.grants.remove(&id) else {
             return;
         };
+        if grant.domain.is_none() {
+            self.bootstrap_outstanding = (self.bootstrap_outstanding - nanos(grant.reserved)).max(0);
+        }
+        if grant.started.is_some() {
+            Governor::decrement(&mut self.running, grant.domain);
+            self.running_total = self.running_total.saturating_sub(1);
+        }
+        if grant.stuck {
+            Governor::decrement(&mut self.stuck, grant.domain);
+        }
         let (Some(started), Some(domain)) = (grant.started, grant.domain) else {
             return;
         };
@@ -676,7 +953,7 @@ impl Governor {
     }
 
     pub fn in_flight(&self) -> usize {
-        self.grants.values().filter(|g| g.started.is_some()).count()
+        self.running_total
     }
 
     pub fn running_occupancy(&self, now: MonotonicTime) -> Duration {
@@ -699,9 +976,12 @@ impl Governor {
             return;
         }
         grant.stuck = true;
+        let counted = grant.domain;
+        *self.stuck.entry(counted).or_insert(0) += 1;
         let refund = nanos(grant.charged.saturating_sub(grant.reserved));
         let domain = grant.domain;
-        self.global.level += refund;
+        let origin = grant.origin;
+        self.global_bucket(origin).level += refund;
         if let Some(id) = domain {
             self.domain_mut(id, now).adapt(true);
         }
@@ -740,10 +1020,18 @@ impl Governor {
     }
 
     pub fn throttle(&self, now: MonotonicTime) -> Option<(ThrottleCause, Option<MonotonicTime>)> {
+        if self.memory_exceeded(0) {
+            return Some((ThrottleCause::Memory, None));
+        }
         if let Some((domain, cost)) = self.denied
             && let Some(at) = self.affordable_at(domain, cost, now)
         {
             return Some((ThrottleCause::DutyBudget, Some(at)));
+        }
+        if let Some((domain, cost)) = self.denied_foreground
+            && let Some(at) = self.foreground_affordable_at(domain, cost, now)
+        {
+            return Some((ThrottleCause::ForegroundCeiling, Some(at)));
         }
         match self.grants.values().any(|grant| grant.stuck) {
             true => Some((ThrottleCause::StuckWorker, None)),
@@ -764,12 +1052,38 @@ impl Governor {
         if self.quarantined(Some(domain)) {
             return Some((ThrottleCause::StuckWorker, None));
         }
+        if self.memory_exceeded(0) {
+            return Some((ThrottleCause::Memory, None));
+        }
         if let Some(at) = self.affordable_at(Some(domain), self.cost_of(Some(domain), 1), now) {
             return Some((ThrottleCause::DutyBudget, Some(at)));
+        }
+        if let Some(at) = self.foreground_affordable_at(Some(domain), self.cost_of(Some(domain), 1), now)
+            && self.denied_foreground.is_some()
+        {
+            return Some((ThrottleCause::ForegroundCeiling, Some(at)));
         }
         match queued && self.in_flight_on(Some(domain)) >= self.window_of(Some(domain)) {
             true => Some((ThrottleCause::Concurrency, None)),
             false => None,
+        }
+    }
+
+    fn foreground_affordable_at(
+        &self,
+        domain: Option<StorageDomainId>,
+        cost: Duration,
+        now: MonotonicTime,
+    ) -> Option<MonotonicTime> {
+        let cost = nanos(cost);
+        let global = self.foreground.affordable_at(now, cost);
+        let local =
+            domain.and_then(|id| self.domains.get(&id)).and_then(|state| state.foreground.affordable_at(now, cost));
+        match (global, local) {
+            (None, None) => None,
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
         }
     }
 
@@ -779,14 +1093,11 @@ impl Governor {
 
     fn occupancy(&self) -> BTreeMap<Option<StorageDomainId>, (usize, usize)> {
         let mut counts: BTreeMap<Option<StorageDomainId>, (usize, usize)> = BTreeMap::new();
-        for grant in self.grants.values() {
-            let entry = counts.entry(grant.domain).or_default();
-            if grant.started.is_some() {
-                entry.0 += 1;
-            }
-            if grant.stuck {
-                entry.1 += 1;
-            }
+        for (domain, running) in &self.running {
+            counts.entry(*domain).or_default().0 = *running;
+        }
+        for (domain, stuck) in &self.stuck {
+            counts.entry(*domain).or_default().1 = *stuck;
         }
         counts
     }
@@ -799,6 +1110,10 @@ impl Governor {
             capacity: duration(state.bucket.capacity),
             level: duration(state.bucket.level),
             debt: duration(-state.bucket.level),
+            foreground_capacity: duration(state.foreground.capacity),
+            foreground_level: duration(state.foreground.level),
+            foreground_debt: duration(-state.foreground.level),
+            bytes_estimate: state.bytes_estimate,
             window: state.window,
             ceiling: state.ceiling,
             in_flight: occupancy.0,
@@ -820,6 +1135,15 @@ impl Governor {
             capacity: duration(self.global.capacity),
             level: duration(self.global.level),
             debt: duration(-self.global.level),
+            foreground_capacity: duration(self.foreground.capacity),
+            foreground_level: duration(self.foreground.level),
+            foreground_debt: duration(-self.foreground.level),
+            bootstrap_capacity: duration(self.bootstrap_capacity),
+            bootstrap_outstanding: duration(self.bootstrap_outstanding),
+            accounted_memory: self.memory_total,
+            memory_ceiling: self.config.accounted_memory_ceiling,
+            in_flight_bytes: self.in_flight_total,
+            in_flight_bytes_ceiling: self.config.in_flight_listing_bytes,
             reserved: duration(self.reserved_total),
             charged: duration(self.charged_total),
             surcharged: duration(self.surcharged_total),
@@ -829,6 +1153,7 @@ impl Governor {
             grants: self.granted,
             lease_grants: self.lease_granted,
             watch_registration_grants: self.watch_registration_grants,
+            watch_release_grants: self.watch_release_grants,
             denials: self.denials,
             throttled_duration: match self.throttled_since {
                 Some(since) => self.throttled_total + now.since(since),
@@ -854,5 +1179,292 @@ impl Governor {
                     .collect()
             },
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct HostGovernor {
+    inner: Arc<Mutex<Governor>>,
+    base: Arc<Mutex<Option<Instant>>>,
+    limits: Arc<Config>,
+}
+
+static PROCESS_GOVERNOR: OnceLock<HostGovernor> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostGovernorError {
+    AlreadyInstalled,
+    InvalidConfig(String),
+}
+
+impl std::fmt::Display for HostGovernorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostGovernorError::AlreadyInstalled => f.write_str("the process governor is already in use"),
+            HostGovernorError::InvalidConfig(message) => write!(f, "invalid host configuration: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for HostGovernorError {}
+
+pub fn host_governor() -> HostGovernor {
+    PROCESS_GOVERNOR.get_or_init(|| HostGovernor::independent(&Config::default())).clone()
+}
+
+fn guard(inner: &Mutex<Governor>) -> MutexGuard<'_, Governor> {
+    match inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl HostGovernor {
+    pub fn install(config: Config) -> Result<HostGovernor, HostGovernorError> {
+        config.validate().map_err(HostGovernorError::InvalidConfig)?;
+        let installed = HostGovernor::independent(&config);
+        match PROCESS_GOVERNOR.set(installed.clone()) {
+            Ok(()) => Ok(installed),
+            Err(_) => Err(HostGovernorError::AlreadyInstalled),
+        }
+    }
+
+    pub fn independent(config: &Config) -> HostGovernor {
+        HostGovernor {
+            inner: Arc::new(Mutex::new(Governor::new(config, MonotonicTime::ZERO))),
+            base: Arc::new(Mutex::new(None)),
+            limits: Arc::new(config.clone()),
+        }
+    }
+
+    pub fn base(&self, now: Instant) -> Instant {
+        let mut base = match self.base.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *base.get_or_insert(now)
+    }
+
+    pub fn reject_raised_limits(&self, config: &Config) -> Result<(), String> {
+        let host = self.limits.as_ref();
+        let raised = |name: &str| Err(format!("{name} raises a host governor limit"));
+        if config.max_in_flight > host.max_in_flight {
+            return raised("max_in_flight");
+        }
+        if config.per_domain_concurrency > host.per_domain_concurrency {
+            return raised("per_domain_concurrency");
+        }
+        if config.background_duty > host.background_duty {
+            return raised("background_duty");
+        }
+        if config.background_burst > host.background_burst {
+            return raised("background_burst");
+        }
+        if config.domain_background_duty > host.domain_background_duty {
+            return raised("domain_background_duty");
+        }
+        if config.domain_background_burst > host.domain_background_burst {
+            return raised("domain_background_burst");
+        }
+        if config.foreground_duty > host.foreground_duty {
+            return raised("foreground_duty");
+        }
+        if config.foreground_burst > host.foreground_burst {
+            return raised("foreground_burst");
+        }
+        if config.domain_foreground_duty > host.domain_foreground_duty {
+            return raised("domain_foreground_duty");
+        }
+        if config.domain_foreground_burst > host.domain_foreground_burst {
+            return raised("domain_foreground_burst");
+        }
+        if config.bootstrap_allowance > host.bootstrap_allowance {
+            return raised("bootstrap_allowance");
+        }
+        if config.accounted_memory_ceiling > host.accounted_memory_ceiling {
+            return raised("accounted_memory_ceiling");
+        }
+        if config.in_flight_listing_bytes > host.in_flight_listing_bytes {
+            return raised("in_flight_listing_bytes");
+        }
+        Ok(())
+    }
+
+    pub fn register_domain(
+        &self,
+        id: StorageDomainId,
+        capabilities: &DomainCapabilities,
+        subordinate_ceiling: usize,
+        now: MonotonicTime,
+    ) {
+        guard(&self.inner).register_domain(id, capabilities, subordinate_ceiling, now)
+    }
+
+    pub fn next_tree(&self) -> u64 {
+        guard(&self.inner).next_tree()
+    }
+
+    pub fn next_bootstrap(&self) -> u64 {
+        guard(&self.inner).next_bootstrap()
+    }
+
+    pub fn report_memory(&self, tree: u64, snapshot_bytes: u64, in_flight_bytes: u64) {
+        guard(&self.inner).report_memory(tree, snapshot_bytes, in_flight_bytes)
+    }
+
+    pub fn forget_tree(&self, tree: u64) {
+        guard(&self.inner).forget_tree(tree)
+    }
+
+    pub fn accounted_memory(&self) -> u64 {
+        guard(&self.inner).accounted_memory()
+    }
+
+    pub fn accounted_memory_excluding(&self, tree: u64) -> u64 {
+        guard(&self.inner).accounted_memory_excluding(tree)
+    }
+
+    pub fn memory_ceiling(&self) -> u64 {
+        guard(&self.inner).memory_ceiling()
+    }
+
+    pub fn in_flight_bytes(&self) -> u64 {
+        guard(&self.inner).in_flight_bytes()
+    }
+
+    pub fn bytes_estimate(&self, domain: Option<StorageDomainId>) -> u64 {
+        guard(&self.inner).bytes_estimate(domain)
+    }
+
+    pub fn record_bytes(&self, domain: Option<StorageDomainId>, bytes: u64, now: MonotonicTime) {
+        guard(&self.inner).record_bytes(domain, bytes, now)
+    }
+
+    pub fn attribute(&self, id: GrantId, domain: StorageDomainId, now: MonotonicTime) {
+        guard(&self.inner).attribute(id, domain, now)
+    }
+
+    pub fn estimate_of(&self, domain: Option<StorageDomainId>) -> Duration {
+        guard(&self.inner).estimate_of(domain)
+    }
+
+    pub fn cost_of(&self, domain: Option<StorageDomainId>, operations: u32) -> Duration {
+        guard(&self.inner).cost_of(domain, operations)
+    }
+
+    pub fn account(&self, now: MonotonicTime) {
+        guard(&self.inner).account(now)
+    }
+
+    pub fn quarantined(&self, domain: Option<StorageDomainId>) -> bool {
+        guard(&self.inner).quarantined(domain)
+    }
+
+    pub fn window_of(&self, domain: Option<StorageDomainId>) -> usize {
+        guard(&self.inner).window_of(domain)
+    }
+
+    pub fn global_exhausted(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> bool {
+        guard(&self.inner).global_exhausted(domain, origin)
+    }
+
+    pub fn may_start(&self, domain: Option<StorageDomainId>, in_flight: usize) -> Result<(), ThrottleCause> {
+        guard(&self.inner).may_start(domain, in_flight)
+    }
+
+    pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Duration, ThrottleCause> {
+        guard(&self.inner).try_admit(reservation, now)
+    }
+
+    pub fn report(&self, id: GrantId, blocking: Duration, now: MonotonicTime) {
+        guard(&self.inner).report(id, blocking, now)
+    }
+
+    pub fn charge_of(&self, id: GrantId) -> Option<Duration> {
+        guard(&self.inner).charge_of(id)
+    }
+
+    pub fn overshoot_of(&self, id: GrantId) -> Duration {
+        guard(&self.inner).overshoot_of(id)
+    }
+
+    pub fn charge_surcharge(&self, domain: Option<StorageDomainId>, now: MonotonicTime) {
+        guard(&self.inner).charge_surcharge(domain, now)
+    }
+
+    pub fn charge_release(&self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Duration {
+        guard(&self.inner).charge_release(domain, now)
+    }
+
+    pub fn start(&self, id: GrantId, at: MonotonicTime) {
+        guard(&self.inner).start(id, at)
+    }
+
+    pub fn release(&self, id: GrantId, now: MonotonicTime) {
+        guard(&self.inner).release(id, now)
+    }
+
+    pub fn record_outcome(&self, domain: Option<StorageDomainId>, error: bool, now: MonotonicTime) {
+        guard(&self.inner).record_outcome(domain, error, now)
+    }
+
+    pub fn newly_stuck(&self, now: MonotonicTime) -> Vec<GrantId> {
+        guard(&self.inner).newly_stuck(now)
+    }
+
+    pub fn mark_stuck(&self, id: GrantId, now: MonotonicTime) {
+        guard(&self.inner).mark_stuck(id, now)
+    }
+
+    pub fn stuck_grants(&self) -> Vec<Grant> {
+        guard(&self.inner).stuck_grants().cloned().collect()
+    }
+
+    pub fn next_stuck_deadline(&self) -> Option<MonotonicTime> {
+        guard(&self.inner).next_stuck_deadline()
+    }
+
+    pub fn admissible_at(&self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Option<MonotonicTime> {
+        guard(&self.inner).admissible_at(domain, now)
+    }
+
+    pub fn throttle(&self, now: MonotonicTime) -> Option<(ThrottleCause, Option<MonotonicTime>)> {
+        guard(&self.inner).throttle(now)
+    }
+
+    pub fn resume_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
+        guard(&self.inner).resume_at(now)
+    }
+
+    pub fn timer_hints(&self, now: MonotonicTime) -> (Option<MonotonicTime>, Option<MonotonicTime>) {
+        let governor = guard(&self.inner);
+        (governor.resume_at(now), governor.next_stuck_deadline())
+    }
+
+    pub fn domain_health_map(
+        &self,
+        now: MonotonicTime,
+        queued: &std::collections::BTreeSet<StorageDomainId>,
+        into: &mut BTreeMap<StorageDomainId, crate::update::ResourceHealth>,
+    ) {
+        let governor = guard(&self.inner);
+        for (id, slot) in into.iter_mut() {
+            *slot = match governor.domain_health(*id, now, queued.contains(id)) {
+                Some((cause, resume)) => crate::update::ResourceHealth::Throttled { cause, resume },
+                None => crate::update::ResourceHealth::Nominal,
+            };
+        }
+    }
+
+    pub fn grants(&self) -> Vec<Grant> {
+        guard(&self.inner).grants().cloned().collect()
+    }
+
+    pub fn new_grants(&self, seen: &dyn Fn(GrantId, u32) -> bool) -> Vec<Grant> {
+        guard(&self.inner).grants().filter(|grant| !seen(grant.id, grant.lease)).cloned().collect()
+    }
+
+    pub fn view(&self, now: MonotonicTime) -> GovernorView {
+        guard(&self.inner).view(now)
     }
 }

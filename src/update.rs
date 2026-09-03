@@ -98,6 +98,8 @@ impl ReconciliationHealth {
 pub enum ThrottleCause {
     DutyBudget,
     Concurrency,
+    Memory,
+    ForegroundCeiling,
     StuckWorker,
 }
 
@@ -106,6 +108,8 @@ impl fmt::Display for ThrottleCause {
         match self {
             ThrottleCause::DutyBudget => f.write_str("duty budget"),
             ThrottleCause::Concurrency => f.write_str("concurrency window"),
+            ThrottleCause::Memory => f.write_str("accounted memory"),
+            ThrottleCause::ForegroundCeiling => f.write_str("foreground allowance"),
             ThrottleCause::StuckWorker => f.write_str("stuck worker"),
         }
     }
@@ -134,6 +138,11 @@ impl ResourceHealth {
 pub enum ResourceLimit {
     EntriesPerDirectory,
     RepresentedEntries,
+    ListingBytes,
+    InFlightBytes,
+    SnapshotBytes,
+    AccountedMemory,
+    CommandWorkerTime,
 }
 
 impl fmt::Display for ResourceLimit {
@@ -141,6 +150,29 @@ impl fmt::Display for ResourceLimit {
         match self {
             ResourceLimit::EntriesPerDirectory => f.write_str("entries per directory"),
             ResourceLimit::RepresentedEntries => f.write_str("represented entries"),
+            ResourceLimit::ListingBytes => f.write_str("listing bytes"),
+            ResourceLimit::InFlightBytes => f.write_str("in-flight listing bytes"),
+            ResourceLimit::SnapshotBytes => f.write_str("snapshot bytes"),
+            ResourceLimit::AccountedMemory => f.write_str("accounted memory"),
+            ResourceLimit::CommandWorkerTime => f.write_str("command worker time"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceLimited {
+    pub limit: ResourceLimit,
+    pub configured: u64,
+    pub observed: u64,
+    pub domain: Option<crate::domain::StorageDomainId>,
+}
+
+impl fmt::Display for ResourceLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} limit {} reached with {} observed", self.limit, self.configured, self.observed)?;
+        match self.domain {
+            Some(domain) => write!(f, " on domain {domain}"),
+            None => Ok(()),
         }
     }
 }
@@ -148,9 +180,7 @@ impl fmt::Display for ResourceLimit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceLimitEvent {
     pub path: RelativePath,
-    pub resource: ResourceLimit,
-    pub seen: u64,
-    pub limit: u64,
+    pub limited: ResourceLimited,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,7 +216,7 @@ pub enum Operation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErrorCause {
     Fs(FsError),
-    LimitExceeded,
+    ResourceLimited(ResourceLimited),
     InvalidName(std::ffi::OsString),
     DuplicateName(std::ffi::OsString),
     UnresolvedKind(std::ffi::OsString),
@@ -201,7 +231,7 @@ impl fmt::Display for ErrorCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ErrorCause::Fs(e) => write!(f, "{e}"),
-            ErrorCause::LimitExceeded => f.write_str("configured entry limit exceeded"),
+            ErrorCause::ResourceLimited(limited) => write!(f, "{limited}"),
             ErrorCause::InvalidName(n) => write!(f, "unrepresentable name {n:?}"),
             ErrorCause::DuplicateName(n) => write!(f, "duplicate name {n:?}"),
             ErrorCause::UnresolvedKind(n) => write!(f, "unresolved kind for {n:?}"),

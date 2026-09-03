@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::fs::FsError;
 use crate::path::{PathError, RelativePath};
+use crate::update::ResourceLimited;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -12,7 +13,7 @@ pub enum Error {
     NotDirectory,
     NotLoaded,
     PolicyDenied,
-    LimitExceeded,
+    ResourceLimited(ResourceLimited),
     PathLimit,
     Capacity,
     RootUnavailable,
@@ -37,7 +38,7 @@ impl fmt::Display for Error {
             Error::NotDirectory => f.write_str("not a directory"),
             Error::NotLoaded => f.write_str("not loaded"),
             Error::PolicyDenied => f.write_str("denied by policy"),
-            Error::LimitExceeded => f.write_str("configured entry limit exceeded"),
+            Error::ResourceLimited(limited) => write!(f, "{limited}"),
             Error::PathLimit => f.write_str("too many paths in command"),
             Error::Capacity => f.write_str("command capacity exhausted"),
             Error::RootUnavailable => f.write_str("root unavailable"),

@@ -63,8 +63,14 @@ impl Coordinator {
         self.batch = Some(Batch { members, periodic });
     }
 
-    fn try_grant(&mut self, entry: Option<EntryId>, need: ReadNeed, path: &RelativePathOwned) -> Option<JobGrant> {
-        self.try_grant_on(entry, need, path).ok()
+    fn try_grant(
+        &mut self,
+        entry: Option<EntryId>,
+        need: ReadNeed,
+        path: &RelativePathOwned,
+        barriers: &[CommandId],
+    ) -> Option<JobGrant> {
+        self.try_grant_on(entry, need, path, barriers).ok()
     }
 
     fn try_grant_on(
@@ -72,6 +78,7 @@ impl Coordinator {
         entry: Option<EntryId>,
         need: ReadNeed,
         path: &RelativePathOwned,
+        barriers: &[CommandId],
     ) -> Result<JobGrant, Denied> {
         let id = self.next_job_id;
         let decision = match entry {
@@ -88,6 +95,7 @@ impl Coordinator {
             (WatchDecision::Capped, None) | (WatchDecision::NotNeeded, _) => None,
         };
         let domain = entry.and_then(|e| self.domain_of(e));
+        let origin = self.origin_of(entry, barriers);
         let now = self.now;
         let reservation = Reservation {
             id: GrantId::Job(id),
@@ -96,13 +104,15 @@ impl Coordinator {
             registrations: u32::from(registration.is_some()),
             lease: 0,
             domain,
+            origin,
+            listing: need == ReadNeed::Listing,
         };
         match self.governor.try_admit(reservation, now) {
-            Ok(_) => {
+            Ok(cost) => {
                 self.next_job_id = id.next();
-                Ok(JobGrant { id, registration, domain })
+                Ok(JobGrant { id, registration, domain, origin, cost })
             }
-            Err(_) => match self.governor.global_exhausted(domain) {
+            Err(_) => match self.governor.global_exhausted(domain, origin) {
                 true => Err(Denied::Globally),
                 false => Err(Denied::OnDomain(domain)),
             },
@@ -128,11 +138,22 @@ impl Coordinator {
             let now = self.now;
             let lease = job.leases;
             let domain = job.domain;
-            let reservation =
-                Reservation { id: GrantId::Job(id), path: job.path.clone(), reads: 1, registrations: 0, lease, domain };
-            if self.governor.try_admit(reservation, now).is_err() {
-                continue;
-            }
+            let reservation = Reservation {
+                id: GrantId::Job(id),
+                path: job.path.clone(),
+                reads: 1,
+                registrations: 0,
+                lease,
+                domain,
+                origin: job.origin,
+                listing: job.need == ReadNeed::Listing,
+            };
+            let cost = match self.governor.try_admit(reservation, now) {
+                Ok(cost) => cost,
+                Err(_) => continue,
+            };
+            let barriers = job.barriers.clone();
+            self.charge_commands(&barriers, cost);
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.phase = JobPhase::Queued;
                 job.leases = job.leases.saturating_add(1);
@@ -151,7 +172,7 @@ impl Coordinator {
         match job.need {
             ReadNeed::Listing => Work::Listing(ListingWork {
                 lease: Lease { entries: self.config.entries_per_lease, operations: self.config.operations_per_lease },
-                ceiling: self.config.entries_per_directory,
+                ceilings: self.ceilings(),
                 cancel: job.cancel.clone(),
                 resume: job.session_open,
             }),
@@ -310,6 +331,8 @@ impl Coordinator {
     fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) -> bool {
         let mut remaining = slots;
         let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
+        let mut quarantined: std::collections::HashMap<Option<StorageDomainId>, bool> =
+            std::collections::HashMap::new();
         let mut index = match self.round.as_ref() {
             Some(round) => round.cursor,
             None => return true,
@@ -383,7 +406,15 @@ impl Coordinator {
                 continue;
             }
             let domain = self.domain_of(obligation.entry);
-            if self.governor.quarantined(domain) {
+            let held = match quarantined.get(&domain) {
+                Some(held) => *held,
+                None => {
+                    let held = self.governor.quarantined(domain);
+                    quarantined.insert(domain, held);
+                    held
+                }
+            };
+            if held {
                 self.set_obligation(obligation.entry, ObligationState::Unsatisfied);
                 if at_cursor {
                     self.advance_cursor();
@@ -393,7 +424,10 @@ impl Coordinator {
             if denied.contains(&domain) {
                 continue;
             }
-            let grant = match self.try_grant_on(Some(obligation.entry), ReadNeed::Listing, &obligation.path) {
+            let barriers =
+                self.pending.get(&obligation.entry).map(|request| request.barriers.clone()).unwrap_or_default();
+            let grant = match self.try_grant_on(Some(obligation.entry), ReadNeed::Listing, &obligation.path, &barriers)
+            {
                 Ok(grant) => grant,
                 Err(Denied::Globally) => return false,
                 Err(Denied::OnDomain(domain)) => {
@@ -508,7 +542,7 @@ impl Coordinator {
                 && take > 0
                 && let Some(probe) = self.root_probe.take()
             {
-                match self.try_grant(None, probe.request.need, &probe.request.path) {
+                match self.try_grant(None, probe.request.need, &probe.request.path, &probe.request.barriers) {
                     Some(grant) => {
                         let job_id = self.admit(grant, None, probe.request);
                         members.insert(job_id);
@@ -546,7 +580,7 @@ impl Coordinator {
                 if denied.contains(&self.domain_of(id)) {
                     continue;
                 }
-                let grant = match self.try_grant_on(Some(id), request.need, &request.path) {
+                let grant = match self.try_grant_on(Some(id), request.need, &request.path, &request.barriers) {
                     Ok(grant) => grant,
                     Err(Denied::Globally) => return false,
                     Err(Denied::OnDomain(domain)) => {
@@ -620,11 +654,13 @@ impl Coordinator {
             }
             (Some(_), None) | (None, _) => JobPhase::Queued,
         };
+        self.charge_commands(&barriers, grant.cost);
         let job = ActiveJob {
             id,
             target,
             path: request.path,
             domain: grant.domain,
+            origin: grant.origin,
             need: request.need,
             phase,
             dispatch,
@@ -838,6 +874,8 @@ pub(super) struct JobGrant {
     pub id: JobId,
     pub registration: Option<WatchScope>,
     pub domain: Option<StorageDomainId>,
+    pub origin: WorkOrigin,
+    pub cost: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

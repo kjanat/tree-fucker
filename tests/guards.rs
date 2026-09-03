@@ -4,8 +4,8 @@ use tree_fucker::core::{Command, JobResult};
 use tree_fucker::testing::{FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{RoundResult, UpdateEvent};
 use tree_fucker::{
-    Config, EntryKind, FsError, LoadAll, LoadState, MetadataFields, PathPredicate, RelativePath, ScanDecision,
-    SessionOutcome, SessionStep, WatcherKind, list_directory,
+    Ceilings, Config, EntryKind, FsError, LoadAll, LoadState, MetadataFields, PathPredicate, RelativePath,
+    ScanDecision, SessionOutcome, SessionStep, WatcherKind, list_directory,
 };
 
 fn path(p: &str) -> RelativePath {
@@ -179,7 +179,7 @@ fn membership_changes_invalidate_containing_directory_binding_guards() {
 }
 
 fn frozen_parent_listing(fs: &FakeFileSystem, stale_size: u64) -> JobResult {
-    let SessionOutcome::Complete(mut listing) = list_directory(fs, fs.root(), &path("a"), usize::MAX) else {
+    let SessionOutcome::Complete(mut listing) = list_directory(fs, fs.root(), &path("a"), Ceilings::UNBOUNDED) else {
         panic!("the fake filesystem did not complete a listing of a");
     };
     for entry in &mut listing.entries {

@@ -33,6 +33,18 @@ impl Add<Duration> for MonotonicTime {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WorkOrigin {
+    Background,
+    Foreground,
+}
+
+impl WorkOrigin {
+    pub fn is_foreground(self) -> bool {
+        self == WorkOrigin::Foreground
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Class {
     Baseline,
     Control,
@@ -312,6 +324,7 @@ pub struct ActiveJob {
     pub target: JobTarget,
     pub path: RelativePath,
     pub domain: Option<StorageDomainId>,
+    pub origin: WorkOrigin,
     pub need: ReadNeed,
     pub phase: JobPhase,
     pub dispatch: Sequence,
@@ -377,7 +390,7 @@ pub enum DegradedCause {
     Transient,
     PermissionDenied,
     Unsupported,
-    LimitExceeded,
+    ResourceLimited,
     WatcherRegistration,
     Enrichment,
 }
@@ -1056,6 +1069,13 @@ pub struct PendingCommand {
     pub id: CommandId,
     pub barrier: Sequence,
     pub state: CommandState,
+    pub admitted: Duration,
+}
+
+impl PendingCommand {
+    pub fn draws_on_foreground(&self) -> bool {
+        matches!(self.state, CommandState::Refresh { .. } | CommandState::Load { .. })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1096,7 +1116,7 @@ impl RootState {
 pub enum ListingRejection {
     MalformedNames,
     UnresolvedChild,
-    LimitExceeded,
+    ResourceLimited(crate::update::ResourceLimited),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -6,9 +6,9 @@ use tree_fucker::core::{Class, Command, DomainStat, JobResult, JobSpec, Monotoni
 use tree_fucker::testing::{Admission, CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ErrorCause, ResourceHealth, ResourceLimit, RoundResult, ThrottleCause, UpdateEvent};
 use tree_fucker::{
-    AccessTopology, CancellationToken, Config, Continuation, DomainCapabilities, DomainCrossing, DomainIdentity,
-    EntryKind, FileSystem, FsError, HintKind, Lease, LoadAll, MediaHint, RelativePath, SessionOutcome, SessionStep,
-    TransportHint, WatcherKind,
+    AccessTopology, CancellationToken, Ceilings, Config, Continuation, DomainCapabilities, DomainCrossing,
+    DomainIdentity, EntryKind, FileSystem, FsError, HintKind, Lease, LoadAll, MediaHint, RelativePath, SessionOutcome,
+    SessionStep, TransportHint, WatcherKind,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -65,11 +65,11 @@ fn worst_window(h: &Harness, window: Duration) -> (MonotonicTime, Duration) {
 }
 
 fn run_one_round(h: &mut Harness) {
-    let before = h.stats().last_round;
+    let before = h.last_round();
     for _ in 0..4000 {
         let next = h.now() + Duration::from_secs(5);
         h.run_jobs_until(next);
-        if h.stats().last_round != before {
+        if h.last_round() != before {
             return;
         }
     }
@@ -360,15 +360,15 @@ fn the_baseline_cursor_advances_while_every_expedited_class_stays_ready() {
     assert_eq!(h.result(t), Some(Ok(())));
 
     let mut rounds = 0;
-    let mut last = h.stats().last_round;
+    let mut last = h.last_round();
     for step in 0..40 {
         fs.mkdir(&format!("fresh{step}"));
         let t = h.command(Command::Refresh(vec![path("keep2")]));
         let target = h.now() + Duration::from_secs(60);
         h.run_jobs_until(target);
         assert!(h.result(t).is_some(), "refresh {step} never settled");
-        if h.stats().last_round != last {
-            last = h.stats().last_round;
+        if h.last_round() != last {
+            last = h.last_round();
             rounds += 1;
         }
     }
@@ -580,7 +580,7 @@ fn a_directory_over_its_entry_limit_reports_a_degraded_path_and_a_limit_cause() 
             UpdateEvent::Terminal { .. } => None,
         })
         .flatten()
-        .filter(|e| e.error == ErrorCause::LimitExceeded)
+        .filter(|e| matches!(e.error, ErrorCause::ResourceLimited(_)))
         .map(|e| e.path)
         .collect();
     assert_eq!(limits, vec![path("big")], "RFC 13.1: the resource-limit cause must name the directory that hit it");
@@ -846,7 +846,7 @@ fn wide(children: usize) -> Arc<FakeFileSystem> {
 fn a_listing_session_yields_at_every_lease_boundary_and_performs_no_operation_beyond_its_lease() {
     let fs = wide(7);
     fs.set_chunk_size(1);
-    let mut session = fs.open_listing(fs.root(), &path("aaa"), 1000, CancellationToken::new());
+    let mut session = fs.open_listing(fs.root(), &path("aaa"), Ceilings::entries(1000), CancellationToken::new());
     let lease = Lease { entries: 2, operations: 4 };
     let entry_lease = u64::try_from(lease.entries).unwrap_or(u64::MAX);
     let operation_lease = u32::try_from(lease.operations).unwrap_or(u32::MAX);
@@ -937,7 +937,7 @@ fn cancellation_between_enumeration_chunks_ends_the_session_cancelled_carrying_n
     let fs = wide(6);
     fs.set_chunk_size(1);
     let cancel = CancellationToken::new();
-    let session = fs.open_listing(fs.root(), &path("aaa"), 1000, cancel.clone());
+    let session = fs.open_listing(fs.root(), &path("aaa"), Ceilings::entries(1000), cancel.clone());
     let lease = Lease { entries: 2, operations: 8 };
     let Continuation::Suspended(session) = session.resume(lease).0 else {
         panic!("the session finished before the cancellation could land between chunks");
@@ -994,16 +994,18 @@ fn a_listing_at_the_entry_ceiling_stops_within_one_chunk_and_reports_the_count_s
     let fs = wide(10);
     fs.set_chunk_size(2);
     let ceiling = 3;
-    let mut session = fs.open_listing(fs.root(), &path("aaa"), ceiling, CancellationToken::new());
+    let mut session = fs.open_listing(fs.root(), &path("aaa"), Ceilings::entries(ceiling), CancellationToken::new());
     let outcome = loop {
         match session.resume(Lease { entries: 64, operations: 64 }).0 {
             Continuation::Suspended(next) => session = next,
             Continuation::Finished(outcome) => break outcome,
         }
     };
-    let SessionOutcome::ResourceLimited { seen } = outcome else {
+    let SessionOutcome::ResourceLimited(limited) = outcome else {
         panic!("RFC 10.2: a session that reaches the entry ceiling ends ResourceLimited, not {outcome:?}");
     };
+    assert_eq!(limited.limit, ResourceLimit::EntriesPerDirectory);
+    let seen = usize::try_from(limited.observed).expect("count");
     assert_eq!(
         seen, 4,
         "RFC 10.2: the ResourceLimited outcome carries the count seen so far, and an adapter MUST NOT accumulate \
@@ -1026,9 +1028,9 @@ fn a_listing_over_the_entry_ceiling_reports_the_count_seen_and_the_configured_li
         .iter()
         .find(|e| e.path == path("big"))
         .unwrap_or_else(|| panic!("RFC 15.6 and 16: a resource-limit event must name the directory that hit it"));
-    assert_eq!(event.resource, ResourceLimit::EntriesPerDirectory);
+    assert_eq!(event.limited.limit, ResourceLimit::EntriesPerDirectory);
     assert_eq!(
-        (event.seen, event.limit),
+        (event.limited.observed, event.limited.configured),
         (5, 3),
         "RFC 13.1 and 16: a resource-limit event names the resource, the count seen, and the configured limit"
     );
@@ -1147,7 +1149,7 @@ fn a_session_reports_its_blocking_time_and_result_bytes_with_every_lease() {
     fs.set_chunk_size(1);
     fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_millis(30));
     fs.set_cost(CostScope::path("aaa"), FakeOp::Chunk, Duration::from_millis(5));
-    let session = fs.open_listing(fs.root(), &path("aaa"), 1000, CancellationToken::new());
+    let session = fs.open_listing(fs.root(), &path("aaa"), Ceilings::entries(1000), CancellationToken::new());
     let lease = Lease { entries: 2, operations: 8 };
 
     let (continuation, first) = session.resume(lease);
@@ -1287,6 +1289,9 @@ fn indebted_media(cost: Duration) -> (Arc<FakeFileSystem>, Harness) {
     let config = Config {
         background_duty: 1.0,
         background_burst: Duration::from_secs(300),
+        foreground_duty: 1.0,
+        foreground_burst: Duration::from_secs(300),
+        domain_foreground_duty: 0.02,
         stuck_threshold: Duration::from_secs(3600),
         ..follow()
     };
@@ -1337,6 +1342,13 @@ fn one_domains_debt_never_reduces_another_domains_admissible_rate() {
 #[test]
 fn a_governor_denial_for_one_domain_still_admits_another_domains_ready_work() {
     let (_fs, mut h) = indebted_media(Duration::from_secs(5));
+    let charged = h.now();
+    h.command(Command::Refresh(vec![path("media")]));
+    h.run_jobs_until(charged + Duration::from_secs(30));
+    assert!(
+        domain_stat(&h, MEDIA).foreground_debt > Duration::ZERO,
+        "RFC 15.4: a refresh read draws on the foreground buckets, and this one left no debt behind"
+    );
     let from = h.now();
     let since = h.admissions().len();
     let denials = h.governor().denials;

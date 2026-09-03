@@ -20,6 +20,7 @@ pub struct Snapshot {
 struct Inner {
     version: SnapshotVersion,
     case: CaseSensitivity,
+    bytes: u64,
     child_case: HashMap<EntryId, CaseSensitivity>,
     by_path: OrdMap<PathKey, Arc<Entry>>,
     by_id: HashMap<EntryId, PathKey>,
@@ -66,6 +67,7 @@ impl Snapshot {
             inner: Arc::new(Inner {
                 version,
                 case,
+                bytes: 0,
                 child_case: HashMap::new(),
                 by_path: OrdMap::new(),
                 by_id: HashMap::new(),
@@ -84,6 +86,10 @@ impl Snapshot {
 
     pub fn len(&self) -> usize {
         self.inner.by_path.len()
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.inner.bytes
     }
 
     pub fn is_empty(&self) -> bool {
@@ -112,6 +118,12 @@ impl Snapshot {
 
     pub fn get_key(&self, key: &PathKey) -> Option<&Entry> {
         self.inner.by_path.get(key).map(|e| e.as_ref())
+    }
+
+    pub fn parent_id(&self, id: EntryId) -> Option<EntryId> {
+        let key = self.inner.by_id.get(&id)?;
+        let parent = key.parent()?;
+        self.inner.by_path.get(&parent).map(|entry| entry.id)
     }
 
     pub fn get_by_id(&self, id: EntryId) -> Option<&Entry> {
@@ -166,6 +178,7 @@ impl Snapshot {
 
     pub fn builder(&self) -> SnapshotBuilder {
         SnapshotBuilder {
+            bytes: self.inner.bytes,
             case: self.inner.case,
             folds: 0,
             child_case: self.inner.child_case.clone(),
@@ -185,6 +198,7 @@ impl fmt::Debug for Snapshot {
 
 pub struct SnapshotBuilder {
     case: CaseSensitivity,
+    bytes: u64,
     folds: usize,
     child_case: HashMap<EntryId, CaseSensitivity>,
     by_path: OrdMap<PathKey, Arc<Entry>>,
@@ -202,6 +216,23 @@ pub enum BuildError {
 }
 
 impl SnapshotBuilder {
+    fn put(&mut self, key: PathKey, entry: Arc<Entry>) {
+        self.bytes = self.bytes.saturating_add(crate::entry::entry_bytes(&entry));
+        if let Some(previous) = self.by_path.insert(key, entry) {
+            self.bytes = self.bytes.saturating_sub(crate::entry::entry_bytes(&previous));
+        }
+    }
+
+    fn take(&mut self, key: &PathKey) -> Option<Arc<Entry>> {
+        let removed = self.by_path.remove(key)?;
+        self.bytes = self.bytes.saturating_sub(crate::entry::entry_bytes(&removed));
+        Some(removed)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     fn fold(&mut self, path: &RelativePath) -> (PathKey, CaseSensitivity) {
         self.folds += 1;
         fold(path, self.case, &self.by_path, &self.child_case)
@@ -257,7 +288,7 @@ impl SnapshotBuilder {
         let mut moved: Vec<Arc<Entry>> = Vec::new();
         for id in &order {
             if let Some(key) = self.by_id.remove(id)
-                && let Some(entry) = self.by_path.remove(&key)
+                && let Some(entry) = self.take(&key)
             {
                 moved.push(entry);
             }
@@ -283,7 +314,7 @@ impl SnapshotBuilder {
                 dropped.push(incumbent);
             }
             self.by_id.insert(entry.id, key.clone());
-            self.by_path.insert(key.clone(), entry.clone());
+            self.put(key.clone(), entry.clone());
             if let Some(parent_key) = key.parent()
                 && let Some(parent) = self.by_path.get(&parent_key).map(|p| p.id)
             {
@@ -295,7 +326,7 @@ impl SnapshotBuilder {
 
     fn evict(&mut self, key: &PathKey, entry: &Arc<Entry>) {
         self.by_id.remove(&entry.id);
-        self.by_path.remove(key);
+        self.take(key);
         self.children.remove(&entry.id);
         self.child_case.remove(&entry.id);
         if let Some(parent_key) = key.parent()
@@ -364,7 +395,7 @@ impl SnapshotBuilder {
         self.remember(entry.id);
         let id = entry.id;
         self.by_id.insert(id, key.clone());
-        self.by_path.insert(key.clone(), Arc::new(entry));
+        self.put(key.clone(), Arc::new(entry));
         if let Some(parent_id) = parent_id {
             self.children.entry(parent_id).or_default().insert(key, id);
         }
@@ -378,7 +409,7 @@ impl SnapshotBuilder {
         change(&mut entry);
         entry.path = self.by_path.get(&key).map(|e| e.path.clone()).unwrap_or(entry.path);
         entry.id = id;
-        self.by_path.insert(key, Arc::new(entry));
+        self.put(key, Arc::new(entry));
         Ok(())
     }
 
@@ -392,7 +423,7 @@ impl SnapshotBuilder {
             self.remember(current);
             self.child_case.remove(&current);
             if let Some(key) = self.by_id.remove(&current)
-                && let Some(entry) = self.by_path.remove(&key)
+                && let Some(entry) = self.take(&key)
             {
                 if let Some(parent_key) = key.parent()
                     && let Some(parent) = self.by_path.get(&parent_key).map(|p| p.id)
@@ -439,7 +470,7 @@ impl SnapshotBuilder {
         for entry in &collected {
             self.remember(entry.id);
             if let Some(key) = self.by_id.remove(&entry.id) {
-                self.by_path.remove(&key);
+                self.take(&key);
             }
         }
         for entry in collected {
@@ -449,7 +480,7 @@ impl SnapshotBuilder {
             updated.path = rebased;
             updated.generation = updated.generation.next();
             self.by_id.insert(updated.id, key.clone());
-            self.by_path.insert(key.clone(), Arc::new(updated));
+            self.put(key.clone(), Arc::new(updated));
             moved.push(entry.id);
             if let Some(parent_key) = key.parent()
                 && let Some(parent) = self.by_path.get(&parent_key).map(|p| p.id)
@@ -537,6 +568,7 @@ impl SnapshotBuilder {
             inner: Arc::new(Inner {
                 version,
                 case: self.case,
+                bytes: self.bytes,
                 child_case: self.child_case,
                 by_path: self.by_path,
                 by_id: self.by_id,

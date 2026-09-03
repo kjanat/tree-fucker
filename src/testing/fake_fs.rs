@@ -9,9 +9,9 @@ use crate::domain::{
 };
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
-    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
-    FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome, WatcherEvent,
-    WatcherKind, WatcherSink, entry_bytes,
+    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem,
+    FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome,
+    WatcherEvent, WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -916,7 +916,7 @@ impl FileSystem for FakeFileSystem {
         &self,
         _root: &Path,
         path: &RelativePath,
-        ceiling: usize,
+        ceilings: Ceilings,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession> {
         let (chunk, observes_cancellation) = {
@@ -926,7 +926,7 @@ impl FileSystem for FakeFileSystem {
         Box::new(FakeSession {
             inner: self.inner.clone(),
             path: path.clone(),
-            ceiling,
+            ceilings,
             cancel,
             chunk,
             observes_cancellation,
@@ -1035,7 +1035,7 @@ struct OpenedDirectory {
 struct FakeSession {
     inner: Arc<Mutex<Inner>>,
     path: RelativePath,
-    ceiling: usize,
+    ceilings: Ceilings,
     cancel: CancellationToken,
     chunk: usize,
     observes_cancellation: bool,
@@ -1178,9 +1178,8 @@ impl ListingSession for FakeSession {
             self.consume(take, &mut cost, &mut blocking);
             entries_left -= take;
             operations_left -= needed;
-            if self.entries.len() > self.ceiling {
-                let seen = self.entries.len();
-                return finish(&mut cost, self.bytes, blocking, SessionOutcome::ResourceLimited { seen });
+            if let Some(limited) = self.ceilings.exceeded_by(self.entries.len(), self.bytes) {
+                return finish(&mut cost, self.bytes, blocking, SessionOutcome::ResourceLimited(limited));
             }
         }
     }

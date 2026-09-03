@@ -6,7 +6,7 @@ use crate::entry::{EntryKind, LoadState, Shape};
 use crate::error::Error;
 use crate::fs::{FsError, SessionOutcome, SessionState, SessionStep};
 use crate::ids::*;
-use crate::update::{ErrorCause, Operation, ResourceLimit, ResourceLimitEvent, WatcherHealth};
+use crate::update::{ErrorCause, Operation, ResourceLimitEvent, ResourceLimited, WatcherHealth};
 
 impl Coordinator {
     pub(super) fn on_job_completed(&mut self, id: JobId, result: JobResult) {
@@ -70,16 +70,11 @@ impl Coordinator {
                     self.cancelled_sessions += 1;
                     self.finish_job(id, JobOutcome::Cancelled);
                 }
-                SessionState::Finished(SessionOutcome::ResourceLimited { seen }) => {
+                SessionState::Finished(SessionOutcome::ResourceLimited(reported)) => {
                     self.listing_failures += 1;
-                    let limit = self.config.entries_per_directory;
-                    self.record_resource_limit(ResourceLimitEvent {
-                        path: job.path.clone(),
-                        resource: ResourceLimit::EntriesPerDirectory,
-                        seen: u64::try_from(seen).unwrap_or(u64::MAX),
-                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                    });
-                    self.finish_job(id, JobOutcome::Rejected(ListingRejection::LimitExceeded));
+                    let limited = ResourceLimited { domain: self.domain_of(entry), ..reported };
+                    self.record_resource_limit(ResourceLimitEvent { path: job.path.clone(), limited });
+                    self.finish_job(id, JobOutcome::Rejected(ListingRejection::ResourceLimited(limited)));
                 }
                 SessionState::Finished(SessionOutcome::Failed(FsError::NotFound)) => {
                     self.listing_failures += 1;
@@ -421,7 +416,7 @@ impl Coordinator {
                 let error = match rejection {
                     ListingRejection::MalformedNames => Error::InvalidListing,
                     ListingRejection::UnresolvedChild => Error::UnresolvedKind,
-                    ListingRejection::LimitExceeded => Error::LimitExceeded,
+                    ListingRejection::ResourceLimited(limited) => Error::ResourceLimited(*limited),
                 };
                 for cmd in attached {
                     self.finish_command(cmd, Err(error.clone()));
@@ -532,11 +527,11 @@ impl Coordinator {
                     ListingRejection::MalformedNames | ListingRejection::UnresolvedChild => {
                         (DegradedCause::Transient, RetryTiming::Backoff)
                     }
-                    ListingRejection::LimitExceeded => {
-                        self.push_error(job.path.clone(), kind.operation(), ErrorCause::LimitExceeded);
+                    ListingRejection::ResourceLimited(limited) => {
+                        self.push_error(job.path.clone(), kind.operation(), ErrorCause::ResourceLimited(*limited));
                         let loaded = represented.as_ref().map(|current| current.is_loaded()).unwrap_or(false);
                         let timing = if loaded { RetryTiming::Untimed } else { RetryTiming::Backoff };
-                        (DegradedCause::LimitExceeded, timing)
+                        (DegradedCause::ResourceLimited, timing)
                     }
                 };
                 if represented.is_none() {
@@ -703,8 +698,8 @@ impl Coordinator {
                 self.push_error(job.path.clone(), Operation::DomainResolution, err.clone());
                 self.retry_domain(entry, job);
             }
-            JobOutcome::Rejected(ListingRejection::LimitExceeded) => {
-                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::LimitExceeded);
+            JobOutcome::Rejected(ListingRejection::ResourceLimited(limited)) => {
+                self.push_error(job.path.clone(), Operation::DomainResolution, ErrorCause::ResourceLimited(*limited));
                 self.retry_domain(entry, job);
             }
             JobOutcome::Rejected(ListingRejection::MalformedNames | ListingRejection::UnresolvedChild)
@@ -769,7 +764,7 @@ impl Coordinator {
 
     pub(super) fn release_watch(&mut self, result: Result<WatchId, ErrorCause>) {
         if let Ok(watch) = result {
-            self.outputs.push(Output::Unwatch(watch));
+            self.emit_unwatch(watch, None);
         }
     }
 
@@ -833,7 +828,8 @@ impl Coordinator {
             RegistrationTarget::Standalone(entry) => match result {
                 Ok(watch) => {
                     if self.dir_state(entry).is_none() {
-                        self.outputs.push(Output::Unwatch(watch));
+                        let domain = self.domain_of(entry);
+                        self.emit_unwatch(watch, domain);
                         return;
                     }
                     let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);

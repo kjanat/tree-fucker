@@ -12,7 +12,7 @@ use crate::ids::*;
 use crate::path::{PathKey, RelativePath};
 use crate::policy::{PolicyContext, ScanDecision};
 use crate::snapshot::{SnapshotBuilder, new_entry};
-use crate::update::{ErrorCause, Operation, PathChange, ResourceLimit, ResourceLimitEvent};
+use crate::update::{ErrorCause, Operation, PathChange, ResourceLimit, ResourceLimitEvent, ResourceLimited};
 
 pub(super) struct Observed<'a> {
     pub path: &'a RelativePath,
@@ -155,14 +155,14 @@ impl Coordinator {
             return Err(ListingRejection::MalformedNames);
         }
         if order.len() > self.config.entries_per_directory {
-            let limit = self.config.entries_per_directory;
-            self.record_resource_limit(ResourceLimitEvent {
-                path: dir.path.clone(),
-                resource: ResourceLimit::EntriesPerDirectory,
-                seen: u64::try_from(order.len()).unwrap_or(u64::MAX),
-                limit: u64::try_from(limit).unwrap_or(u64::MAX),
-            });
-            return Err(ListingRejection::LimitExceeded);
+            let limited = self.limited(
+                ResourceLimit::EntriesPerDirectory,
+                u64::try_from(self.config.entries_per_directory).unwrap_or(u64::MAX),
+                u64::try_from(order.len()).unwrap_or(u64::MAX),
+                dir_id,
+            );
+            self.record_resource_limit(ResourceLimitEvent { path: dir.path.clone(), limited });
+            return Err(ListingRejection::ResourceLimited(limited));
         }
         let children: Vec<(RelativePath, PathKey, EntryInfo, Option<Box<ProbeResult>>)> = order
             .into_iter()
@@ -240,15 +240,9 @@ impl Coordinator {
         if ctx_changed {
             self.reevaluate_descendants(&mut builder, &mut effects, dir_id, &ctx, false, inherit);
         }
-        if builder.len() > self.config.represented_entries {
-            let limit = self.config.represented_entries;
-            self.record_resource_limit(ResourceLimitEvent {
-                path: dir.path.clone(),
-                resource: ResourceLimit::RepresentedEntries,
-                seen: u64::try_from(builder.len()).unwrap_or(u64::MAX),
-                limit: u64::try_from(limit).unwrap_or(u64::MAX),
-            });
-            return Err(ListingRejection::LimitExceeded);
+        if let Some(limited) = self.exceeded_representation(&builder, dir_id) {
+            self.record_resource_limit(ResourceLimitEvent { path: dir.path.clone(), limited });
+            return Err(ListingRejection::ResourceLimited(limited));
         }
         duplicates.sort();
         for name in duplicates {
@@ -257,6 +251,30 @@ impl Coordinator {
         self.commit(builder, effects, Some(job));
         self.request_enrichment(dir_id, fields.without(listing.supplied_fields), job.reasons);
         Ok(())
+    }
+
+    pub(super) fn exceeded_representation(
+        &self,
+        builder: &crate::snapshot::SnapshotBuilder,
+        dir: EntryId,
+    ) -> Option<ResourceLimited> {
+        if builder.len() > self.config.represented_entries {
+            return Some(self.limited(
+                ResourceLimit::RepresentedEntries,
+                u64::try_from(self.config.represented_entries).unwrap_or(u64::MAX),
+                u64::try_from(builder.len()).unwrap_or(u64::MAX),
+                dir,
+            ));
+        }
+        if builder.bytes() > self.config.snapshot_bytes {
+            return Some(self.limited(ResourceLimit::SnapshotBytes, self.config.snapshot_bytes, builder.bytes(), dir));
+        }
+        let projected = self.projected_memory(builder.bytes());
+        let ceiling = self.memory_ceiling();
+        if projected > ceiling {
+            return Some(self.limited(ResourceLimit::AccountedMemory, ceiling, projected, dir));
+        }
+        None
     }
 
     pub(super) fn request_enrichment(&mut self, dir: EntryId, fields: MetadataFields, origin: Reasons) {
@@ -998,9 +1016,9 @@ impl Coordinator {
         if let Some(WatchState::Registered(watch)) = self.dir_state(id).map(|dir| dir.watch())
             && self.watcher_of(id).scope == crate::domain::WatcherScope::PerDirectory
         {
-            self.outputs.push(Output::Unwatch(watch));
-            self.watches.retain(|w| *w != watch);
             let domain = self.domain_of(id);
+            self.emit_unwatch(watch, domain);
+            self.watches.retain(|w| *w != watch);
             self.entries.set_watch(id, WatchState::NotRegistered, domain);
         }
     }
@@ -1017,12 +1035,16 @@ impl Coordinator {
         self.pending_enrichment.remove(&id);
         self.pending_domain.remove(&id);
         let per_directory = self.watcher_of(id).scope == crate::domain::WatcherScope::PerDirectory;
-        if let Some(state) = self.entries.remove(id)
-            && let Some(dir) = state.dir()
-            && let WatchState::Registered(watch) = dir.watch()
-            && per_directory
-        {
-            self.outputs.push(Output::Unwatch(watch));
+        let domain = self.domain_of(id);
+        let released = match self.entries.remove(id) {
+            Some(state) => match (state.dir().map(|dir| dir.watch()), per_directory) {
+                (Some(WatchState::Registered(watch)), true) => Some(watch),
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(watch) = released {
+            self.emit_unwatch(watch, domain);
             self.watches.retain(|w| *w != watch);
         }
         self.set_obligation(id, ObligationState::Removed);

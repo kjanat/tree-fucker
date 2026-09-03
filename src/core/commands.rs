@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::types::*;
 use super::{Command, Coordinator, Output, TerminalOutcome};
@@ -128,6 +129,7 @@ impl Coordinator {
                 self.commands.insert(
                     id,
                     PendingCommand {
+                        admitted: Duration::ZERO,
                         id,
                         barrier,
                         state: CommandState::Refresh { remaining: vec![RefreshTarget::RootRecovery] },
@@ -169,7 +171,10 @@ impl Coordinator {
             self.outputs.push(Output::CommandFinished { id, result: Ok(()) });
             return;
         }
-        self.commands.insert(id, PendingCommand { id, barrier, state: CommandState::Refresh { remaining } });
+        self.commands.insert(
+            id,
+            PendingCommand { id, barrier, admitted: Duration::ZERO, state: CommandState::Refresh { remaining } },
+        );
         for (entry, path, need) in requests {
             self.bump_epoch(entry);
             self.request(entry, path, need, Reasons::refresh(), vec![id]);
@@ -213,7 +218,10 @@ impl Coordinator {
                 }
             }
         }
-        self.commands.insert(id, PendingCommand { id, barrier, state: CommandState::Load { entry: entry.id } });
+        self.commands.insert(
+            id,
+            PendingCommand { id, barrier, admitted: Duration::ZERO, state: CommandState::Load { entry: entry.id } },
+        );
         self.bump_epoch(entry.id);
         self.request(entry.id, entry.path.clone(), ReadNeed::Listing, Reasons::control(), vec![id]);
     }
@@ -286,7 +294,15 @@ impl Coordinator {
             self.outputs.push(Output::CommandFinished { id, result: Ok(()) });
             return;
         }
-        self.commands.insert(id, PendingCommand { id, barrier, state: CommandState::InvalidatePolicy { remaining } });
+        self.commands.insert(
+            id,
+            PendingCommand {
+                id,
+                barrier,
+                admitted: Duration::ZERO,
+                state: CommandState::InvalidatePolicy { remaining },
+            },
+        );
     }
 
     fn do_shutdown(&mut self, id: CommandId) {

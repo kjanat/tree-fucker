@@ -5,8 +5,8 @@ use std::time::Duration;
 use super::fake_fs::{DomainId, FakeFileSystem, FakeOp};
 use crate::config::Config;
 use crate::core::{
-    Class, Command, Coordinator, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats, Work,
-    WorkerLoss,
+    Class, Command, Coordinator, HostGovernor, Input, JobOperation, JobResult, JobSpec, MonotonicTime, Output, Stats,
+    Work, WorkOrigin, WorkerLoss,
 };
 use crate::domain::StorageDomainId;
 use crate::error::Error;
@@ -34,6 +34,7 @@ pub struct Admission {
     pub reserved: Duration,
     pub lease: u32,
     pub domain: Option<StorageDomainId>,
+    pub origin: WorkOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,10 +99,20 @@ pub struct Harness {
 
 impl Harness {
     pub fn open(fs: Arc<FakeFileSystem>, policy: Arc<dyn ScanPolicy>, config: Config) -> Result<Harness, Error> {
+        let governor = HostGovernor::independent(&config);
+        Harness::open_under(fs, policy, config, governor)
+    }
+
+    pub fn open_under(
+        fs: Arc<FakeFileSystem>,
+        policy: Arc<dyn ScanPolicy>,
+        config: Config,
+        governor: HostGovernor,
+    ) -> Result<Harness, Error> {
         config.validate().map_err(Error::InvalidConfig)?;
         let root_info = fs.metadata(fs.root(), &RelativePath::root())?;
         let now = MonotonicTime::ZERO;
-        let mut coordinator = Coordinator::new(config, policy, fs.capabilities(), root_info, now)?;
+        let mut coordinator = Coordinator::new(config, policy, fs.capabilities(), root_info, now, governor)?;
         let outputs = coordinator.take_outputs();
         let mut harness = Harness {
             fs,
@@ -230,6 +241,7 @@ impl Harness {
                 reserved: grant.reserved,
                 lease: grant.lease,
                 domain: grant.domain,
+                origin: grant.origin,
             });
         }
     }
@@ -303,14 +315,20 @@ impl Harness {
     }
 
     pub fn worst_reserved_window(&self, window: Duration) -> (MonotonicTime, Duration) {
+        self.worst_reserved_window_of(window, None)
+    }
+
+    pub fn worst_reserved_window_of(&self, window: Duration, origin: Option<WorkOrigin>) -> (MonotonicTime, Duration) {
+        let admissions: Vec<&Admission> =
+            self.admissions.iter().filter(|a| origin.is_none_or(|origin| a.origin == origin)).collect();
         let mut worst = (MonotonicTime::ZERO, Duration::ZERO);
         let mut oldest = 0;
         let mut total = Duration::ZERO;
-        for index in 0..self.admissions.len() {
-            let end = self.admissions[index].at;
-            total += self.admissions[index].reserved;
-            while self.admissions[oldest].at.0 + window <= end.0 {
-                total -= self.admissions[oldest].reserved;
+        for index in 0..admissions.len() {
+            let end = admissions[index].at;
+            total += admissions[index].reserved;
+            while admissions[oldest].at.0 + window <= end.0 {
+                total -= admissions[oldest].reserved;
                 oldest += 1;
             }
             if total > worst.1 {
@@ -377,8 +395,9 @@ impl Harness {
                     Some(SessionSlot::Open(session)) => Some(session),
                     Some(SessionSlot::Cancelled) | None => None,
                 };
-                let session = existing
-                    .unwrap_or_else(|| fs.open_listing(fs.root(), &spec.path, listing.ceiling, listing.cancel.clone()));
+                let session = existing.unwrap_or_else(|| {
+                    fs.open_listing(fs.root(), &spec.path, listing.ceilings, listing.cancel.clone())
+                });
                 let (continuation, cost) = session.resume(listing.lease);
                 *self.entries_seen.entry(spec.id).or_default() +=
                     usize::try_from(cost.entries_enumerated).unwrap_or(usize::MAX);
@@ -635,7 +654,7 @@ impl Harness {
     }
 
     fn wait_for_capacity(&mut self, horizon: MonotonicTime) -> bool {
-        if !self.stats().resource.is_throttled() {
+        if !self.coordinator.throttled() {
             return false;
         }
         let Some((id, at)) = self.timer else {
@@ -698,12 +717,12 @@ impl Harness {
     }
 
     pub fn run_round(&mut self) {
-        let before = self.stats().last_round;
+        let before = self.last_round();
         for _ in 0..10_000 {
             if !self.fire_timer() {
                 break;
             }
-            if self.stats().last_round != before {
+            if self.last_round() != before {
                 return;
             }
         }
@@ -720,6 +739,10 @@ impl Harness {
 
     pub fn health(&self) -> Health {
         self.coordinator.health()
+    }
+
+    pub fn last_round(&self) -> Option<(MonotonicTime, Duration)> {
+        self.coordinator.last_round()
     }
 
     pub fn stats(&self) -> Stats {

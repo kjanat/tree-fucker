@@ -815,3 +815,95 @@ fn watch_registrations_in_a_random_history_never_exceed_the_cap_and_every_one_ho
         );
     }
 }
+
+fn mixed_origin_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
+    let mut rng = Lcg(seed);
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(4 + seed * 2));
+    fs.set_cost(CostScope::Everything, FakeOp::Metadata, Duration::from_millis(1 + seed));
+    let mut known: Vec<String> = Vec::new();
+    for i in 0..6 {
+        let name = format!("d{i}");
+        fs.mkdir(&name);
+        known.push(name.clone());
+        let file = format!("{name}/f");
+        fs.create_file(&file, 1);
+        known.push(file);
+    }
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    settle(&mut h);
+    for step in 0..40 {
+        let dirs = directories(&fs, &known);
+        let dir = rng.pick(&dirs).cloned().unwrap_or_default();
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        match rng.next() % 4 {
+            0 => {
+                let name = format!("{prefix}n{step}");
+                fs.add_silently(&name, EntryKind::File);
+                known.push(name);
+            }
+            1 => {
+                if let Some(victim) = rng.pick(&known).cloned() {
+                    fs.remove_silently(&victim);
+                }
+            }
+            2 => {
+                let targets: Vec<RelativePath> = directories(&fs, &known)
+                    .into_iter()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| FakeFileSystem::path(&name))
+                    .collect();
+                if !targets.is_empty() {
+                    h.command(tree_fucker::core::Command::Refresh(targets));
+                }
+            }
+            _ => {
+                if let Some(target) = rng.pick(&directories(&fs, &known)).cloned()
+                    && !target.is_empty()
+                {
+                    h.command(tree_fucker::core::Command::Load(FakeFileSystem::path(&target)));
+                }
+            }
+        }
+        let target = h.now() + Duration::from_secs(5);
+        h.run_jobs_until(target);
+    }
+    settle(&mut h);
+    (h, fs, known)
+}
+
+#[test]
+fn a_random_history_of_mixed_foreground_and_background_work_holds_both_envelopes() {
+    let config = Config::default();
+    let background = envelope(config.background_duty, config.background_burst, MAXIMUM_PERIOD);
+    let foreground = envelope(config.foreground_duty, config.foreground_burst, MAXIMUM_PERIOD);
+    for seed in 1..6u64 {
+        let (h, fs, known) = mixed_origin_history(seed);
+        let admissions = h.admissions();
+        let split = |origin: tree_fucker::core::WorkOrigin| -> Vec<tree_fucker::testing::Admission> {
+            admissions.iter().filter(|a| a.origin == origin).cloned().collect()
+        };
+        let admitted_background = split(tree_fucker::core::WorkOrigin::Background);
+        let admitted_foreground = split(tree_fucker::core::WorkOrigin::Foreground);
+        assert!(!admitted_background.is_empty(), "seed {seed} admitted no background work");
+        assert!(!admitted_foreground.is_empty(), "seed {seed} admitted no foreground work");
+        let worst = worst_window_of(&admitted_background, MAXIMUM_PERIOD);
+        assert!(
+            worst <= background,
+            "RFC 15.3 and 15.1 item 4: seed {seed} reserved {worst:?} of background worker time over a \
+             {MAXIMUM_PERIOD:?} window against a budget of {background:?}"
+        );
+        let worst = worst_window_of(&admitted_foreground, MAXIMUM_PERIOD);
+        assert!(
+            worst <= foreground,
+            "RFC 15.4 and 17.5: seed {seed} reserved {worst:?} of foreground worker time over a {MAXIMUM_PERIOD:?} \
+             window against a budget of {foreground:?}"
+        );
+        for name in &known {
+            let path = FakeFileSystem::path(name);
+            let represented = h.snapshot().get(&path).is_some();
+            let present = reachable(&fs, name).is_some();
+            assert_eq!(represented, present, "seed {seed} disagrees with the filesystem about {name}");
+        }
+    }
+}

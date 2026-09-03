@@ -14,6 +14,8 @@ pub mod testing;
 pub mod tree;
 pub mod update;
 
+pub use core::{HostGovernor, HostGovernorError, host_governor};
+
 pub use config::{ClassWeights, Config, LagMode, WatchRegistrationFailure};
 pub use domain::{
     AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
@@ -24,9 +26,9 @@ pub use domain::{
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};
 pub use fs::{
-    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
-    FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome, SessionState,
-    SessionStep, WatcherEvent, WatcherKind, WatcherSink, entry_bytes, list_directory,
+    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem,
+    FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome,
+    SessionState, SessionStep, WatcherEvent, WatcherKind, WatcherSink, entry_bytes, list_directory,
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,
@@ -38,6 +40,6 @@ pub use snapshot::Snapshot;
 pub use tree::{Tree, TreeHandle, UpdateStream};
 pub use update::{
     ErrorCause, Health, InitialScanState, Operation, PathChange, ReconciliationHealth, RecoverableError,
-    ResourceHealth, ResourceLimit, ResourceLimitEvent, RootAvailability, RoundResult, ShutdownState, StreamError,
-    ThrottleCause, Update, UpdateEvent, WatcherHealth,
+    ResourceHealth, ResourceLimit, ResourceLimitEvent, ResourceLimited, RootAvailability, RoundResult, ShutdownState,
+    StreamError, ThrottleCause, Update, UpdateEvent, WatcherHealth,
 };

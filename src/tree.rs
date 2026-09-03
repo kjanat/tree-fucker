@@ -12,7 +12,8 @@ use futures_util::StreamExt;
 
 use crate::config::{Config, LagMode};
 use crate::core::{
-    Command, Coordinator, Input, JobResult, MonotonicTime, Output, Stats, TerminalOutcome, Work, WorkerLoss,
+    Command, Coordinator, GrantId, HostGovernor, Input, JobResult, MonotonicTime, Output, Reservation, Stats,
+    TerminalOutcome, Work, WorkOrigin, WorkerLoss, host_governor,
 };
 use crate::error::{Error, Result};
 use crate::fs::{Continuation, FileSystem, FsError, ListingSession, SessionStep, WatcherEvent, WatcherSink};
@@ -295,7 +296,7 @@ impl Actor {
                                 };
                                 let cancel = listing.cancel.clone();
                                 let session = existing.unwrap_or_else(|| {
-                                    fs.open_listing(&root, &spec.path, listing.ceiling, listing.cancel)
+                                    fs.open_listing(&root, &spec.path, listing.ceilings, listing.cancel)
                                 });
                                 let (continuation, cost) = session.resume(listing.lease);
                                 let step = match continuation {
@@ -447,20 +448,44 @@ impl Tree {
         config: Config,
         runtime: Arc<dyn Runtime>,
     ) -> Result<(TreeHandle, UpdateStream)> {
+        Tree::open_under(filesystem, root, policy, config, runtime, host_governor()).await
+    }
+
+    pub async fn open_outside_host_governor(
+        filesystem: Arc<dyn FileSystem>,
+        root: PathBuf,
+        policy: Arc<dyn ScanPolicy>,
+        config: Config,
+        runtime: Arc<dyn Runtime>,
+        governor: HostGovernor,
+    ) -> Result<(TreeHandle, UpdateStream)> {
+        Tree::open_under(filesystem, root, policy, config, runtime, governor).await
+    }
+
+    async fn open_under(
+        filesystem: Arc<dyn FileSystem>,
+        root: PathBuf,
+        policy: Arc<dyn ScanPolicy>,
+        config: Config,
+        runtime: Arc<dyn Runtime>,
+        governor: HostGovernor,
+    ) -> Result<(TreeHandle, UpdateStream)> {
         config.validate().map_err(Error::InvalidConfig)?;
+        governor.reject_raised_limits(&config).map_err(Error::InvalidConfig)?;
         let caps = filesystem.capabilities();
+        let base = governor.base(runtime.now());
         let root = {
             let fs = filesystem.clone();
-            blocking(&runtime, move || fs.canonicalize(&root)).await?
+            bootstrap(&runtime, &governor, base, &config, move || fs.canonicalize(&root)).await?
         };
         let root = Arc::new(root);
         let root_info = {
             let fs = filesystem.clone();
             let root = root.clone();
-            blocking(&runtime, move || fs.metadata(&root, &RelativePath::root())).await?
+            bootstrap(&runtime, &governor, base, &config, move || fs.metadata(&root, &RelativePath::root())).await?
         };
-        let base = runtime.now();
-        let mut coordinator = Coordinator::new(config.clone(), policy, caps, root_info, MonotonicTime::ZERO)?;
+        let now = MonotonicTime(runtime.now().saturating_duration_since(base));
+        let mut coordinator = Coordinator::new(config.clone(), policy, caps, root_info, now, governor)?;
         let (tx, rx) = mpsc::unbounded();
         let stream = Arc::new(Mutex::new(StreamInner {
             queue: VecDeque::new(),
@@ -521,6 +546,41 @@ impl Tree {
         runtime.spawn(Box::pin(actor.run()));
         Ok((TreeHandle { shared }, UpdateStream { inner: stream }))
     }
+}
+
+async fn bootstrap<T: Send + 'static>(
+    runtime: &Arc<dyn Runtime>,
+    governor: &HostGovernor,
+    base: Instant,
+    config: &Config,
+    work: impl FnOnce() -> std::result::Result<T, FsError> + Send + 'static,
+) -> Result<T> {
+    let id = GrantId::Bootstrap(governor.next_bootstrap());
+    loop {
+        let now = MonotonicTime(runtime.now().saturating_duration_since(base));
+        let reservation = Reservation {
+            id,
+            path: RelativePath::root(),
+            reads: 1,
+            registrations: 0,
+            lease: 0,
+            domain: None,
+            origin: WorkOrigin::Background,
+            listing: false,
+        };
+        if governor.try_admit(reservation, now).is_ok() {
+            break;
+        }
+        let delay = match governor.resume_at(now) {
+            Some(at) => at.0.saturating_sub(now.0).max(config.minimum_period),
+            None => config.minimum_period,
+        };
+        runtime.sleep(delay).await;
+    }
+    governor.start(id, MonotonicTime(runtime.now().saturating_duration_since(base)));
+    let outcome = blocking(runtime, work).await;
+    governor.release(id, MonotonicTime(runtime.now().saturating_duration_since(base)));
+    outcome
 }
 
 async fn blocking<T: Send + 'static>(

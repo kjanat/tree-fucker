@@ -5,9 +5,9 @@ use std::time::Instant;
 use crate::domain::{DeclarationSource, DomainProbe, IdentitySource, KindSource, MetadataSources, ProbeResult};
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
-    CancellationToken, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem, FsCapabilities,
-    FsError, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome, WatcherKind, WatcherSink,
-    entry_bytes,
+    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem,
+    FsCapabilities, FsError, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome,
+    WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -158,13 +158,13 @@ impl FileSystem for StdFileSystem {
         &self,
         root: &Path,
         path: &RelativePath,
-        ceiling: usize,
+        ceilings: Ceilings,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession> {
         Box::new(StdSession {
             full: path.under(root),
             probe: self.probe.clone(),
-            ceiling,
+            ceilings,
             cancel,
             opened: None,
             entries: Vec::new(),
@@ -217,7 +217,7 @@ struct Opened {
 struct StdSession {
     full: PathBuf,
     probe: Arc<dyn DomainProbe>,
-    ceiling: usize,
+    ceilings: Ceilings,
     cancel: CancellationToken,
     opened: Option<Opened>,
     entries: Vec<DirEntry>,
@@ -325,9 +325,8 @@ impl ListingSession for StdSession {
             let resolved = usize::try_from(cost.kind_resolutions - resolutions).unwrap_or(usize::MAX);
             entries_left -= taken;
             operations_left = operations_left.saturating_sub(taken.saturating_add(resolved));
-            if self.entries.len() > self.ceiling {
-                let seen = self.entries.len();
-                return finish(&mut cost, self.bytes, started, SessionOutcome::ResourceLimited { seen });
+            if let Some(limited) = self.ceilings.exceeded_by(self.entries.len(), self.bytes) {
+                return finish(&mut cost, self.bytes, started, SessionOutcome::ResourceLimited(limited));
             }
         }
     }

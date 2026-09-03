@@ -13,10 +13,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use governor::Governor;
-pub use governor::{AdmissionDecision, DomainAccount, DomainView, GovernorView, Grant, GrantId, LatencySummary};
+pub use governor::{
+    AdmissionDecision, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor, HostGovernorError,
+    LatencySummary, Reservation, host_governor,
+};
 use types::*;
-pub use types::{Class, MonotonicTime};
+pub use types::{Class, MonotonicTime, WorkOrigin};
 
 use crate::config::Config;
 use crate::domain::{
@@ -26,8 +28,8 @@ use crate::domain::{
 use crate::entry::{LoadState, MetadataFields, Shape};
 use crate::error::Error;
 use crate::fs::{
-    CancellationToken, Enrichment, EntryInfo, FsCapabilities, FsError, Lease, SessionCost, SessionStep, WatcherEvent,
-    WatcherKind,
+    CancellationToken, Ceilings, Enrichment, EntryInfo, FsCapabilities, FsError, Lease, SessionCost, SessionStep,
+    WatcherEvent, WatcherKind,
 };
 use crate::ids::*;
 use crate::path::RelativePath;
@@ -35,7 +37,8 @@ use crate::policy::{PolicyContext, ScanPolicy};
 use crate::snapshot::{Snapshot, new_entry};
 use crate::update::{
     ErrorCause, Health, InitialScanState, Operation, ReconciliationHealth, RecoverableError, ResourceHealth,
-    ResourceLimitEvent, RootAvailability, ShutdownState, ThrottleCause, Update, UpdateEvent, WatcherHealth,
+    ResourceLimit, ResourceLimitEvent, ResourceLimited, RootAvailability, ShutdownState, ThrottleCause, Update,
+    UpdateEvent, WatcherHealth,
 };
 
 const RESOURCE_LIMIT_HISTORY: usize = 64;
@@ -68,6 +71,10 @@ pub struct DomainStat {
     pub in_flight: usize,
     pub stuck: usize,
     pub estimate: Duration,
+    pub foreground_capacity: Duration,
+    pub foreground_level: Duration,
+    pub foreground_debt: Duration,
+    pub bytes_estimate: u64,
     pub latency: LatencySummary,
     pub throttled_jobs: u64,
     pub throttled_duration: Duration,
@@ -155,7 +162,7 @@ pub enum JobOperation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListingWork {
     pub lease: Lease,
-    pub ceiling: usize,
+    pub ceilings: Ceilings,
     pub cancel: CancellationToken,
     pub resume: bool,
 }
@@ -253,6 +260,8 @@ pub struct Stats {
     pub priority_cursor: (usize, usize),
     pub loaded_directories: usize,
     pub represented_entries: usize,
+    pub snapshot_bytes: u64,
+    pub accounted_memory: u64,
     pub queued_jobs: usize,
     pub in_flight_jobs: usize,
     pub blocking_slots_held: usize,
@@ -301,7 +310,9 @@ pub struct Stats {
 
 pub struct Coordinator {
     config: Config,
-    governor: Governor,
+    governor: HostGovernor,
+    tree: u64,
+    memory_ceiling: u64,
     policy: Arc<dyn ScanPolicy>,
     caps: FsCapabilities,
     now: MonotonicTime,
@@ -367,6 +378,8 @@ pub struct Coordinator {
     listing_operations: u64,
     entries_enumerated: u64,
     listing_bytes: u64,
+    in_flight_listing_bytes: u64,
+    reported_memory: (u64, u64),
     session_bytes: HashMap<JobId, u64>,
     kind_resolutions: u64,
     identity_reads: u64,
@@ -380,6 +393,19 @@ pub struct Coordinator {
     last_listing_children: Option<usize>,
 }
 
+impl Drop for Coordinator {
+    fn drop(&mut self) {
+        let now = self.now;
+        for id in self.jobs.keys() {
+            self.governor.release(GrantId::Job(*id), now);
+        }
+        for request in self.registrations.keys() {
+            self.governor.release(GrantId::WatchRegistration(*request), now);
+        }
+        self.governor.forget_tree(self.tree);
+    }
+}
+
 impl Coordinator {
     pub fn new(
         config: Config,
@@ -387,17 +413,22 @@ impl Coordinator {
         caps: FsCapabilities,
         root_info: EntryInfo,
         now: MonotonicTime,
+        governor: HostGovernor,
     ) -> Result<Coordinator, Error> {
         config.validate().map_err(Error::InvalidConfig)?;
+        governor.reject_raised_limits(&config).map_err(Error::InvalidConfig)?;
         if root_info.kind != crate::entry::EntryKind::Directory {
             return Err(Error::NotDirectory);
         }
         let seed = config.jitter_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let snapshot = Snapshot::empty(SnapshotVersion::new(0), caps.case);
-        let governor = Governor::new(&config, now);
+        let tree = governor.next_tree();
+        let memory_ceiling = governor.memory_ceiling();
         let mut coordinator = Coordinator {
             config,
             governor,
+            tree,
+            memory_ceiling,
             policy,
             caps,
             now,
@@ -467,6 +498,8 @@ impl Coordinator {
             listing_operations: 0,
             entries_enumerated: 0,
             listing_bytes: 0,
+            in_flight_listing_bytes: 0,
+            reported_memory: (0, 0),
             session_bytes: HashMap::new(),
             kind_resolutions: 0,
             identity_reads: 0,
@@ -525,7 +558,8 @@ impl Coordinator {
         self.kind_resolutions += u64::from(cost.kind_resolutions);
         self.identity_reads += u64::from(cost.identity_reads);
         self.entries_enumerated += cost.entries_enumerated;
-        self.session_bytes.insert(job, cost.bytes);
+        let previous = self.session_bytes.insert(job, cost.bytes).unwrap_or(0);
+        self.in_flight_listing_bytes = self.in_flight_listing_bytes.saturating_sub(previous).saturating_add(cost.bytes);
         let domain = self.jobs.get(&job).and_then(|job| job.domain);
         if let Some(domain) = domain {
             let ops = self.domain_ops.entry(domain).or_default();
@@ -543,9 +577,33 @@ impl Coordinator {
     }
 
     pub(super) fn release_session_bytes(&mut self, job: JobId) {
+        let domain = self.jobs.get(&job).and_then(|job| job.domain);
         if let Some(bytes) = self.session_bytes.remove(&job) {
             self.listing_bytes += bytes;
+            self.in_flight_listing_bytes = self.in_flight_listing_bytes.saturating_sub(bytes);
+            let now = self.now;
+            self.governor.record_bytes(domain, bytes, now);
         }
+    }
+
+    pub(super) fn memory_ceiling(&self) -> u64 {
+        self.memory_ceiling
+    }
+
+    pub(super) fn projected_memory(&self, snapshot_bytes: u64) -> u64 {
+        self.governor
+            .accounted_memory_excluding(self.tree)
+            .saturating_add(snapshot_bytes)
+            .saturating_add(self.in_flight_listing_bytes)
+    }
+
+    fn report_memory(&mut self) {
+        let reported = (self.snapshot.bytes(), self.in_flight_listing_bytes);
+        if self.reported_memory == reported {
+            return;
+        }
+        self.reported_memory = reported;
+        self.governor.report_memory(self.tree, reported.0, reported.1);
     }
 
     pub(super) fn record_resource_limit(&mut self, event: ResourceLimitEvent) {
@@ -565,15 +623,33 @@ impl Coordinator {
     }
 
     pub fn grants(&self) -> Vec<Grant> {
-        self.governor.grants().cloned().collect()
+        self.governor.grants()
     }
 
     pub fn new_grants(&self, seen: &dyn Fn(GrantId, u32) -> bool) -> Vec<Grant> {
-        self.governor.grants().filter(|grant| !seen(grant.id, grant.lease)).cloned().collect()
+        self.governor.new_grants(seen)
+    }
+
+    pub(super) fn ceilings(&self) -> Ceilings {
+        Ceilings { entries: self.config.entries_per_directory, bytes: self.config.in_flight_listing_bytes }
+    }
+
+    pub(super) fn limited(
+        &self,
+        limit: ResourceLimit,
+        configured: u64,
+        observed: u64,
+        entry: EntryId,
+    ) -> ResourceLimited {
+        ResourceLimited { limit, configured, observed, domain: self.domain_of(entry) }
     }
 
     pub fn governor(&self) -> GovernorView {
         self.governor.view(self.now)
+    }
+
+    pub fn last_round(&self) -> Option<(MonotonicTime, Duration)> {
+        self.last_round
     }
 
     pub fn open_batch(&self) -> Option<BatchView> {
@@ -613,6 +689,11 @@ impl Coordinator {
                     && let Some(blocking) = step.cost.blocking
                 {
                     self.governor.report(GrantId::Job(*job), blocking, now);
+                }
+                let barriers = self.jobs.get(job).map(|job| job.barriers.clone()).unwrap_or_default();
+                if !barriers.is_empty() {
+                    let overshoot = self.governor.overshoot_of(GrantId::Job(*job));
+                    self.charge_commands(&barriers, overshoot);
                 }
                 self.governor.release(GrantId::Job(*job), now);
             }
@@ -688,11 +769,14 @@ impl Coordinator {
             priority_cursor: (self.priority.cursor, priority_len),
             loaded_directories: loaded,
             represented_entries: self.snapshot.len(),
+            snapshot_bytes: self.snapshot.bytes(),
+            accounted_memory: view.accounted_memory,
             queued_jobs: queued,
             in_flight_jobs: in_flight,
             stuck_workers: self
                 .governor
                 .stuck_grants()
+                .into_iter()
                 .filter_map(|grant| {
                     let job = grant.id.job()?;
                     let held = self.blocking_slots.get(&job)?;
@@ -704,7 +788,7 @@ impl Coordinator {
                     })
                 })
                 .collect(),
-            grants: self.governor.grants().cloned().collect(),
+            grants: self.governor.grants(),
             resource: self.resource_health(&resource),
             reported_blocking: view.reported_blocking,
             lease_grants: view.lease_grants,
@@ -731,7 +815,7 @@ impl Coordinator {
             listing_operations: self.listing_operations,
             entries_enumerated: self.entries_enumerated,
             listing_bytes: self.listing_bytes,
-            in_flight_listing_bytes: self.session_bytes.values().sum(),
+            in_flight_listing_bytes: self.in_flight_listing_bytes,
             kind_resolutions: self.kind_resolutions,
             identity_reads: self.identity_reads,
             unresolved_listings: self.unresolved_listings,
@@ -778,6 +862,10 @@ impl Coordinator {
                     in_flight: account.map(|view| view.in_flight).unwrap_or_default(),
                     stuck: account.map(|view| view.stuck).unwrap_or_default(),
                     estimate: account.map(|view| view.estimate).unwrap_or_default(),
+                    foreground_capacity: account.map(|view| view.foreground_capacity).unwrap_or_default(),
+                    foreground_level: account.map(|view| view.foreground_level).unwrap_or_default(),
+                    foreground_debt: account.map(|view| view.foreground_debt).unwrap_or_default(),
+                    bytes_estimate: account.map(|view| view.bytes_estimate).unwrap_or_default(),
                     latency: account.map(|view| view.latency).unwrap_or_default(),
                     throttled_jobs: account.map(|view| view.throttled_jobs).unwrap_or_default(),
                     throttled_duration: account.map(|view| view.throttled_duration).unwrap_or_default(),
@@ -808,7 +896,7 @@ impl Coordinator {
         };
         let watcher = resolve_watcher(capabilities.watcher, self.caps.watcher);
         let now = self.now;
-        self.governor.register_domain(id, &capabilities, now);
+        self.governor.register_domain(id, &capabilities, self.config.per_domain_concurrency, now);
         self.domain_records.insert(id, DomainRecord { identity, capabilities, watcher });
         DomainBinding { id, probe: probe.clone() }
     }
@@ -969,8 +1057,10 @@ impl Coordinator {
             return;
         }
         let now = self.now;
+        self.report_memory();
         self.governor.account(now);
         self.declare_stuck_workers();
+        self.enforce_command_ceilings();
         self.check_round_end();
         self.check_initial_scan();
         self.maybe_dispatch();
@@ -995,6 +1085,50 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn origin_of(&self, entry: Option<EntryId>, barriers: &[CommandId]) -> WorkOrigin {
+        let foreground = |id: &CommandId| self.commands.get(id).is_some_and(|cmd| cmd.draws_on_foreground());
+        if barriers.iter().any(foreground) {
+            return WorkOrigin::Foreground;
+        }
+        let retained = entry.and_then(|entry| self.entries.retry(entry)).map(|record| record.barriers.clone());
+        match retained.iter().flatten().any(foreground) {
+            true => WorkOrigin::Foreground,
+            false => WorkOrigin::Background,
+        }
+    }
+
+    pub(super) fn charge_commands(&mut self, barriers: &[CommandId], cost: Duration) {
+        if cost.is_zero() {
+            return;
+        }
+        for id in barriers {
+            if let Some(command) = self.commands.get_mut(id)
+                && command.draws_on_foreground()
+            {
+                command.admitted += cost;
+            }
+        }
+    }
+
+    fn enforce_command_ceilings(&mut self) {
+        let ceiling = self.config.foreground_ceiling_per_command;
+        let exhausted: Vec<(CommandId, Duration)> = self
+            .commands
+            .values()
+            .filter(|command| command.draws_on_foreground() && command.admitted >= ceiling)
+            .map(|command| (command.id, command.admitted))
+            .collect();
+        for (id, admitted) in exhausted {
+            let limited = ResourceLimited {
+                limit: ResourceLimit::CommandWorkerTime,
+                configured: u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX),
+                observed: u64::try_from(admitted.as_nanos()).unwrap_or(u64::MAX),
+                domain: None,
+            };
+            self.finish_command(id, Err(Error::ResourceLimited(limited)));
+        }
+    }
+
     fn release_quarantined(&mut self, domain: Option<StorageDomainId>) {
         if !self.governor.quarantined(domain) {
             return;
@@ -1009,6 +1143,16 @@ impl Coordinator {
         for id in waiting {
             self.cancel_job(id);
         }
+    }
+
+    pub fn throttled(&self) -> bool {
+        if self.governor.throttle(self.now).is_some() {
+            return true;
+        }
+        if self.blocking_slots.len() >= self.config.max_in_flight && !self.queue_order.is_empty() {
+            return true;
+        }
+        self.domain_resource_health().values().any(ResourceHealth::is_throttled)
     }
 
     fn resource_health(&self, domains: &BTreeMap<StorageDomainId, ResourceHealth>) -> ResourceHealth {
@@ -1026,22 +1170,19 @@ impl Coordinator {
     }
 
     fn domain_resource_health(&self) -> BTreeMap<StorageDomainId, ResourceHealth> {
+        let mut health: BTreeMap<StorageDomainId, ResourceHealth> =
+            self.domain_records.keys().map(|id| (*id, ResourceHealth::Nominal)).collect();
+        if health.is_empty() {
+            return health;
+        }
         let queued = self.queued_domains();
-        self.domain_records
-            .keys()
-            .map(|id| {
-                let health = match self.governor.domain_health(*id, self.now, queued.contains(id)) {
-                    Some((cause, resume)) => ResourceHealth::Throttled { cause, resume },
-                    None => ResourceHealth::Nominal,
-                };
-                (*id, health)
-            })
-            .collect()
+        self.governor.domain_health_map(self.now, &queued, &mut health);
+        health
     }
 
-    pub(super) fn next_admissible(&self) -> Option<MonotonicTime> {
+    pub(super) fn next_admissible(&self, resume: Option<MonotonicTime>) -> Option<MonotonicTime> {
         let Some(round) = self.round.as_ref() else {
-            return self.governor.resume_at(self.now);
+            return resume;
         };
         let mut seen: Vec<Option<StorageDomainId>> = Vec::new();
         let mut earliest: Option<MonotonicTime> = None;
@@ -1062,7 +1203,7 @@ impl Coordinator {
         }
         match earliest {
             Some(at) => Some(at),
-            None => self.governor.resume_at(self.now),
+            None => resume,
         }
     }
 
@@ -1142,9 +1283,7 @@ impl Coordinator {
     }
 
     fn parent_of(&self, id: EntryId) -> Option<EntryId> {
-        let entry = self.snapshot.get_by_id(id)?;
-        let parent_path = entry.path.parent()?;
-        self.snapshot.get(&parent_path).map(|p| p.id)
+        self.snapshot.parent_id(id)
     }
 
     fn context_for_children(&self, dir: EntryId) -> Option<PolicyContext> {
@@ -1316,9 +1455,15 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn emit_unwatch(&mut self, watch: WatchId, domain: Option<StorageDomainId>) {
+        let now = self.now;
+        self.governor.charge_release(domain, now);
+        self.outputs.push(Output::Unwatch(watch));
+    }
+
     fn unwatch_all(&mut self) {
         for id in std::mem::take(&mut self.watches) {
-            self.outputs.push(Output::Unwatch(id));
+            self.emit_unwatch(id, None);
         }
         self.entries.reset_watches();
     }
@@ -1331,24 +1476,25 @@ impl Coordinator {
                 None => t,
             });
         };
+        let (resume, stuck_deadline) = self.governor.timer_hints(self.now);
         if !self.baseline_due && self.batch.is_none() {
-            let due = match self.next_admissible() {
+            let due = match self.next_admissible(resume) {
                 Some(at) => self.periodic_due.max(at),
                 None => self.periodic_due.min(self.now + self.config.maximum_period),
             };
             consider(due);
         }
         if self.batch.is_none()
-            && let Some(at) = self.governor.resume_at(self.now)
+            && let Some(at) = resume
         {
             consider(at);
         }
         if self.jobs.values().any(|j| j.phase == JobPhase::Suspended)
-            && let Some(at) = self.governor.resume_at(self.now)
+            && let Some(at) = resume
         {
             consider(at);
         }
-        if let Some(at) = self.governor.next_stuck_deadline() {
+        if let Some(at) = stuck_deadline {
             consider(at);
         }
         if let Some(probe) = &self.root_probe

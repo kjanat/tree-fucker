@@ -151,12 +151,12 @@ fn a_non_observing_domain_keeps_the_same_baseline_cadence_as_an_observing_one() 
         let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).expect("open");
         h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(600));
         let mut rounds = 0;
-        let mut last = h.stats().last_round;
+        let mut last = h.last_round();
         for _ in 0..20 {
             let target = h.now() + Duration::from_secs(60);
             h.run_jobs_until(target);
-            if h.stats().last_round != last {
-                last = h.stats().last_round;
+            if h.last_round() != last {
+                last = h.last_round();
                 rounds += 1;
             }
         }

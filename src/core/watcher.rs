@@ -56,9 +56,9 @@ impl Coordinator {
             let Some(WatchState::Registered(watch)) = self.dir_state(id).map(|d| d.watch()) else {
                 continue;
             };
-            self.outputs.push(Output::Unwatch(watch));
-            self.watches.retain(|held| *held != watch);
             let domain = self.domain_of(id);
+            self.emit_unwatch(watch, domain);
+            self.watches.retain(|held| *held != watch);
             self.entries.set_watch(id, WatchState::NotRegistered, domain);
         }
     }
@@ -159,6 +159,8 @@ impl Coordinator {
                         registrations: 1,
                         lease: 0,
                         domain: self.domain_of(id),
+                        origin: WorkOrigin::Background,
+                        listing: false,
                     };
                     if self.governor.try_admit(reservation, now).is_err() {
                         return true;

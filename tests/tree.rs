@@ -11,6 +11,17 @@ fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
 }
 
+fn open_tree(
+    fs: Arc<dyn tree_fucker::FileSystem>,
+    root: std::path::PathBuf,
+    policy: Arc<dyn tree_fucker::ScanPolicy>,
+    config: Config,
+    runtime: Arc<dyn tree_fucker::runtime::Runtime>,
+) -> impl std::future::Future<Output = tree_fucker::Result<(tree_fucker::TreeHandle, tree_fucker::UpdateStream)>> {
+    let governor = tree_fucker::HostGovernor::independent(&config);
+    Tree::open_outside_host_governor(fs, root, policy, config, runtime, governor)
+}
+
 #[test]
 fn open_scan_refresh_and_shutdown_over_the_async_layer() {
     let runtime = Arc::new(DeterministicRuntime::new());
@@ -19,7 +30,7 @@ fn open_scan_refresh_and_shutdown_over_the_async_layer() {
     fs.create_file("a/x", 3);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, mut stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     assert!(matches!(handle.health().initial_scan, InitialScanState::Complete { .. }));
@@ -58,7 +69,7 @@ fn slow_consumer_receives_reset_or_lagged() {
         let config = Config { update_stream_capacity: 2, lag_mode: mode, ..Default::default() };
         let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
         let (handle, mut stream) = runtime
-            .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), config, rt))
+            .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), config, rt))
             .expect("open");
         runtime.block_on(handle.initial_scan_complete()).expect("scan");
         for i in 0..5 {
@@ -102,13 +113,13 @@ fn open_rejects_missing_or_non_directory_root() {
     fs.set_root_kind(EntryKind::File);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let result =
-        runtime.block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt));
+        runtime.block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt));
     assert!(matches!(result, Err(Error::NotDirectory)));
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
     fs.remove_root();
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let result =
-        runtime.block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt));
+        runtime.block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt));
     assert!(matches!(result, Err(Error::NotFound)));
 }
 
@@ -157,7 +168,7 @@ fn unload_cancels_the_running_worker_and_its_result_never_lands() {
     fs.create_file("a/x", 3);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, _stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     let listings_before = fs.count_ops(FakeOp::ReadDir, "a");
@@ -186,7 +197,7 @@ fn unload_discards_the_result_of_a_worker_that_cancellation_cannot_interrupt() {
     fs.create_file("a/x", 3);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, _stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     let listings_before = fs.count_ops(FakeOp::ReadDir, "a");
@@ -214,7 +225,7 @@ fn panicking_worker_is_reported_and_the_directory_is_listed_again() {
     fs.create_file("a/x", 3);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, mut stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     drain(&runtime, &mut stream);
@@ -299,7 +310,7 @@ fn a_runtime_whose_handles_cancel_on_drop_still_opens_and_watches() {
     fs.create_file("a/x", 3);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, _stream) = inner
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     inner.block_on(handle.initial_scan_complete()).expect("scan");
     assert_eq!(fs.watch_count(), 1);
@@ -315,7 +326,7 @@ fn open_fails_when_the_runtime_drops_initial_blocking_work() {
     fs.mkdir("a");
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let result =
-        runtime.block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt));
+        runtime.block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt));
     assert!(matches!(result, Err(Error::WorkerLost)));
     assert_eq!(fs.count_ops(FakeOp::ReadDir, ""), 0);
 }
@@ -328,7 +339,7 @@ fn a_registration_dispatched_before_shutdown_releases_its_watch() {
     fs.create_file("c/x", 1);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, _stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     assert_eq!(fs.watch_count(), 2);
@@ -361,7 +372,7 @@ fn a_cancelled_worker_that_cannot_be_interrupted_holds_its_slot_and_its_handle_u
     fs.create_file("a/x", 3);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, _stream) = inner
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     inner.block_on(handle.initial_scan_complete()).expect("scan");
     let listings_before = fs.count_ops(FakeOp::ReadDir, "a");
@@ -404,7 +415,7 @@ fn shutdown_closes_the_stream_while_a_registration_worker_never_runs() {
     fs.create_file("c/x", 1);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, mut stream) = inner
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     inner.block_on(handle.initial_scan_complete()).expect("scan");
     assert_eq!(fs.watch_count(), 2);
@@ -447,7 +458,7 @@ fn a_command_after_fatal_termination_reports_the_termination() {
     fs.create_file("c/x", 1);
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, mut stream) = runtime
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt))
         .expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     fs.fail("c", FakeOp::ReadDir, FailureMode::Always(FsError::Fatal("gone".into())));
@@ -487,7 +498,7 @@ fn fatal_termination_with_a_registration_outstanding_reports_the_same_error_befo
     }));
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
     let (handle, _stream) = inner
-        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), policy.clone(), Config::default(), rt))
+        .block_on(open_tree(fs.clone(), fs.root().to_path_buf(), policy.clone(), Config::default(), rt))
         .expect("open");
     inner.block_on(handle.initial_scan_complete()).expect("scan");
     assert_eq!(fs.watch_count(), 1);
@@ -520,7 +531,7 @@ fn a_job_cancelled_while_its_worker_is_held_leaves_no_listing_session_behind() {
     let config = Config { entries_per_lease: 2, ..Default::default() };
     let rt: Arc<dyn tree_fucker::runtime::Runtime> = holding.clone();
     let (handle, _stream) =
-        runtime.block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), config, rt)).expect("open");
+        runtime.block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), config, rt)).expect("open");
     runtime.block_on(handle.initial_scan_complete()).expect("scan");
     assert_eq!(handle.held_listing_sessions(), 0, "the initial scan left a listing session behind");
 
@@ -552,4 +563,107 @@ fn a_job_cancelled_while_its_worker_is_held_leaves_no_listing_session_behind() {
     );
     assert_eq!(runtime.block_on(unload), Ok(()));
     assert_eq!(handle.snapshot().get(&path("wide")).and_then(|e| e.load_state()), Some(LoadState::Unloaded));
+}
+
+#[test]
+fn open_uses_the_process_wide_host_governor_and_the_opt_out_does_not() {
+    let runtime = Arc::new(DeterministicRuntime::new());
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.create_file("a/x", 1);
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let host = tree_fucker::host_governor();
+    let before = host.view(tree_fucker::core::MonotonicTime::ZERO).bootstrap.grants;
+    let (handle, _stream) = runtime
+        .block_on(Tree::open(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), Config::default(), rt.clone()))
+        .expect("open");
+    runtime.block_on(handle.initial_scan_complete()).expect("scan");
+    let after = host.view(tree_fucker::core::MonotonicTime::ZERO).bootstrap.grants;
+    assert!(
+        after >= before + 2,
+        "RFC 15.9: `open` uses the process-wide governor, and RFC 15.1 item 1 admits root canonicalization and root \
+         validation under its bootstrap scope; bootstrap grants went from {before} to {after}"
+    );
+
+    let own = tree_fucker::HostGovernor::independent(&Config::default());
+    let other = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    other.mkdir("b");
+    let (opted_out, _stream) = runtime
+        .block_on(Tree::open_outside_host_governor(
+            other.clone(),
+            other.root().to_path_buf(),
+            Arc::new(LoadAll),
+            Config::default(),
+            rt,
+            own.clone(),
+        ))
+        .expect("open");
+    runtime.block_on(opted_out.initial_scan_complete()).expect("scan");
+    assert!(
+        own.view(tree_fucker::core::MonotonicTime::ZERO).bootstrap.grants >= 2,
+        "RFC 15.9: a tree opened under an independently constructed governor is accounted there"
+    );
+    assert_eq!(
+        host.view(tree_fucker::core::MonotonicTime::ZERO).bootstrap.grants,
+        after,
+        "RFC 15.9: the opt-out is outside the bound the process-wide governor states"
+    );
+}
+
+#[test]
+fn an_open_under_an_exhausted_bootstrap_allowance_waits_rather_than_bypassing() {
+    let runtime = Arc::new(DeterministicRuntime::new());
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    let config = Config { bootstrap_allowance: Duration::from_millis(20), ..Default::default() };
+    let governor = tree_fucker::HostGovernor::independent(&config);
+    let held = tree_fucker::core::GrantId::Bootstrap(governor.next_bootstrap());
+    governor
+        .try_admit(
+            tree_fucker::core::Reservation {
+                id: held,
+                path: path("."),
+                reads: 1,
+                registrations: 0,
+                lease: 0,
+                domain: None,
+                origin: tree_fucker::core::WorkOrigin::Background,
+                listing: false,
+            },
+            tree_fucker::core::MonotonicTime::ZERO,
+        )
+        .expect("the first bootstrap operation is admitted");
+
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = opened.clone();
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let spawn_rt = rt.clone();
+    let held_governor = governor.clone();
+    let root = fs.root().to_path_buf();
+    let opening = fs.clone();
+    tree_fucker::runtime::Runtime::spawn(
+        runtime.as_ref(),
+        Box::pin(async move {
+            let opened =
+                Tree::open_outside_host_governor(opening, root, Arc::new(LoadAll), config, spawn_rt, held_governor)
+                    .await;
+            assert!(opened.is_ok(), "the open completes once the allowance frees");
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+    runtime.run_until_stalled();
+    runtime.advance(Duration::from_secs(30));
+    assert!(
+        !opened.load(std::sync::atomic::Ordering::SeqCst),
+        "RFC 15.1 item 1 and 10.3: an open under an exhausted bootstrap allowance waits rather than bypassing the \
+         governor"
+    );
+    assert!(fs.ops().iter().all(|(op, _)| *op != FakeOp::ReadDir), "no listing runs while the open waits");
+    governor.release(held, tree_fucker::core::MonotonicTime::ZERO);
+    runtime.advance(Duration::from_secs(2));
+    runtime.run_until_stalled();
+    assert!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        "RFC 5.2: work denied for lack of allowance is granted once the allowance returns"
+    );
 }
