@@ -1,0 +1,95 @@
+---
+name: CI
+on:
+  push:
+    branches: [master]
+    paths-ignore: [rfc/**, reports/**, "*.txt", .zed/**, .github/workflows/pages.yml]
+  pull_request:
+    paths-ignore: [rfc/**, reports/**, "*.txt", .zed/**, .github/workflows/pages.yml]
+  workflow_dispatch:
+permissions: { contents: read }
+concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: "${{ github.event_name == 'pull_request' }}" }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_UNSTABLE_HINT_MSRV: "false"
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  native:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, macos-26-intel, windows-2025, windows-11-arm] }
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: "rustfmt, clippy, rust-src, rust-analyzer" }
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.event_name != 'pull_request' }}" }
+      - if: matrix.os == 'ubuntu-26.04'
+        run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features --no-fail-fast
+      - run: cargo doc --no-deps --all-features
+
+  freebsd:
+    name: freebsd-15
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15"
+          envs: CARGO_TERM_COLOR CARGO_UNSTABLE_HINT_MSRV RUSTDOCFLAGS
+          copyback: false
+          prepare: |
+            pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly -c rustfmt -c clippy -c rust-src -c rust-analyzer
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            cargo clippy --all-targets --all-features -- -D warnings
+            cargo test --all-features --no-fail-fast
+            cargo doc --no-deps --all-features
+
+  illumos:
+    name: omnios-r151058
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: vmactions/omnios-vm@v1
+        with:
+          release: r151058-build
+          envs: CARGO_TERM_COLOR CARGO_UNSTABLE_HINT_MSRV RUSTDOCFLAGS
+          copyback: false
+          prepare: |
+            pkg install build-essential curl || [ $? -eq 4 ]
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly -c rustfmt -c clippy -c rust-src -c rust-analyzer
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            cargo clippy --all-targets --all-features -- -D warnings
+            cargo test --all-features --no-fail-fast
+            cargo doc --no-deps --all-features
+
+  cross:
+    name: clippy ${{ matrix.target }}
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix: { target: [x86_64-pc-solaris, aarch64-unknown-freebsd] }
+    env: { TARGET: "${{ matrix.target }}" }
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: clippy, targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: "${{ matrix.target }}", save-if: "${{ github.event_name != 'pull_request' }}" }
+      - run: cargo clippy --target "${TARGET}" --all-targets --all-features -- -D warnings
