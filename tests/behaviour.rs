@@ -42,6 +42,16 @@ fn populated(watcher: WatcherKind) -> Arc<FakeFileSystem> {
     fs
 }
 
+fn populated_local(watcher: WatcherKind) -> Arc<FakeFileSystem> {
+    let fs = populated(watcher);
+    fs.set_default_capabilities(DomainCapabilities {
+        topology: tree_fucker::AccessTopology::Local,
+        media: tree_fucker::MediaHint::SolidState,
+        ..DomainCapabilities::inline()
+    });
+    fs
+}
+
 #[test]
 fn per_directory_watcher_registers_before_each_first_listing() {
     let fs = populated(WatcherKind::NonRecursive);
@@ -720,7 +730,7 @@ fn malformed_listing_fails_the_refresh_and_keeps_the_previous_children() {
 
 #[test]
 fn lost_registration_worker_is_reported_and_the_listing_proceeds_without_a_watch() {
-    let fs = populated(WatcherKind::NonRecursive);
+    let fs = populated_local(WatcherKind::NonRecursive);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
     h.auto_register = false;
     let root_job = h.pending_job_for("").expect("root listing");
@@ -822,7 +832,7 @@ fn an_accepted_refresh_listing_resolves_a_degraded_initial_scan_obligation() {
 
 #[test]
 fn a_registration_landing_after_job_cancellation_releases_the_watch() {
-    let fs = populated(WatcherKind::NonRecursive);
+    let fs = populated_local(WatcherKind::NonRecursive);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
     h.auto_register = false;
     let root_job = h.pending_job_for("").expect("root listing");
@@ -837,7 +847,7 @@ fn a_registration_landing_after_job_cancellation_releases_the_watch() {
 
 #[test]
 fn a_registration_landing_after_shutdown_releases_the_watch() {
-    let fs = populated(WatcherKind::NonRecursive);
+    let fs = populated_local(WatcherKind::NonRecursive);
     let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
     h.auto_register = false;
     let root_job = h.pending_job_for("").expect("root listing");
@@ -922,13 +932,17 @@ fn a_standalone_registration_landing_after_its_directory_vanishes_releases_the_w
         h.advance(Duration::from_secs(5));
     }
     let (request, watch_path, recursive) = h.take_registration("c").expect("c restart registration");
+    h.auto_register = true;
     fs.remove_silently("c");
     let t = h.command(Command::Refresh(vec![path("")]));
     h.run_until_idle();
     assert_eq!(h.result(t), Some(Ok(())));
     assert!(!h.paths().contains(&"c".to_string()), "{:?}", h.paths());
+    let before = fs.watch_count();
+    let released = h.unwatched().len();
     h.complete_registration(request, &watch_path, recursive);
-    assert_eq!(fs.watch_count(), 0);
+    assert_eq!(fs.watch_count(), before, "the landed watch on a vanished directory stayed registered");
+    assert_eq!(h.unwatched().len(), released + 1);
     let t = h.command(Command::Shutdown);
     assert_eq!(h.result(t), Some(Ok(())));
     let mut seen = std::collections::HashSet::new();

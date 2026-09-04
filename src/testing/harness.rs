@@ -51,6 +51,12 @@ struct Running {
     domain: DomainId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Scheduled {
+    Job(JobId),
+    Registration(WatchRequestId),
+}
+
 struct Sink {
     queue: Mutex<VecDeque<WatcherEvent>>,
 }
@@ -85,7 +91,8 @@ pub struct Harness {
     outstanding: VecDeque<JobSpec>,
     unwatched: Vec<WatchId>,
     stopped: bool,
-    schedule: BTreeSet<(MonotonicTime, JobId)>,
+    schedule: BTreeSet<(MonotonicTime, Scheduled)>,
+    registration_due: IdMap<WatchRequestId, MonotonicTime>,
     running: IdMap<JobId, Running>,
     job_domain: IdMap<JobId, DomainId>,
     charges: Vec<Charge>,
@@ -144,6 +151,7 @@ impl Harness {
             unwatched: Vec::new(),
             stopped: false,
             schedule: BTreeSet::new(),
+            registration_due: IdMap::default(),
             running: IdMap::default(),
             job_domain: IdMap::default(),
             charges: Vec::new(),
@@ -212,6 +220,12 @@ impl Harness {
                     }
                 }
                 Output::RegisterWatch { request, path, recursive } => {
+                    let cost = self.fs.cost_of(FakeOp::Watch, &path);
+                    if !cost.is_zero() {
+                        let due = self.now + cost;
+                        self.registration_due.insert(request, due);
+                        self.schedule.insert((due, Scheduled::Registration(request)));
+                    }
                     self.registrations.push_back((request, path, recursive))
                 }
                 Output::Unwatch(id) => {
@@ -303,7 +317,17 @@ impl Harness {
         let due = self.now + cost;
         self.job_domain.insert(spec.id, domain);
         self.running.insert(spec.id, Running { started: self.now, due, domain });
-        self.schedule.insert((due, spec.id));
+        self.schedule.insert((due, Scheduled::Job(spec.id)));
+    }
+
+    fn forget_registration(&mut self, request: WatchRequestId) {
+        if let Some(due) = self.registration_due.remove(&request) {
+            self.schedule.remove(&(due, Scheduled::Registration(request)));
+        }
+    }
+
+    fn registration_ready(&self, request: WatchRequestId) -> bool {
+        self.registration_due.get(&request).is_none_or(|due| *due <= self.now)
     }
 
     fn drop_session(&mut self, job: JobId) {
@@ -319,7 +343,7 @@ impl Harness {
         let Some(run) = self.running.remove(&job) else {
             return;
         };
-        self.schedule.remove(&(run.due, job));
+        self.schedule.remove(&(run.due, Scheduled::Job(job)));
         let cost = self.now.since(run.started);
         if !cost.is_zero() {
             self.charges.push(Charge { at: self.now, job, domain: run.domain, cost });
@@ -520,6 +544,7 @@ impl Harness {
             return false;
         };
         self.registrations.remove(index);
+        self.forget_registration(request);
         self.feed(Input::WorkerLost(WorkerLoss::WatchRegistration(request)));
         true
     }
@@ -546,19 +571,29 @@ impl Harness {
     pub fn take_registration(&mut self, p: &str) -> Option<(WatchRequestId, RelativePath, bool)> {
         let path = FakeFileSystem::path(p);
         let index = self.registrations.iter().position(|(_, q, _)| *q == path)?;
-        self.registrations.remove(index)
+        let taken = self.registrations.remove(index)?;
+        self.forget_registration(taken.0);
+        Some(taken)
     }
 
     pub fn complete_registration(&mut self, request: WatchRequestId, path: &RelativePath, recursive: bool) {
+        self.forget_registration(request);
         let result = self.fs.watch(self.fs.root(), path, recursive, self.sink.clone());
         self.feed(Input::WatchRegistered { request, result });
     }
 
     pub fn complete_registrations(&mut self) -> usize {
         let mut count = 0;
-        while let Some((request, path, recursive)) = self.registrations.pop_front() {
-            let result = self.fs.watch(self.fs.root(), &path, recursive, self.sink.clone());
-            self.feed(Input::WatchRegistered { request, result });
+        loop {
+            let next = self
+                .registrations
+                .iter()
+                .position(|(request, _, _)| self.registration_ready(*request))
+                .and_then(|index| self.registrations.remove(index));
+            let Some((request, path, recursive)) = next else {
+                break;
+            };
+            self.complete_registration(request, &path, recursive);
             count += 1;
         }
         count
@@ -591,14 +626,29 @@ impl Harness {
     }
 
     pub fn advance_to_next_completion(&mut self) -> bool {
-        let Some((due, id)) = self.schedule.iter().next().copied() else {
+        let Some((due, scheduled)) = self.schedule.iter().next().copied() else {
             return false;
         };
         self.advance_injected(due);
-        if self.complete_job(id) || self.complete_outstanding_job(id) {
-            return true;
+        match scheduled {
+            Scheduled::Job(id) => {
+                if self.complete_job(id) || self.complete_outstanding_job(id) {
+                    return true;
+                }
+                self.settle_work(id);
+            }
+            Scheduled::Registration(request) => {
+                let pending = self
+                    .registrations
+                    .iter()
+                    .position(|(held, _, _)| *held == request)
+                    .and_then(|index| self.registrations.remove(index));
+                match pending {
+                    Some((request, path, recursive)) => self.complete_registration(request, &path, recursive),
+                    None => self.forget_registration(request),
+                }
+            }
         }
-        self.settle_work(id);
         true
     }
 

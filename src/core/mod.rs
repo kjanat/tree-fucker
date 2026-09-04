@@ -15,7 +15,7 @@ use std::time::Duration;
 
 pub use governor::{
     AdmissionDecision, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor, HostGovernorError,
-    LatencySummary, Reservation, host_governor,
+    LatencySummary, Reservation, TreeNumber, host_governor,
 };
 use types::*;
 pub use types::{Class, MonotonicTime, WorkOrigin};
@@ -91,6 +91,9 @@ pub struct DomainStat {
     pub foreground_debt: Duration,
     pub bytes_estimate: u64,
     pub latency: LatencySummary,
+    pub listing_latency: LatencySummary,
+    pub metadata_latency: LatencySummary,
+    pub registration_latency: LatencySummary,
     pub throttled_jobs: u64,
     pub throttled_duration: Duration,
     pub effective_duty: f64,
@@ -98,6 +101,9 @@ pub struct DomainStat {
     pub listings: u64,
     pub metadata_operations: u64,
     pub entries_enumerated: u64,
+    pub per_child_lookups: u64,
+    pub entries_per_second: f64,
+    pub per_child_lookups_per_second: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,6 +111,18 @@ pub struct DomainOps {
     pub listings: u64,
     pub metadata_operations: u64,
     pub entries_enumerated: u64,
+    pub per_child_lookups: u64,
+}
+
+fn to_f64(count: u64) -> f64 {
+    let high = u32::try_from(count >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(count & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(high) * 4_294_967_296.0 + f64::from(low)
+}
+
+fn rate(count: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 { 0.0 } else { to_f64(count) / seconds }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +190,7 @@ pub enum JobOperation {
     Metadata,
     DomainResolution,
     Enrichment { fields: MetadataFields },
+    WatchRegistration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,12 +269,33 @@ pub enum Output {
     Stopped(TerminalOutcome),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SlotOwner {
+    Job(JobId),
+    WatchRegistration(WatchRequestId),
+}
+
+impl SlotOwner {
+    pub fn job(self) -> Option<JobId> {
+        match self {
+            SlotOwner::Job(id) => Some(id),
+            SlotOwner::WatchRegistration(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockingSlot {
-    pub job: JobId,
+    pub owner: SlotOwner,
     pub path: RelativePath,
     pub operation: JobOperation,
     pub started: MonotonicTime,
+}
+
+impl BlockingSlot {
+    pub fn job(&self) -> Option<JobId> {
+        self.owner.job()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,7 +369,7 @@ pub struct Stats {
 pub struct Coordinator {
     config: Config,
     governor: HostGovernor,
-    tree: u64,
+    tree: TreeNumber,
     memory_ceiling: u64,
     maximum_in_flight: usize,
     in_flight_bytes_ceiling: u64,
@@ -360,7 +400,7 @@ pub struct Coordinator {
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
     jobs: IdMap<JobId, ActiveJob>,
-    blocking_slots: BTreeMap<JobId, Occupancy>,
+    blocking_slots: BTreeMap<SlotOwner, Occupancy>,
     active_by_entry: IdMap<EntryId, JobId>,
     probe_job: Option<JobId>,
     registrations: IdMap<WatchRequestId, RegistrationTarget>,
@@ -421,10 +461,16 @@ impl Drop for Coordinator {
     fn drop(&mut self) {
         let now = self.now;
         for id in self.jobs.keys() {
-            self.governor.release(GrantId::Job(*id), now);
+            self.governor.release(self.job_grant(*id), now);
         }
-        for request in self.registrations.keys() {
-            self.governor.release(GrantId::WatchRegistration(*request), now);
+        for id in self.blocking_slots.keys().filter_map(|owner| owner.job()) {
+            self.governor.release(self.job_grant(id), now);
+        }
+        for (request, target) in self.registrations.iter() {
+            self.governor.release(self.registration_grant(*request), now);
+            if let Some(job) = target.job() {
+                self.governor.release(self.job_grant(job), now);
+            }
         }
         self.governor.forget_tree(self.tree);
     }
@@ -598,6 +644,7 @@ impl Coordinator {
             ops.listings += u64::from(cost.listing_operations);
             ops.metadata_operations += u64::from(cost.metadata_operations);
             ops.entries_enumerated += cost.entries_enumerated;
+            ops.per_child_lookups += u64::from(cost.per_child_operations());
         }
     }
 
@@ -652,6 +699,14 @@ impl Coordinator {
             ReadNeed::Domain => JobOperation::DomainResolution,
             ReadNeed::Enrichment(fields) => JobOperation::Enrichment { fields },
         }
+    }
+
+    pub(super) fn job_grant(&self, id: JobId) -> GrantId {
+        GrantId::Job(self.tree, id)
+    }
+
+    pub(super) fn registration_grant(&self, request: WatchRequestId) -> GrantId {
+        GrantId::WatchRegistration(self.tree, request)
     }
 
     pub fn grants(&self) -> Vec<Grant> {
@@ -722,32 +777,47 @@ impl Coordinator {
         self.now = self.now.max(now);
         match &input {
             Input::JobCompleted { job, result } => {
-                self.blocking_slots.remove(job);
+                self.blocking_slots.remove(&SlotOwner::Job(*job));
                 let now = self.now;
                 if let Some(probe) = reported_domain(result) {
                     let binding = self.bind_domain(&probe);
-                    self.governor.attribute(GrantId::Job(*job), binding.id, now);
+                    self.governor.attribute(self.job_grant(*job), binding.id, now);
                 }
                 if let JobResult::Listing(step) = result
                     && let Some(blocking) = step.cost.blocking
                 {
-                    self.governor.report(GrantId::Job(*job), blocking, now);
+                    self.governor.report(self.job_grant(*job), blocking, now);
                 }
                 let barriers = self.jobs.get(job).map(|job| job.barriers.clone()).unwrap_or_default();
                 if !barriers.is_empty() {
-                    let overshoot = self.governor.overshoot_of(GrantId::Job(*job));
+                    let overshoot = self.governor.overshoot_of(self.job_grant(*job));
                     self.charge_commands(&barriers, overshoot);
                 }
-                self.governor.release(GrantId::Job(*job), now);
+                self.governor.release(self.job_grant(*job), now);
             }
             Input::WorkerLost(WorkerLoss::Job(job)) => {
-                self.blocking_slots.remove(job);
+                self.blocking_slots.remove(&SlotOwner::Job(*job));
                 let now = self.now;
-                self.governor.release(GrantId::Job(*job), now);
+                self.governor.release(self.job_grant(*job), now);
             }
             Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
                 let now = self.now;
-                self.governor.release(GrantId::WatchRegistration(*request), now);
+                self.governor.release(self.registration_grant(*request), now);
+                match self.registrations.get(request).copied() {
+                    Some(RegistrationTarget::AbandonedJob(job)) => {
+                        self.registrations.remove(request);
+                        self.blocking_slots.remove(&SlotOwner::Job(job));
+                        self.governor.release(self.job_grant(job), now);
+                    }
+                    Some(RegistrationTarget::AbandonedStandalone) => {
+                        self.registrations.remove(request);
+                        self.blocking_slots.remove(&SlotOwner::WatchRegistration(*request));
+                    }
+                    Some(RegistrationTarget::Standalone(_)) => {
+                        self.blocking_slots.remove(&SlotOwner::WatchRegistration(*request));
+                    }
+                    Some(RegistrationTarget::Job(_)) | None => {}
+                }
             }
             Input::Command { .. } | Input::Watcher(_) | Input::Timer(_) => {}
         }
@@ -780,17 +850,13 @@ impl Coordinator {
     }
 
     pub fn stats(&self) -> Stats {
-        let queued = self
-            .jobs
-            .values()
-            .filter(|j| matches!(j.phase, JobPhase::Queued | JobPhase::Registering(_) | JobPhase::Suspended))
-            .count();
+        let queued = self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Queued | JobPhase::Suspended)).count();
         let in_flight = self.jobs.values().filter(|j| j.phase.started().is_some()).count();
         let blocking_slots: Vec<BlockingSlot> = self
             .blocking_slots
             .iter()
-            .map(|(job, held)| BlockingSlot {
-                job: *job,
+            .map(|(owner, held)| BlockingSlot {
+                owner: *owner,
                 path: held.path.clone(),
                 operation: held.operation,
                 started: held.started,
@@ -826,10 +892,14 @@ impl Coordinator {
                 .stuck_grants()
                 .into_iter()
                 .filter_map(|grant| {
-                    let job = grant.id.job()?;
-                    let held = self.blocking_slots.get(&job)?;
+                    let owner = match grant.id {
+                        GrantId::Job(_, job) => SlotOwner::Job(job),
+                        GrantId::WatchRegistration(_, request) => SlotOwner::WatchRegistration(request),
+                        GrantId::Bootstrap(_) => return None,
+                    };
+                    let held = self.blocking_slots.get(&owner)?;
                     Some(BlockingSlot {
-                        job,
+                        owner,
                         path: held.path.clone(),
                         operation: held.operation,
                         started: held.started,
@@ -893,6 +963,7 @@ impl Coordinator {
                 let watch = watches.get(&Some(*id)).copied().unwrap_or_default();
                 let ops = self.domain_ops.get(id).copied().unwrap_or_default();
                 let account = accounts.get(id);
+                let elapsed = account.map(|view| view.elapsed).unwrap_or_default();
                 DomainStat {
                     id: *id,
                     identity: record.identity.clone(),
@@ -916,6 +987,9 @@ impl Coordinator {
                     foreground_debt: account.map(|view| view.foreground_debt).unwrap_or_default(),
                     bytes_estimate: account.map(|view| view.bytes_estimate).unwrap_or_default(),
                     latency: account.map(|view| view.latency).unwrap_or_default(),
+                    listing_latency: account.map(|view| view.listing_latency).unwrap_or_default(),
+                    metadata_latency: account.map(|view| view.metadata_latency).unwrap_or_default(),
+                    registration_latency: account.map(|view| view.registration_latency).unwrap_or_default(),
                     throttled_jobs: account.map(|view| view.throttled_jobs).unwrap_or_default(),
                     throttled_duration: account.map(|view| view.throttled_duration).unwrap_or_default(),
                     effective_duty: account.map(|view| view.effective_duty()).unwrap_or_default(),
@@ -923,6 +997,9 @@ impl Coordinator {
                     listings: ops.listings,
                     metadata_operations: ops.metadata_operations,
                     entries_enumerated: ops.entries_enumerated,
+                    per_child_lookups: ops.per_child_lookups,
+                    entries_per_second: rate(ops.entries_enumerated, elapsed),
+                    per_child_lookups_per_second: rate(ops.per_child_lookups, elapsed),
                 }
             })
             .collect()
@@ -1128,11 +1205,10 @@ impl Coordinator {
         let now = self.now;
         for grant in self.governor.newly_stuck(now) {
             self.governor.mark_stuck(grant, now);
-            let Some(job) = grant.job() else {
-                continue;
-            };
-            let domain = self.jobs.get(&job).and_then(|job| job.domain);
-            if self.jobs.contains_key(&job) {
+            let domain = self.governor.domain_of_grant(grant);
+            if let Some(job) = grant.job()
+                && self.jobs.contains_key(&job)
+            {
                 self.finish_job(job, JobOutcome::Stuck);
             }
             self.release_quarantined(domain);
@@ -1199,11 +1275,15 @@ impl Coordinator {
         }
     }
 
+    fn host_full_with_queue(&self) -> bool {
+        self.governor.in_flight() >= self.maximum_in_flight && !self.queue_order.is_empty()
+    }
+
     pub fn throttled(&self) -> bool {
         if self.governor.throttle(self.now).is_some() {
             return true;
         }
-        if self.blocking_slots.len() >= self.maximum_in_flight && !self.queue_order.is_empty() {
+        if self.host_full_with_queue() {
             return true;
         }
         self.domain_resource_health().values().any(ResourceHealth::is_throttled)
@@ -1213,7 +1293,7 @@ impl Coordinator {
         if let Some((cause, resume)) = self.governor.throttle(self.now) {
             return ResourceHealth::Throttled { cause, resume };
         }
-        if self.blocking_slots.len() >= self.maximum_in_flight && !self.queue_order.is_empty() {
+        if self.host_full_with_queue() {
             return ResourceHealth::Throttled { cause: ThrottleCause::Concurrency, resume: None };
         }
         domains.values().copied().find(|health| health.is_throttled()).unwrap_or(ResourceHealth::Nominal)
@@ -1516,7 +1596,7 @@ impl Coordinator {
         self.queue_order.clear();
         self.batch = None;
         for target in self.registrations.values_mut() {
-            *target = RegistrationTarget::Abandoned;
+            *target = target.abandon();
         }
     }
 

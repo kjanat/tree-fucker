@@ -488,6 +488,11 @@ fn fatal_termination_with_a_registration_outstanding_reports_the_same_error_befo
     let inner = Arc::new(DeterministicRuntime::new());
     let runtime = Arc::new(HoldingRuntime::new(inner.clone()));
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    fs.set_default_capabilities(tree_fucker::DomainCapabilities {
+        topology: tree_fucker::AccessTopology::Local,
+        media: tree_fucker::MediaHint::SolidState,
+        ..tree_fucker::DomainCapabilities::inline()
+    });
     fs.mkdir("c");
     fs.create_file("c/x", 1);
     fs.mkdir("d");
@@ -674,4 +679,58 @@ fn an_open_under_an_exhausted_bootstrap_allowance_waits_rather_than_bypassing() 
         opened.load(std::sync::atomic::Ordering::SeqCst),
         "RFC 5.2: work denied for lack of allowance is granted once the allowance returns"
     );
+}
+
+#[test]
+fn shutdown_keeps_reporting_a_stuck_worker_and_releases_its_slot_only_when_it_returns() {
+    let inner = Arc::new(DeterministicRuntime::new());
+    inner.set_blocking_mode(BlockingMode::Uninterruptible);
+    let runtime = Arc::new(HoldingRuntime::new(inner.clone()));
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    fs.create_file("a/x", 3);
+    let host = HostConfig { stuck_threshold: Duration::from_secs(5), ..Default::default() };
+    let governor = tree_fucker::HostGovernor::independent(&host);
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let (handle, _stream) = inner
+        .block_on(Tree::open_outside_host_governor(
+            fs.clone(),
+            fs.root().to_path_buf(),
+            Arc::new(LoadAll),
+            Config::default(),
+            rt,
+            governor.clone(),
+        ))
+        .expect("open");
+    inner.block_on(handle.initial_scan_complete()).expect("scan");
+    runtime.hold_next(1);
+    let mut refresh = Box::pin(handle.refresh(vec![path("a")]));
+    assert!(poll_once(refresh.as_mut()).is_pending());
+    inner.run_until_stalled();
+    assert_eq!(runtime.held(), 1, "the refresh listing never reached the blocking pool");
+    inner.advance(Duration::from_secs(6));
+    assert_eq!(handle.stats().stuck_workers.len(), 1, "RFC 13.5: the held listing is reported stuck");
+
+    assert_eq!(inner.block_on(handle.shutdown()), Ok(()));
+    let stats = handle.stats();
+    assert_eq!(
+        stats.stuck_workers.len(),
+        1,
+        "RFC 17.5: shutdown keeps distinguishing the physically outstanding worker"
+    );
+    assert_eq!(stats.blocking_slots_held, 1);
+    let at = tree_fucker::core::MonotonicTime::ZERO;
+    assert_eq!(governor.view(at).in_flight, 1, "RFC 13.5: shutdown releases nothing physical");
+    assert_eq!(governor.stuck_grants().len(), 1);
+
+    runtime.release();
+    inner.run_until_stalled();
+    assert_eq!(
+        governor.view(at).in_flight,
+        0,
+        "RFC 13.5: when the call returns its slot is released, even after the tree shut down"
+    );
+    assert!(governor.stuck_grants().is_empty(), "RFC 13.5: a returned worker is no longer stuck");
+    assert_eq!(handle.stats().blocking_slots_held, 0, "RFC 17.5: the published statistics observe the return");
+    assert!(handle.stats().stuck_workers.is_empty());
 }

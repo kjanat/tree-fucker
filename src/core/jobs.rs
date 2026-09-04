@@ -1,4 +1,3 @@
-use super::governor::GrantId;
 use super::types::*;
 use super::{Coordinator, JobResult, Output, Work, WorkerLoss};
 use crate::config::WatchRegistrationFailure;
@@ -277,7 +276,7 @@ impl Coordinator {
         }
         if job.phase.started().is_none() {
             let now = self.now;
-            self.governor.release(GrantId::Job(id), now);
+            self.governor.release(self.job_grant(id), now);
         }
         match job.entry() {
             Some(entry) => {
@@ -291,7 +290,7 @@ impl Coordinator {
                 }
             }
         }
-        if let JobPhase::Registering(request) = job.phase {
+        if let JobPhase::Registering(request, _) = job.phase {
             self.abandon_registration(request);
             if let Some(entry) = job.entry() {
                 let domain = self.domain_of(entry);
@@ -760,7 +759,7 @@ impl Coordinator {
 
     fn abandon_registration(&mut self, request: WatchRequestId) {
         if let Some(target) = self.registrations.get_mut(&request) {
-            *target = RegistrationTarget::Abandoned;
+            *target = target.abandon();
         }
     }
 
@@ -771,19 +770,28 @@ impl Coordinator {
     }
 
     pub(super) fn on_watch_registered(&mut self, request: WatchRequestId, result: Result<WatchId, ErrorCause>) {
-        let target = self.registrations.remove(&request).unwrap_or(RegistrationTarget::Abandoned);
+        let Some(target) = self.registrations.remove(&request) else {
+            self.release_watch(result);
+            return;
+        };
         match target {
-            RegistrationTarget::Abandoned => self.release_watch(result),
+            RegistrationTarget::AbandonedStandalone => self.release_watch(result),
+            RegistrationTarget::AbandonedJob(job_id) => {
+                self.release_registration_slot(job_id);
+                self.release_watch(result);
+            }
             RegistrationTarget::Job(job_id) => {
                 let Some(job) = self.jobs.get(&job_id).cloned() else {
+                    self.release_registration_slot(job_id);
                     self.release_watch(result);
                     return;
                 };
-                if job.phase != JobPhase::Registering(request) {
+                if !matches!(job.phase, JobPhase::Registering(held, _) if held == request) {
                     self.release_watch(result);
                     return;
                 }
                 let Some(entry) = job.entry() else {
+                    self.release_registration_slot(job_id);
                     self.release_watch(result);
                     return;
                 };
@@ -801,7 +809,7 @@ impl Coordinator {
                                 self.open_gate = OpenGate::Ready;
                             }
                         }
-                        self.requeue_after_registration(job_id);
+                        self.continue_after_registration(job_id);
                     }
                     Err(err) => {
                         self.push_error(job.path.clone(), Operation::WatchRegistration, err.clone());
@@ -815,11 +823,15 @@ impl Coordinator {
                                 if is_root && self.open_gate == OpenGate::Pending {
                                     self.open_gate = OpenGate::Ready;
                                 }
-                                self.requeue_after_registration(job_id);
+                                self.continue_after_registration(job_id);
                             }
                             WatchRegistrationFailure::RequireWatcher => {
                                 if is_root && self.open_gate == OpenGate::Pending {
                                     self.open_gate = OpenGate::Failed(Error::WatcherRegistrationFailed);
+                                }
+                                self.release_registration_slot(job_id);
+                                if let Some(job) = self.jobs.get_mut(&job_id) {
+                                    job.phase = JobPhase::Queued;
                                 }
                                 self.finish_job(job_id, JobOutcome::WatcherRegistrationFailed);
                             }
@@ -864,12 +876,5 @@ impl Coordinator {
                 }
             },
         }
-    }
-
-    fn requeue_after_registration(&mut self, job_id: JobId) {
-        if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.phase = JobPhase::Queued;
-        }
-        self.queue_order.push_back(job_id);
     }
 }

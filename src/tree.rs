@@ -426,7 +426,10 @@ impl Actor {
                 phase = RunPhase::ReleasingRegistrations;
                 self.close_stream_and_fail_pending();
             }
-            if matches!(phase, RunPhase::ReleasingRegistrations) && self.registrations.is_empty() {
+            if matches!(phase, RunPhase::ReleasingRegistrations)
+                && self.registrations.is_empty()
+                && self.workers.is_empty()
+            {
                 break;
             }
         }

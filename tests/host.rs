@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tree_fucker::core::{Command, MonotonicTime, WorkOrigin};
-use tree_fucker::testing::{Admission, CostScope, FakeFileSystem, FakeOp, Harness};
+use tree_fucker::testing::{Admission, CostScope, DomainId, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ResourceHealth, ResourceLimit, ThrottleCause};
 use tree_fucker::{
-    Config, EntryKind, Error, HostConfig, HostGovernor, HostGovernorError, LoadAll, RelativePath, Tree, WatcherKind,
-    entry_bytes,
+    AccessTopology, Config, DomainCapabilities, EntryKind, Error, HostConfig, HostGovernor, HostGovernorError, LoadAll,
+    MediaHint, RelativePath, Tree, WatcherKind, entry_bytes,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -587,4 +587,144 @@ fn the_default_configuration_equals_the_rfc_9_2_table() {
 
     assert!(host.validate().is_ok(), "RFC 9.2: the host defaults satisfy every InvalidConfig condition");
     assert!(tree.validate().is_ok(), "RFC 9.2: the tree defaults satisfy every InvalidConfig condition");
+}
+
+#[test]
+fn ten_trees_under_one_host_governor_share_one_physical_ceiling_and_one_envelope() {
+    let host = HostConfig { maximum_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
+    let shared = HostGovernor::independent(&host);
+    let mut trees: Vec<Harness> = (0..10)
+        .map(|index| {
+            let fs = tree(&["a", "b", "c"]);
+            let domain = DomainId::new(100 + index);
+            fs.set_domain("", domain);
+            fs.set_capabilities(
+                domain,
+                DomainCapabilities {
+                    topology: AccessTopology::Local,
+                    media: MediaHint::SolidState,
+                    ..DomainCapabilities::inline()
+                },
+            );
+            fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(1));
+            Harness::open_under(fs, Arc::new(LoadAll), Config::default(), shared.clone()).expect("open")
+        })
+        .collect();
+    let window = Duration::from_secs(300);
+    let mut peak = 0;
+    for step in 1..=300 {
+        let target = MonotonicTime::ZERO + Duration::from_secs(step);
+        for h in trees.iter_mut() {
+            h.run_jobs_until(target);
+        }
+        let held: usize = trees.iter().map(|h| h.stats().blocking_slots_held).sum();
+        peak = peak.max(held);
+        assert!(
+            held <= 2,
+            "RFC 15.9: every tree in the process shares one ceiling on in-flight workers; {held} workers were running \
+             across ten trees at {target:?}"
+        );
+        assert!(
+            shared.view(target).in_flight <= 2,
+            "RFC 15.3: the host governor reports {}",
+            shared.view(target).in_flight
+        );
+    }
+    assert!(peak > 0, "no tree ever ran a worker");
+    let reserved: Duration =
+        trees.iter().map(|h| h.reserved_between(MonotonicTime::ZERO, MonotonicTime::ZERO + window)).sum();
+    let budget = envelope(BACKGROUND_DUTY_GLOBAL, BACKGROUND_BURST_GLOBAL, window);
+    assert!(reserved <= budget, "RFC 15.9: ten trees reserved {reserved:?} against one global envelope of {budget:?}");
+}
+
+#[test]
+fn the_host_governor_counts_in_flight_workers_across_trees_against_one_ceiling() {
+    use tree_fucker::core::{GrantId, Reservation};
+    use tree_fucker::{DomainKey, JobId, StorageDomainId};
+    let shared = HostGovernor::independent(&HostConfig {
+        maximum_in_flight: 2,
+        per_domain_concurrency: 2,
+        ..Default::default()
+    });
+    let now = MonotonicTime::ZERO;
+    let capabilities = DomainCapabilities {
+        topology: AccessTopology::Local,
+        media: MediaHint::SolidState,
+        ..DomainCapabilities::inline()
+    };
+    let domains: Vec<StorageDomainId> = (0..3).map(|i| StorageDomainId::of(&DomainKey::declared(200 + i))).collect();
+    let grants: Vec<GrantId> = domains
+        .iter()
+        .map(|domain| {
+            shared.register_domain(*domain, &capabilities, now);
+            let id = GrantId::Job(shared.next_tree(), JobId::new(1));
+            shared
+                .try_admit(
+                    Reservation {
+                        id,
+                        path: RelativePath::root(),
+                        reads: 1,
+                        registrations: 0,
+                        lease: 0,
+                        domain: Some(*domain),
+                        origin: WorkOrigin::Background,
+                        listing: true,
+                    },
+                    now,
+                )
+                .expect("admitted");
+            id
+        })
+        .collect();
+    assert_eq!(shared.may_start(Some(domains[0])), Ok(()));
+    shared.start(grants[0], now);
+    assert_eq!(shared.may_start(Some(domains[1])), Ok(()));
+    shared.start(grants[1], now);
+    assert_eq!(
+        shared.may_start(Some(domains[2])),
+        Err(ThrottleCause::Concurrency),
+        "RFC 15.9: one set of physical ceilings on in-flight workers for every tree in the process; a third tree on \
+         its own domain must wait behind two workers of other trees"
+    );
+    assert_eq!(shared.view(now).in_flight, 2);
+    shared.release(grants[0], now);
+    assert_eq!(shared.may_start(Some(domains[2])), Ok(()), "a released slot frees the ceiling for any tree");
+}
+
+#[test]
+fn two_trees_reaching_one_domain_debit_one_domain_account() {
+    let shared = HostGovernor::independent(&HostConfig::default());
+    let make = |dirs: &[&str]| {
+        let fs = tree(dirs);
+        fs.set_domain("", DomainId::new(7));
+        fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+        fs
+    };
+    let mut one =
+        Harness::open_under(make(&["a", "b"]), Arc::new(LoadAll), Config::default(), shared.clone()).expect("open");
+    let mut two =
+        Harness::open_under(make(&["c", "d"]), Arc::new(LoadAll), Config::default(), shared.clone()).expect("open");
+    let mut target = MonotonicTime::ZERO;
+    for step in 1..=120 {
+        target = MonotonicTime::ZERO + Duration::from_secs(step);
+        one.run_jobs_until(target);
+        two.run_jobs_until(target);
+    }
+    let first = one.stats().domains.into_iter().next().expect("the first tree entered no domain");
+    let second = two.stats().domains.into_iter().next().expect("the second tree entered no domain");
+    assert_eq!(
+        first.id, second.id,
+        "RFC 15.9: adapters report the same identity for the same mount, so both trees bind one storage domain"
+    );
+    assert_eq!(first.charged, second.charged, "RFC 15.9: both trees read one domain account");
+    let view = shared.view(target);
+    assert_eq!(view.domains.len(), 1, "RFC 15.9: one accounting of worker time per storage domain; {:?}", view.domains);
+    let account = view.domains.get(&first.id).copied().expect("the shared domain account");
+    assert!(
+        account.charged >= one.charged_work() + two.charged_work(),
+        "RFC 15.9: the one account carries both trees' work; {:?} against {:?} and {:?}",
+        account.charged,
+        one.charged_work(),
+        two.charged_work()
+    );
 }

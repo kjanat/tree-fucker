@@ -267,7 +267,7 @@ pub struct Guards {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobPhase {
-    Registering(WatchRequestId),
+    Registering(WatchRequestId, MonotonicTime),
     Queued,
     Suspended,
     Running(MonotonicTime),
@@ -277,8 +277,8 @@ pub enum JobPhase {
 impl JobPhase {
     pub fn started(self) -> Option<MonotonicTime> {
         match self {
-            JobPhase::Running(at) | JobPhase::Confirming(at) => Some(at),
-            JobPhase::Registering(_) | JobPhase::Queued | JobPhase::Suspended => None,
+            JobPhase::Running(at) | JobPhase::Confirming(at) | JobPhase::Registering(_, at) => Some(at),
+            JobPhase::Queued | JobPhase::Suspended => None,
         }
     }
 }
@@ -329,6 +329,7 @@ pub struct ActiveJob {
     pub cancel: crate::fs::CancellationToken,
     pub leases: u32,
     pub session_open: bool,
+    pub registration: Option<super::WatchScope>,
 }
 
 impl ActiveJob {
@@ -1139,5 +1140,24 @@ pub enum OpenGate {
 pub enum RegistrationTarget {
     Job(JobId),
     Standalone(EntryId),
-    Abandoned,
+    AbandonedJob(JobId),
+    AbandonedStandalone,
+}
+
+impl RegistrationTarget {
+    pub fn abandon(self) -> RegistrationTarget {
+        match self {
+            RegistrationTarget::Job(id) | RegistrationTarget::AbandonedJob(id) => RegistrationTarget::AbandonedJob(id),
+            RegistrationTarget::Standalone(_) | RegistrationTarget::AbandonedStandalone => {
+                RegistrationTarget::AbandonedStandalone
+            }
+        }
+    }
+
+    pub fn job(self) -> Option<JobId> {
+        match self {
+            RegistrationTarget::Job(id) | RegistrationTarget::AbandonedJob(id) => Some(id),
+            RegistrationTarget::Standalone(_) | RegistrationTarget::AbandonedStandalone => None,
+        }
+    }
 }

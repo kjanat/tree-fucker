@@ -1,4 +1,3 @@
-use super::governor::GrantId;
 use super::types::*;
 use super::{Coordinator, Output, WatchDecision};
 use crate::entry::{LoadState, Shape};
@@ -150,22 +149,35 @@ impl Coordinator {
                     continue;
                 }
                 WatchDecision::Register(scope) => {
+                    let domain = self.domain_of(id);
+                    if self.governor.may_start(domain).is_err() {
+                        return true;
+                    }
                     let request = self.next_watch_request();
                     let now = self.now;
                     let reservation = super::governor::Reservation {
-                        id: GrantId::WatchRegistration(request),
+                        id: self.registration_grant(request),
                         path: path.clone(),
                         reads: 0,
                         registrations: 1,
                         lease: 0,
-                        domain: self.domain_of(id),
+                        domain,
                         origin: WorkOrigin::Background,
                         listing: false,
                     };
                     if self.governor.try_admit(reservation, now).is_err() {
                         return true;
                     }
+                    self.governor.start(self.registration_grant(request), now);
                     self.hold_watch_path(id);
+                    self.blocking_slots.insert(
+                        super::SlotOwner::WatchRegistration(request),
+                        Occupancy {
+                            path: path.clone(),
+                            operation: super::JobOperation::WatchRegistration,
+                            started: now,
+                        },
+                    );
                     self.registrations.insert(request, RegistrationTarget::Standalone(id));
                     self.outputs.push(Output::RegisterWatch { request, path, recursive: scope.is_recursive() });
                 }

@@ -282,12 +282,12 @@ fn a_cancelled_worker_keeps_its_physical_slot_until_it_returns() {
     assert_eq!(h.stats().in_flight_jobs, 1);
     assert_eq!(h.stats().blocking_slots_held, 2);
     let held = h.stats().blocking_slots;
-    let slot = held.iter().find(|s| s.job == cancelled.id).expect("cancelled worker still holds a slot");
+    let slot = held.iter().find(|s| s.job() == Some(cancelled.id)).expect("cancelled worker still holds a slot");
     assert_eq!(slot.path, path("d0"));
     assert_eq!(slot.operation, JobOperation::Listing);
     assert_eq!(slot.started, h.now());
     assert!(h.complete_outstanding_job(cancelled.id));
-    assert!(h.stats().blocking_slots.iter().all(|s| s.job != cancelled.id));
+    assert!(h.stats().blocking_slots.iter().all(|s| s.job() != Some(cancelled.id)));
     assert!(h.pending_job_for("d2").is_some(), "the released slot admitted no queued job");
     assert_eq!(h.stats().blocking_slots_held, 2);
     h.run_until_idle();
@@ -309,7 +309,7 @@ fn shutdown_keeps_a_started_worker_slot_held_until_the_worker_returns() {
     assert_eq!(h.result(t), Some(Err(Error::Shutdown)));
     assert_eq!(h.stats().in_flight_jobs, 0);
     assert_eq!(h.stats().blocking_slots_held, 1);
-    assert_eq!(h.stats().blocking_slots[0].job, job.id);
+    assert_eq!(h.stats().blocking_slots[0].job(), Some(job.id));
     assert_eq!(h.stats().blocking_slots[0].path, path("a"));
     assert!(h.complete_outstanding_job(job.id));
     assert_eq!(h.stats().blocking_slots_held, 0);

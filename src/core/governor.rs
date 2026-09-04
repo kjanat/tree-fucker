@@ -18,17 +18,33 @@ const CONSERVATIVE_START_WINDOW: usize = 1;
 const CONSERVATIVE_TOPOLOGY_CEILING: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TreeNumber(u64);
+
+impl TreeNumber {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GrantId {
-    Job(JobId),
-    WatchRegistration(WatchRequestId),
+    Job(TreeNumber, JobId),
+    WatchRegistration(TreeNumber, WatchRequestId),
     Bootstrap(u64),
 }
 
 impl GrantId {
     pub fn job(self) -> Option<JobId> {
         match self {
-            GrantId::Job(id) => Some(id),
-            GrantId::WatchRegistration(_) | GrantId::Bootstrap(_) => None,
+            GrantId::Job(_, id) => Some(id),
+            GrantId::WatchRegistration(_, _) | GrantId::Bootstrap(_) => None,
+        }
+    }
+
+    pub fn tree(self) -> Option<TreeNumber> {
+        match self {
+            GrantId::Job(tree, _) | GrantId::WatchRegistration(tree, _) => Some(tree),
+            GrantId::Bootstrap(_) => None,
         }
     }
 }
@@ -50,7 +66,11 @@ pub struct Grant {
     pub charged: Duration,
     pub admitted: MonotonicTime,
     pub started: Option<MonotonicTime>,
+    pub dispatched: Option<MonotonicTime>,
     pub stuck: bool,
+    pub listing: bool,
+    pub registration: bool,
+    pub registration_took: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -87,6 +107,9 @@ pub struct DomainView {
     pub stuck: usize,
     pub estimate: Duration,
     pub latency: LatencySummary,
+    pub listing_latency: LatencySummary,
+    pub metadata_latency: LatencySummary,
+    pub registration_latency: LatencySummary,
     pub queue_delay: Duration,
     pub throttled_jobs: u64,
     pub throttled_duration: Duration,
@@ -244,6 +267,57 @@ impl Bucket {
 }
 
 #[derive(Clone, Debug)]
+struct LatencyWindow {
+    history: VecDeque<Duration>,
+    sorted: Vec<Duration>,
+    total: Duration,
+    summary: LatencySummary,
+}
+
+impl LatencyWindow {
+    fn new() -> LatencyWindow {
+        LatencyWindow {
+            history: VecDeque::new(),
+            sorted: Vec::with_capacity(LATENCY_HISTORY),
+            total: Duration::ZERO,
+            summary: LatencySummary::default(),
+        }
+    }
+
+    fn record(&mut self, latency: Duration) {
+        if self.history.len() >= LATENCY_HISTORY
+            && let Some(oldest) = self.history.pop_front()
+        {
+            if let Ok(at) = self.sorted.binary_search(&oldest) {
+                self.sorted.remove(at);
+            }
+            self.total = self.total.saturating_sub(oldest);
+        }
+        self.history.push_back(latency);
+        let at = self.sorted.partition_point(|held| *held < latency);
+        self.sorted.insert(at, latency);
+        self.total += latency;
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        let samples = self.sorted.len();
+        if samples == 0 {
+            self.summary = LatencySummary::default();
+            return;
+        }
+        let tail = (samples * 9 / 10).min(samples - 1);
+        self.summary = LatencySummary {
+            samples,
+            minimum: self.sorted[0],
+            median: self.sorted[samples / 2],
+            mean: self.total / u32::try_from(samples).unwrap_or(u32::MAX),
+            tail: self.sorted[tail],
+        };
+    }
+}
+
+#[derive(Clone, Debug)]
 struct DomainState {
     bucket: Bucket,
     foreground: Bucket,
@@ -251,16 +325,16 @@ struct DomainState {
     window: usize,
     ceiling: usize,
     estimate: Duration,
-    latency: VecDeque<Duration>,
+    latency: LatencyWindow,
+    listing_latency: LatencyWindow,
+    metadata_latency: LatencyWindow,
+    registration_latency: LatencyWindow,
     bytes: VecDeque<u64>,
     bytes_total: u64,
     bytes_estimate: u64,
     errors: VecDeque<bool>,
     completions: usize,
     queue: VecDeque<Duration>,
-    summary: LatencySummary,
-    sorted: Vec<Duration>,
-    total: Duration,
     standing_queue_delay: Duration,
     throttled_jobs: u64,
     throttled_since: Option<MonotonicTime>,
@@ -282,16 +356,16 @@ impl DomainState {
             window: start_window(capabilities).clamp(1, ceiling),
             ceiling,
             estimate: config.initial_cost_estimate,
-            latency: VecDeque::new(),
+            latency: LatencyWindow::new(),
+            listing_latency: LatencyWindow::new(),
+            metadata_latency: LatencyWindow::new(),
+            registration_latency: LatencyWindow::new(),
             bytes: VecDeque::new(),
             bytes_total: 0,
             bytes_estimate: 0,
             errors: VecDeque::new(),
             completions: 0,
             queue: VecDeque::new(),
-            summary: LatencySummary::default(),
-            sorted: Vec::with_capacity(LATENCY_HISTORY),
-            total: Duration::ZERO,
             standing_queue_delay: Duration::ZERO,
             throttled_jobs: 0,
             throttled_since: None,
@@ -301,42 +375,19 @@ impl DomainState {
     }
 
     fn summary(&self) -> LatencySummary {
-        self.summary
+        self.latency.summary
     }
 
-    fn recompute_summary(&mut self) {
-        let samples = self.sorted.len();
-        if samples == 0 {
-            self.summary = LatencySummary::default();
-            return;
+    fn record_latency(&mut self, latency: Duration, listing: bool) {
+        self.latency.record(latency);
+        match listing {
+            true => self.listing_latency.record(latency),
+            false => self.metadata_latency.record(latency),
         }
-        let tail = (samples * 9 / 10).min(samples - 1);
-        self.summary = LatencySummary {
-            samples,
-            minimum: self.sorted[0],
-            median: self.sorted[samples / 2],
-            mean: self.total / u32::try_from(samples).unwrap_or(u32::MAX),
-            tail: self.sorted[tail],
-        };
-    }
-
-    fn record_latency(&mut self, latency: Duration) {
-        if self.latency.len() >= LATENCY_HISTORY
-            && let Some(oldest) = self.latency.pop_front()
-        {
-            if let Ok(at) = self.sorted.binary_search(&oldest) {
-                self.sorted.remove(at);
-            }
-            self.total = self.total.saturating_sub(oldest);
-        }
-        self.latency.push_back(latency);
-        let at = self.sorted.partition_point(|held| *held < latency);
-        self.sorted.insert(at, latency);
-        self.total += latency;
         self.completions += 1;
-        self.recompute_summary();
         let ceiling = duration(self.bucket.capacity);
-        self.estimate = self.summary.median.max(self.summary.minimum).min(ceiling).max(Duration::from_nanos(1));
+        let summary = self.latency.summary;
+        self.estimate = summary.median.max(summary.minimum).min(ceiling).max(Duration::from_nanos(1));
     }
 
     fn record_bytes(&mut self, bytes: u64) {
@@ -398,7 +449,7 @@ pub struct Governor {
     foreground: Bucket,
     bootstrap_capacity: i128,
     bootstrap_outstanding: i128,
-    memory: BTreeMap<u64, (u64, u64)>,
+    memory: BTreeMap<TreeNumber, (u64, u64)>,
     memory_total: u64,
     in_flight_total: u64,
     next_tree: u64,
@@ -477,9 +528,9 @@ impl Governor {
         self.domains.insert(id, state);
     }
 
-    pub fn next_tree(&mut self) -> u64 {
+    pub fn next_tree(&mut self) -> TreeNumber {
         self.next_tree += 1;
-        self.next_tree
+        TreeNumber(self.next_tree)
     }
 
     pub fn next_bootstrap(&mut self) -> u64 {
@@ -487,7 +538,7 @@ impl Governor {
         self.next_bootstrap
     }
 
-    pub fn report_memory(&mut self, tree: u64, snapshot_bytes: u64, in_flight_bytes: u64) {
+    pub fn report_memory(&mut self, tree: TreeNumber, snapshot_bytes: u64, in_flight_bytes: u64) {
         let entry = self.memory.entry(tree).or_default();
         let previous = *entry;
         *entry = (snapshot_bytes, in_flight_bytes);
@@ -498,14 +549,14 @@ impl Governor {
         self.in_flight_total = self.in_flight_total.saturating_sub(previous.1).saturating_add(in_flight_bytes);
     }
 
-    pub fn forget_tree(&mut self, tree: u64) {
+    pub fn forget_tree(&mut self, tree: TreeNumber) {
         if let Some(previous) = self.memory.remove(&tree) {
             self.memory_total = self.memory_total.saturating_sub(previous.0.saturating_add(previous.1));
             self.in_flight_total = self.in_flight_total.saturating_sub(previous.1);
         }
     }
 
-    pub fn accounted_memory_excluding(&self, tree: u64) -> u64 {
+    pub fn accounted_memory_excluding(&self, tree: TreeNumber) -> u64 {
         let own = self.memory.get(&tree).copied().unwrap_or((0, 0));
         self.memory_total.saturating_sub(own.0.saturating_add(own.1))
     }
@@ -589,6 +640,11 @@ impl Governor {
         self.move_counts(&moved, previous, Some(domain));
         if let Some(grant) = self.grants.get_mut(&id) {
             grant.domain = Some(domain);
+        }
+        if previous.is_none()
+            && let Some(took) = moved.registration_took
+        {
+            self.domain_mut(domain, now).registration_latency.record(took);
         }
         if previous.is_none() {
             self.bootstrap_outstanding = (self.bootstrap_outstanding - granted).max(0);
@@ -705,8 +761,8 @@ impl Governor {
         }
     }
 
-    pub fn may_start(&self, domain: Option<StorageDomainId>, in_flight: usize) -> Result<(), ThrottleCause> {
-        if in_flight >= self.config.maximum_in_flight {
+    pub fn may_start(&self, domain: Option<StorageDomainId>) -> Result<(), ThrottleCause> {
+        if self.running_total >= self.config.maximum_in_flight {
             return Err(ThrottleCause::Concurrency);
         }
         if self.in_flight_on(domain) >= self.window_of(domain) {
@@ -820,7 +876,11 @@ impl Governor {
                 charged: cost,
                 admitted: now,
                 started: None,
+                dispatched: None,
                 stuck: false,
+                listing,
+                registration: registrations > 0,
+                registration_took: None,
             },
         );
         Ok(cost)
@@ -915,14 +975,37 @@ impl Governor {
         }
         if grant.stuck {
             Governor::decrement(&mut self.stuck, grant.domain);
+            let withheld = nanos(grant.charged.saturating_sub(grant.reserved));
+            self.global_bucket(grant.origin).level -= withheld;
         }
         let (Some(started), Some(domain)) = (grant.started, grant.domain) else {
             return;
         };
-        let latency = now.since(started);
         let state = self.domain_mut(domain, now);
-        state.record_latency(latency);
+        match (grant.dispatched, grant.registration) {
+            (Some(dispatched), _) => state.record_latency(now.since(dispatched), grant.listing),
+            (None, true) => state.registration_latency.record(now.since(started)),
+            (None, false) => state.record_latency(now.since(started), grant.listing),
+        }
         state.adapt(false);
+    }
+
+    pub fn dispatch(&mut self, id: GrantId, at: MonotonicTime) {
+        let Some(grant) = self.grants.get_mut(&id) else {
+            return;
+        };
+        if grant.dispatched.is_some() {
+            return;
+        }
+        grant.dispatched = Some(at);
+        let (Some(started), true) = (grant.started, grant.registration) else {
+            return;
+        };
+        let took = at.since(started);
+        grant.registration_took = Some(took);
+        if let Some(domain) = grant.domain {
+            self.domain_mut(domain, at).registration_latency.record(took);
+        }
     }
 
     pub fn record_outcome(&mut self, domain: Option<StorageDomainId>, error: bool, now: MonotonicTime) {
@@ -969,6 +1052,10 @@ impl Governor {
         if let Some(id) = domain {
             self.domain_mut(id, now).adapt(true);
         }
+    }
+
+    pub fn domain_of_grant(&self, id: GrantId) -> Option<StorageDomainId> {
+        self.grants.get(&id).and_then(|grant| grant.domain)
     }
 
     pub fn stuck_grants(&self) -> impl Iterator<Item = &Grant> {
@@ -1104,6 +1191,9 @@ impl Governor {
             stuck: occupancy.1,
             estimate: state.estimate,
             latency: state.summary(),
+            listing_latency: state.listing_latency.summary,
+            metadata_latency: state.metadata_latency.summary,
+            registration_latency: state.registration_latency.summary,
             queue_delay: state.standing_queue_delay(),
             throttled_jobs: state.throttled_jobs,
             throttled_duration: match state.throttled_since {
@@ -1233,7 +1323,7 @@ impl HostGovernor {
         guard(&self.inner).register_domain(id, capabilities, now)
     }
 
-    pub fn next_tree(&self) -> u64 {
+    pub fn next_tree(&self) -> TreeNumber {
         guard(&self.inner).next_tree()
     }
 
@@ -1241,15 +1331,15 @@ impl HostGovernor {
         guard(&self.inner).next_bootstrap()
     }
 
-    pub fn report_memory(&self, tree: u64, snapshot_bytes: u64, in_flight_bytes: u64) {
+    pub fn report_memory(&self, tree: TreeNumber, snapshot_bytes: u64, in_flight_bytes: u64) {
         guard(&self.inner).report_memory(tree, snapshot_bytes, in_flight_bytes)
     }
 
-    pub fn forget_tree(&self, tree: u64) {
+    pub fn forget_tree(&self, tree: TreeNumber) {
         guard(&self.inner).forget_tree(tree)
     }
 
-    pub fn accounted_memory_excluding(&self, tree: u64) -> u64 {
+    pub fn accounted_memory_excluding(&self, tree: TreeNumber) -> u64 {
         guard(&self.inner).accounted_memory_excluding(tree)
     }
 
@@ -1293,8 +1383,12 @@ impl HostGovernor {
         guard(&self.inner).global_exhausted(domain, origin)
     }
 
-    pub fn may_start(&self, domain: Option<StorageDomainId>, in_flight: usize) -> Result<(), ThrottleCause> {
-        guard(&self.inner).may_start(domain, in_flight)
+    pub fn may_start(&self, domain: Option<StorageDomainId>) -> Result<(), ThrottleCause> {
+        guard(&self.inner).may_start(domain)
+    }
+
+    pub fn in_flight(&self) -> usize {
+        guard(&self.inner).in_flight()
     }
 
     pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Duration, ThrottleCause> {
@@ -1321,6 +1415,10 @@ impl HostGovernor {
         guard(&self.inner).start(id, at)
     }
 
+    pub fn dispatch(&self, id: GrantId, at: MonotonicTime) {
+        guard(&self.inner).dispatch(id, at)
+    }
+
     pub fn release(&self, id: GrantId, now: MonotonicTime) {
         guard(&self.inner).release(id, now)
     }
@@ -1335,6 +1433,10 @@ impl HostGovernor {
 
     pub fn mark_stuck(&self, id: GrantId, now: MonotonicTime) {
         guard(&self.inner).mark_stuck(id, now)
+    }
+
+    pub fn domain_of_grant(&self, id: GrantId) -> Option<StorageDomainId> {
+        guard(&self.inner).domain_of_grant(id)
     }
 
     pub fn stuck_grants(&self) -> Vec<Grant> {

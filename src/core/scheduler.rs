@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
-use super::governor::{GrantId, Reservation};
+use super::governor::Reservation;
 use super::types::*;
 use super::{
     Coordinator, JobSpec, ListingWork, ObligationCounts, Output, WatchDecision, WatchScope, Work, obligation_counts,
@@ -100,7 +100,7 @@ impl Coordinator {
         let origin = self.origin_of(entry, barriers);
         let now = self.now;
         let reservation = Reservation {
-            id: GrantId::Job(id),
+            id: self.job_grant(id),
             path: path.clone(),
             reads: 1,
             registrations: u32::from(registration.is_some()),
@@ -141,7 +141,7 @@ impl Coordinator {
             let lease = job.leases;
             let domain = job.domain;
             let reservation = Reservation {
-                id: GrantId::Job(id),
+                id: self.job_grant(id),
                 path: job.path.clone(),
                 reads: 1,
                 registrations: 0,
@@ -539,7 +539,8 @@ impl Coordinator {
         }
         self.class_rotation = (rotation + 1) % 5;
         let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
-        for i in 0..5 {
+        for step in 0..5 {
+            let i = (rotation + step) % 5;
             let mut take = quota[i];
             if i == 0
                 && probe_pending
@@ -647,16 +648,12 @@ impl Coordinator {
             Some(entry_id) => JobTarget::Entry { id: entry_id, guards: self.capture_guards(entry_id, request.need) },
             None => JobTarget::RootProbe { expected_unavailable: self.root.incarnation() },
         };
-        let phase = match (grant.registration, entry) {
+        let registration = match (grant.registration, entry) {
             (Some(scope), Some(entry_id)) => {
-                let req = self.next_watch_request();
-                self.registrations.insert(req, RegistrationTarget::Job(id));
-                let recursive = scope.is_recursive();
                 self.hold_watch_path(entry_id);
-                self.outputs.push(Output::RegisterWatch { request: req, path: request.path.clone(), recursive });
-                JobPhase::Registering(req)
+                Some(scope)
             }
-            (Some(_), None) | (None, _) => JobPhase::Queued,
+            (Some(_), None) | (None, _) => None,
         };
         self.charge_commands(&barriers, grant.cost);
         let job = ActiveJob {
@@ -666,7 +663,7 @@ impl Coordinator {
             domain: grant.domain,
             origin: grant.origin,
             need: request.need,
-            phase,
+            phase: JobPhase::Queued,
             dispatch,
             recon,
             reasons,
@@ -675,6 +672,7 @@ impl Coordinator {
             cancel: CancellationToken::new(),
             leases: 1,
             session_open: false,
+            registration,
         };
         if let Some(entry_id) = entry {
             self.active_by_entry.insert(entry_id, id);
@@ -685,9 +683,7 @@ impl Coordinator {
         } else {
             self.probe_job = Some(id);
         }
-        if phase == JobPhase::Queued {
-            self.queue_order.push_back(id);
-        }
+        self.queue_order.push_back(id);
         self.jobs.insert(id, job);
         id
     }
@@ -764,7 +760,7 @@ impl Coordinator {
         }
         let mut deferred: Vec<JobId> = Vec::new();
         loop {
-            if self.blocking_slots.len() >= self.maximum_in_flight {
+            if self.governor.in_flight() >= self.maximum_in_flight {
                 break;
             }
             let Some(id) = self.queue_order.pop_front() else {
@@ -781,24 +777,66 @@ impl Coordinator {
                 continue;
             }
             let domain = job.domain;
-            if self.governor.may_start(domain, self.blocking_slots.len()).is_err() {
+            if self.governor.may_start(domain).is_err() {
                 deferred.push(id);
                 continue;
             }
-            let Some(job) = self.jobs.get(&id) else {
-                continue;
-            };
-            let work = self.work_for(job);
             let now = self.now;
-            if let Some(job) = self.jobs.get_mut(&id) {
-                job.phase = JobPhase::Running(now);
+            self.governor.start(self.job_grant(id), now);
+            let registration = self.jobs.get_mut(&id).and_then(|job| job.registration.take());
+            match registration {
+                Some(scope) => self.register_before_listing(id, scope, now),
+                None => {
+                    let Some(job) = self.jobs.get(&id) else {
+                        continue;
+                    };
+                    let work = self.work_for(job);
+                    if let Some(job) = self.jobs.get_mut(&id) {
+                        job.phase = JobPhase::Running(now);
+                    }
+                    self.dispatch_job(id, work);
+                }
             }
-            self.governor.start(GrantId::Job(id), now);
-            self.dispatch_job(id, work);
         }
         for id in deferred.into_iter().rev() {
             self.queue_order.push_front(id);
         }
+    }
+
+    fn register_before_listing(&mut self, id: JobId, scope: WatchScope, now: MonotonicTime) {
+        let Some(path) = self.jobs.get(&id).map(|job| job.path.clone()) else {
+            return;
+        };
+        let request = self.next_watch_request();
+        self.registrations.insert(request, RegistrationTarget::Job(id));
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.phase = JobPhase::Registering(request, now);
+        }
+        self.blocking_slots.insert(
+            super::SlotOwner::Job(id),
+            Occupancy { path: path.clone(), operation: super::JobOperation::WatchRegistration, started: now },
+        );
+        self.outputs.push(Output::RegisterWatch { request, path, recursive: scope.is_recursive() });
+    }
+
+    pub(super) fn continue_after_registration(&mut self, id: JobId) {
+        let Some(job) = self.jobs.get(&id) else {
+            return;
+        };
+        let Some(started) = job.phase.started() else {
+            return;
+        };
+        let work = self.work_for(job);
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.phase = JobPhase::Running(started);
+        }
+        self.dispatch_job(id, work);
+    }
+
+    pub(super) fn release_registration_slot(&mut self, id: JobId) {
+        let now = self.now;
+        self.blocking_slots.remove(&super::SlotOwner::Job(id));
+        self.governor.release(self.job_grant(id), now);
     }
 
     pub(super) fn dispatch_job(&mut self, id: JobId, work: Work) {
@@ -811,7 +849,9 @@ impl Coordinator {
         let path = job.path.clone();
         let spec = JobSpec { id, path: path.clone(), work };
         let operation = spec.operation();
-        self.blocking_slots.insert(id, Occupancy { path, operation, started });
+        self.blocking_slots.insert(super::SlotOwner::Job(id), Occupancy { path, operation, started });
+        let now = self.now;
+        self.governor.dispatch(self.job_grant(id), now);
         self.outputs.push(Output::StartJob(spec));
     }
 
