@@ -8,8 +8,8 @@ use tree_fucker::testing::{CostScope, DomainId, FakeFileSystem, FakeOp, Harness}
 use tree_fucker::update::UpdateEvent;
 use tree_fucker::{
     AccessTopology, CaseSensitivity, Config, DeclarationSource, DirectoryListing, DomainCapabilities,
-    DomainCaseSensitivity, DomainCrossing, DomainIdentity, EntryInfo, LoadAll, LoadState, PolicyRevision, RelativePath,
-    WatcherKind,
+    DomainCaseSensitivity, DomainCrossing, DomainIdentity, EntryInfo, IdentityReliability, LoadAll, LoadState,
+    PolicyRevision, RelativePath, WatcherKind,
 };
 
 const MEDIA: DomainId = DomainId::new(2);
@@ -178,6 +178,81 @@ fn a_domain_not_reported_inline_is_resolved_by_a_separate_governed_operation() {
         "the separate resolution did not report the crossing it detected"
     );
     assert!(h.paths().contains(&"mnt/inner/deep".to_string()), "Follow did not traverse the resolved domain");
+}
+
+#[test]
+fn a_candidate_domain_resolution_is_charged_to_the_bootstrap_scope_and_attributed_to_the_resolved_domain() {
+    let fs = mounted();
+    fs.report_inline_domains(false);
+    fs.set_cost(CostScope::Everything, FakeOp::ResolveDomain, Duration::from_millis(3));
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(2));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_until_idle();
+
+    let resolutions: Vec<_> =
+        h.admissions().into_iter().filter(|a| a.operation == JobOperation::DomainResolution).collect();
+    assert!(!resolutions.is_empty(), "no candidate domain was resolved, so the property was never tested");
+    assert!(
+        resolutions.iter().all(|a| a.domain.is_none()),
+        "RFC 10.3: a domain resolution runs before the candidate's domain is known, so it is charged to the \
+         bootstrap scope, never to a domain bucket; the tree admitted {resolutions:?}"
+    );
+    let view = h.governor();
+    assert_eq!(
+        view.bootstrap.charged,
+        Duration::ZERO,
+        "RFC 10.3: the bootstrap allowance is attributed to the resolved domain once it is known; it still holds {:?}",
+        view.bootstrap
+    );
+    let media = h
+        .stats()
+        .domains
+        .into_iter()
+        .find(|d| d.identity == DomainIdentity::Known(FakeFileSystem::domain_key(MEDIA)))
+        .expect("the resolved domain was entered");
+    assert!(
+        media.charged > Duration::ZERO,
+        "RFC 10.3 and 15.3: the resolved domain must carry the worker time the bootstrap scope advanced for it; \
+         {MEDIA} charged {:?}",
+        media.charged
+    );
+}
+
+#[test]
+fn a_domain_resolution_that_never_returns_keeps_its_slot_while_other_domains_progress() {
+    let fs = mounted();
+    fs.mkdir("mnt2");
+    fs.mkdir("mnt2/inner");
+    fs.create_file("mnt2/inner/deep", 1);
+    fs.set_domain("mnt2", DomainId::new(9));
+    fs.report_inline_domains(false);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(5));
+    fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ResolveDomain, Duration::from_secs(36_000));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_jobs_until(h.now() + Duration::from_secs(600));
+
+    let slots = h.stats().blocking_slots;
+    assert!(
+        slots.iter().any(|slot| slot.path == path("mnt") && slot.operation == JobOperation::DomainResolution),
+        "RFC 10.3 and 13.5: topology discovery must not casually turn into an indefinite operation, and a stuck \
+         resolution retains its physical slot until its call returns; the tree holds {slots:?}"
+    );
+    assert!(
+        h.paths().contains(&"local/f".to_string()),
+        "RFC 17.5: a stuck domain resolution must not stall the domains that are healthy; the tree holds {:?}",
+        h.paths()
+    );
+    assert!(
+        h.paths().contains(&"mnt2/inner/deep".to_string()),
+        "RFC 10.3 and 13.5: the bootstrap scope is not quarantined by one stuck resolution, so a second mount \
+         point resolves and lists while the first is stuck; the tree holds {:?}",
+        h.paths()
+    );
+    assert!(
+        !h.paths().contains(&"mnt/inner".to_string()),
+        "the mount point whose domain never resolved must not be traversed on a guess; the tree holds {:?}",
+        h.paths()
+    );
 }
 
 #[test]
@@ -388,6 +463,34 @@ fn identities_from_different_identity_spaces_never_match_while_a_bind_mounts_do(
         "RFC 7.1: identity comparisons are meaningful only between entries whose storage domains declare the \
          same identity space, so an identity from another space must never establish a rename"
     );
+}
+
+#[test]
+fn an_advisory_identity_is_published_but_never_establishes_a_rename() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.set_capabilities(
+        DomainId::ROOT,
+        DomainCapabilities { identity_reliability: IdentityReliability::Advisory, ..DomainCapabilities::inline() },
+    );
+    fs.mkdir("dir");
+    fs.create_file("dir/old", 1);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    let before = h.entry("dir/old").expect("old entry");
+    let advisory = before.identity.expect("the advisory identity is published as metadata");
+
+    fs.rename("dir/old", "dir/new");
+    let t = h.command(Command::Refresh(vec![path("dir")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    let after = h.entry("dir/new").expect("the moved child is represented under its new name");
+    assert_eq!(after.identity, Some(advisory), "the advisory identity is still published on the replacement");
+    assert_ne!(
+        after.id, before.id,
+        "RFC 7.1: an identity from a domain whose reliability is advisory MAY be published as metadata but MUST \
+         NOT establish a rename, even when the observed identity is unchanged, so the move is a remove and an add"
+    );
+    assert!(h.entry("dir/old").is_none(), "the old name is gone");
 }
 
 #[test]

@@ -22,9 +22,10 @@ pub use core::{HostGovernor, HostGovernorError, Stats, host_governor};
 pub use config::{ClassWeights, Config, HostConfig, LagMode, WatchRegistrationFailure};
 pub use domain::{
     AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
-    DomainCrossing, DomainIdentity, DomainKey, DomainProbe, FilesystemSemantics, IdentityReliability, IdentitySource,
-    IdentitySpace, IdentitySpaceKey, KindSource, MediaHint, MetadataSource, MetadataSources, ProbeError, ProbeResult,
-    StorageDomainId, TimestampGranularity, TransportHint, WatcherAvailability, WatcherCapabilities, WatcherScope,
+    DomainCrossing, DomainIdentity, DomainKey, DomainProbe, FilesystemInstance, FilesystemInstanceKey,
+    FilesystemSemantics, IdentityReliability, IdentitySource, IdentitySpace, IdentitySpaceKey, KindSource, MediaHint,
+    MetadataSource, MetadataSources, ProbeError, ProbeResult, StorageDomainId, TimestampGranularity, TransportHint,
+    WatcherAvailability, WatcherCapabilities, WatcherScope,
 };
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};

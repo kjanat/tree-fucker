@@ -1,10 +1,16 @@
+#[cfg(target_os = "freebsd")]
+mod bsd;
 mod declared;
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+mod illumos;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(test)]
 mod tests;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "illumos", target_os = "solaris"))]
+mod unix;
 #[cfg(windows)]
 mod windows;
 
@@ -15,13 +21,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(target_os = "freebsd")]
+pub use bsd::FreeBsdProbe;
 pub use declared::{DeclaredProbe, UnknownProbe};
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+pub use illumos::IllumosProbe;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxProbe;
 #[cfg(target_os = "macos")]
 pub use macos::MacOsProbe;
 #[cfg(windows)]
 pub use windows::WindowsProbe;
+#[cfg(windows)]
+pub(crate) use windows::file_identity as windows_file_identity;
 
 use crate::entry::MetadataFields;
 use crate::path::CaseSensitivity;
@@ -96,11 +108,13 @@ enum Key {
         major: u32,
         minor: u32,
     },
-    #[cfg(target_os = "macos")]
-    MacFsid {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    Fsid {
         first: i32,
         second: i32,
     },
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    StatvfsFsid(u64),
     #[cfg(windows)]
     WindowsVolumeGuid(String),
 }
@@ -125,14 +139,83 @@ impl DomainKey {
         DomainKey(Key::LinuxDevice { major, minor })
     }
 
-    #[cfg(target_os = "macos")]
-    pub(super) fn mac_fsid(first: i32, second: i32) -> DomainKey {
-        DomainKey(Key::MacFsid { first, second })
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(super) fn fsid(first: i32, second: i32) -> DomainKey {
+        DomainKey(Key::Fsid { first, second })
+    }
+
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    pub(super) fn statvfs_fsid(id: u64) -> DomainKey {
+        DomainKey(Key::StatvfsFsid(id))
     }
 
     #[cfg(windows)]
     pub(super) fn windows_volume_guid(guid: String) -> DomainKey {
         DomainKey(Key::WindowsVolumeGuid(guid))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FilesystemInstanceKey(InstanceKey);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum InstanceKey {
+    Declared(u64),
+    #[cfg(target_os = "linux")]
+    LinuxSuperblock {
+        major: u32,
+        minor: u32,
+    },
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    Fsid {
+        first: i32,
+        second: i32,
+    },
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    StatvfsFsid(u64),
+    #[cfg(windows)]
+    WindowsVolumeSerial(u64),
+}
+
+impl FilesystemInstanceKey {
+    pub fn declared(id: u64) -> FilesystemInstanceKey {
+        FilesystemInstanceKey(InstanceKey::Declared(id))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn linux_superblock(major: u32, minor: u32) -> FilesystemInstanceKey {
+        FilesystemInstanceKey(InstanceKey::LinuxSuperblock { major, minor })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(super) fn fsid(first: i32, second: i32) -> FilesystemInstanceKey {
+        FilesystemInstanceKey(InstanceKey::Fsid { first, second })
+    }
+
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    pub(super) fn statvfs_fsid(id: u64) -> FilesystemInstanceKey {
+        FilesystemInstanceKey(InstanceKey::StatvfsFsid(id))
+    }
+
+    #[cfg(windows)]
+    pub(super) fn windows_volume_serial(serial: u64) -> FilesystemInstanceKey {
+        FilesystemInstanceKey(InstanceKey::WindowsVolumeSerial(serial))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FilesystemInstance {
+    Known(FilesystemInstanceKey),
+    #[default]
+    Unknown,
+}
+
+impl FilesystemInstance {
+    pub fn same_as(&self, other: &FilesystemInstance) -> bool {
+        match (self, other) {
+            (FilesystemInstance::Known(a), FilesystemInstance::Known(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -408,6 +491,7 @@ pub enum DeclarationSource {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DeclarationSources {
+    pub filesystem: DeclarationSource,
     pub semantics: DeclarationSource,
     pub topology: DeclarationSource,
     pub transport: DeclarationSource,
@@ -422,6 +506,7 @@ pub struct DeclarationSources {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DomainCapabilities {
+    pub filesystem: FilesystemInstance,
     pub semantics: FilesystemSemantics,
     pub topology: AccessTopology,
     pub transport: TransportHint,
@@ -464,8 +549,13 @@ impl DomainCapabilities {
             && self.identities_comparable(other)
     }
 
+    pub fn same_filesystem_as(&self, other: &DomainCapabilities) -> bool {
+        self.filesystem.same_as(&other.filesystem)
+    }
+
     pub fn same_storage_as(&self, parent: &DomainCapabilities) -> bool {
-        self.semantics == parent.semantics
+        self.filesystem == parent.filesystem
+            && self.semantics == parent.semantics
             && self.topology == parent.topology
             && self.transport == parent.transport
             && self.media == parent.media
@@ -538,7 +628,7 @@ impl ProbeResult {
             DomainCaseSensitivity::PerDirectory { domain_default } => {
                 Some(self.directory_case.unwrap_or(domain_default))
             }
-            DomainCaseSensitivity::Unknown => None,
+            DomainCaseSensitivity::Unknown => self.directory_case,
         }
     }
 }

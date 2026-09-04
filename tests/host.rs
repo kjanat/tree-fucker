@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tree_fucker::core::{Command, MonotonicTime, WorkOrigin};
 use tree_fucker::testing::{Admission, CostScope, DomainId, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::{ResourceHealth, ResourceLimit, ThrottleCause};
+use tree_fucker::update::{ResourceHealth, ResourceLimit, RoundResult, ThrottleCause};
 use tree_fucker::{
     AccessTopology, Config, DomainCapabilities, EntryKind, Error, HostConfig, HostGovernor, HostGovernorError, LoadAll,
     MediaHint, RelativePath, Tree, WatcherKind, entry_bytes,
@@ -689,6 +689,46 @@ fn the_host_governor_counts_in_flight_workers_across_trees_against_one_ceiling()
     assert_eq!(shared.view(now).in_flight, 2);
     shared.release(grants[0], now);
     assert_eq!(shared.may_start(Some(domains[2])), Ok(()), "a released slot frees the ceiling for any tree");
+}
+
+#[test]
+fn a_stuck_domain_resolution_in_one_tree_never_freezes_the_shared_bootstrap_scope() {
+    let shared = HostGovernor::independent(&HostConfig::default());
+    let stuck = tree(&["local", "mnt"]);
+    stuck.create_file("local/f", 1);
+    stuck.mkdir("mnt/inner");
+    stuck.create_file("mnt/inner/deep", 1);
+    stuck.set_domain("mnt", DomainId::new(2));
+    stuck.report_inline_domains(false);
+    stuck.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(5));
+    stuck.set_cost(CostScope::Domain(DomainId::new(2)), FakeOp::ResolveDomain, Duration::from_secs(36_000));
+    let follow = Config { domain_crossing: tree_fucker::DomainCrossing::Follow, ..Default::default() };
+    let mut first = Harness::open_under(stuck.clone(), Arc::new(LoadAll), follow, shared.clone()).expect("open");
+    first.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(120));
+    assert!(
+        first.stats().blocking_slots.iter().any(|slot| slot.path == path("mnt")),
+        "the resolution on mnt was not held, so the scenario is untested"
+    );
+
+    let second = tree(&["a", "b", "c"]);
+    for name in ["a", "b", "c"] {
+        second.create_file(&format!("{name}/f"), 1);
+    }
+    second.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(5));
+    let mut other = Harness::open_under(second.clone(), Arc::new(LoadAll), Config::default(), shared.clone())
+        .expect("RFC 13.5: a stuck bootstrap-scope worker in one tree must not deny another tree's open");
+    other.run_until_idle();
+    assert_eq!(
+        other.health().reconciliation.last_round,
+        Some(RoundResult::Successful),
+        "RFC 13.5: a stuck domain resolution charged to the process-wide bootstrap scope quarantines nothing, so a \
+         second tree under the same host governor still completes its scan"
+    );
+    assert!(other.paths().contains(&"a/f".to_string()));
+    assert!(
+        first.paths().contains(&"mnt/inner/deep".to_string()) || !first.paths().contains(&"mnt/inner".to_string()),
+        "the first tree's healthy work continued around the stuck resolution"
+    );
 }
 
 #[test]

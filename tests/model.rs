@@ -597,7 +597,18 @@ fn domained_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
             break;
         }
     }
-    h.run_round();
+    for _ in 0..50 {
+        h.run_round();
+        if h.health().reconciliation.last_round == Some(RoundResult::Successful) && h.pending_jobs().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        h.health().reconciliation.last_round,
+        Some(RoundResult::Successful),
+        "seed {seed}: the multi-domain history never reached a successful round"
+    );
+    assert!(h.pending_jobs().is_empty(), "seed {seed}: the history settled with pending jobs");
     (h, fs, known)
 }
 

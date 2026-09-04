@@ -4,29 +4,55 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rustix::fs::{AtFlags, CWD, FileType, IFlags, Statx, StatxAttributes, StatxFlags, ioctl_getflags, statx};
+use rustix::fs::{
+    AtFlags, CWD, FileType, IFlags, Mode, OFlags, Statx, StatxAttributes, StatxFlags, ioctl_getflags, statx,
+};
 use rustix::io::Errno;
 
 use super::{
     AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
-    DomainIdentity, DomainKey, DomainProbe, FilesystemSemantics, IdentityReliability, IdentitySource, IdentitySpace,
-    IdentitySpaceKey, KindSource, MediaHint, MetadataSources, ProbeError, ProbeResult, TimestampGranularity,
-    TransportHint, WatcherAvailability, WatcherCapabilities, WatcherScope,
+    DomainIdentity, DomainKey, DomainProbe, FilesystemInstance, FilesystemInstanceKey, FilesystemSemantics,
+    IdentityReliability, IdentitySource, IdentitySpace, IdentitySpaceKey, KindSource, MediaHint, MetadataSources,
+    ProbeError, ProbeResult, TimestampGranularity, TransportHint, WatcherAvailability, WatcherCapabilities,
+    WatcherScope,
 };
 use crate::path::CaseSensitivity;
 
 const STATX_MNT_ID_UNIQUE: StatxFlags = StatxFlags::from_bits_retain(0x4000);
 const FS_CASEFOLD_FL: IFlags = IFlags::from_bits_retain(0x4000_0000);
 const MOUNTINFO: &str = "/proc/self/mountinfo";
+const PROBE_MASK: StatxFlags = StatxFlags::TYPE.union(STATX_MNT_ID_UNIQUE).union(StatxFlags::MNT_ID);
+const PROBE_FLAGS: AtFlags = AtFlags::NO_AUTOMOUNT.union(AtFlags::SYMLINK_NOFOLLOW).union(AtFlags::STATX_DONT_SYNC);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Declarations {
+    timestamp_granularity: HashMap<String, TimestampGranularity>,
+    case: HashMap<String, DomainCaseSensitivity>,
+}
 
 #[derive(Default)]
 pub struct LinuxProbe {
+    declarations: Declarations,
     instances: Mutex<HashMap<u64, DomainCapabilities>>,
 }
 
 impl LinuxProbe {
     pub fn new() -> LinuxProbe {
         LinuxProbe::default()
+    }
+
+    pub fn declare_timestamp_granularity(
+        mut self,
+        fs_type: impl Into<String>,
+        granularity: TimestampGranularity,
+    ) -> LinuxProbe {
+        self.declarations.timestamp_granularity.insert(fs_type.into(), granularity);
+        self
+    }
+
+    pub fn declare_case(mut self, fs_type: impl Into<String>, case: DomainCaseSensitivity) -> LinuxProbe {
+        self.declarations.case.insert(fs_type.into(), case);
+        self
     }
 
     fn cached(&self, mount: u64) -> Option<DomainCapabilities> {
@@ -45,7 +71,7 @@ impl LinuxProbe {
         {
             return cached;
         }
-        let capabilities = capabilities_of(instance_of(mount, device).as_ref());
+        let capabilities = capabilities_of(instance_of(mount, device).as_ref(), &self.declarations);
         if let MountId::Unique(id) = mount {
             self.store(id, &capabilities);
         }
@@ -55,14 +81,12 @@ impl LinuxProbe {
 
 impl DomainProbe for LinuxProbe {
     fn probe(&self, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError> {
-        let mask = StatxFlags::TYPE | STATX_MNT_ID_UNIQUE | StatxFlags::MNT_ID;
-        let flags = AtFlags::NO_AUTOMOUNT | AtFlags::SYMLINK_NOFOLLOW;
-        let stat = statx(CWD, directory, flags, mask).map_err(probe_error)?;
+        let stat = statx(CWD, directory, PROBE_FLAGS, PROBE_MASK).map_err(probe_error)?;
         if FileType::from_raw_mode(u32::from(stat.stx_mode)) != FileType::Directory {
             return Err(ProbeError::NotDirectory);
         }
 
-        let mount = mount_id(&stat);
+        let mount = mount_id(stat.stx_mask, stat.stx_mnt_id);
         let device = Device { major: stat.stx_dev_major, minor: stat.stx_dev_minor };
         let at_mount_root = mount_root(&stat);
         let identity = identity_of(mount, device);
@@ -88,7 +112,8 @@ impl DomainProbe for LinuxProbe {
 }
 
 fn directory_case(directory: &Path) -> Option<CaseSensitivity> {
-    let handle = fs::File::open(directory).ok()?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let handle = rustix::fs::open(directory, flags, Mode::empty()).ok()?;
     let flags = ioctl_getflags(&handle).ok()?;
     Some(if flags.contains(FS_CASEFOLD_FL) { CaseSensitivity::Insensitive } else { CaseSensitivity::Sensitive })
 }
@@ -110,22 +135,25 @@ enum MountId {
 struct Instance {
     fs_type: String,
     source: Option<String>,
+    device: Option<Device>,
 }
 
-fn mount_id(stat: &Statx) -> MountId {
-    if stat.stx_mask & STATX_MNT_ID_UNIQUE.bits() != 0 {
-        MountId::Unique(stat.stx_mnt_id)
-    } else if stat.stx_mask & StatxFlags::MNT_ID.bits() != 0 {
-        MountId::Reusable(stat.stx_mnt_id)
+fn mount_id(mask: u32, mnt_id: u64) -> MountId {
+    if mask & STATX_MNT_ID_UNIQUE.bits() != 0 {
+        MountId::Unique(mnt_id)
+    } else if mask & StatxFlags::MNT_ID.bits() != 0 {
+        MountId::Reusable(mnt_id)
     } else {
         MountId::Device
     }
 }
 
 fn mount_root(stat: &Statx) -> Option<bool> {
-    stat.stx_attributes_mask
-        .contains(StatxAttributes::MOUNT_ROOT)
-        .then(|| stat.stx_attributes.contains(StatxAttributes::MOUNT_ROOT))
+    mount_root_of(stat.stx_attributes_mask, stat.stx_attributes)
+}
+
+fn mount_root_of(supported: StatxAttributes, attributes: StatxAttributes) -> Option<bool> {
+    supported.contains(StatxAttributes::MOUNT_ROOT).then(|| attributes.contains(StatxAttributes::MOUNT_ROOT))
 }
 
 fn identity_of(mount: MountId, device: Device) -> DomainIdentity {
@@ -229,8 +257,9 @@ fn semantics_of(fs_type: &str) -> FilesystemSemantics {
 fn case_of(fs_type: &str) -> DomainCaseSensitivity {
     match fs_type {
         "ext4" | "f2fs" => DomainCaseSensitivity::PerDirectory { domain_default: CaseSensitivity::Sensitive },
-        "ext2" | "ext3" | "btrfs" | "xfs" | "zfs" | "bcachefs" | "tmpfs" | "ramfs" | "devtmpfs" | "proc" | "sysfs"
-        | "cgroup2" => DomainCaseSensitivity::Sensitive,
+        "ext2" | "ext3" | "btrfs" | "bcachefs" | "tmpfs" | "ramfs" | "devtmpfs" | "proc" | "sysfs" | "cgroup2" => {
+            DomainCaseSensitivity::Sensitive
+        }
         "ntfs3" | "ntfs" | "exfat" | "vfat" | "msdos" => DomainCaseSensitivity::Insensitive,
         _ => DomainCaseSensitivity::Unknown,
     }
@@ -238,12 +267,13 @@ fn case_of(fs_type: &str) -> DomainCaseSensitivity {
 
 fn granularity_of(fs_type: &str) -> TimestampGranularity {
     match fs_type {
-        "ext4" | "btrfs" | "xfs" | "f2fs" | "zfs" | "bcachefs" | "tmpfs" | "ramfs" | "devtmpfs" => {
+        "btrfs" | "xfs" | "f2fs" | "zfs" | "bcachefs" | "tmpfs" | "ramfs" | "devtmpfs" => {
             TimestampGranularity::Resolution(Duration::from_nanos(1))
         }
         "ext2" | "ext3" => TimestampGranularity::Resolution(Duration::from_secs(1)),
         "ntfs3" | "ntfs" => TimestampGranularity::Resolution(Duration::from_nanos(100)),
         "exfat" => TimestampGranularity::Resolution(Duration::from_millis(10)),
+        "vfat" | "msdos" => TimestampGranularity::Resolution(Duration::from_secs(2)),
         _ => TimestampGranularity::Unknown,
     }
 }
@@ -262,8 +292,8 @@ fn reliability_of(fs_type: &str, backing: Backing) -> IdentityReliability {
 
 fn observes_external_writers(backing: Backing) -> Answer {
     match backing {
-        Backing::Block | Backing::Memory | Backing::Pseudo | Backing::MultiDevice => Answer::Yes,
-        Backing::Network | Backing::Userspace | Backing::Overlay => Answer::No,
+        Backing::Block | Backing::Memory | Backing::MultiDevice => Answer::Yes,
+        Backing::Network | Backing::Userspace | Backing::Overlay | Backing::Pseudo => Answer::No,
         Backing::Unknown => Answer::Unknown,
     }
 }
@@ -276,7 +306,10 @@ fn watcher_of(backing: Backing) -> WatcherCapabilities {
         Answer::Unknown => Answer::Unknown,
     };
     WatcherCapabilities {
-        availability: WatcherAvailability::Available,
+        availability: match backing {
+            Backing::Pseudo => WatcherAvailability::Unavailable,
+            _ => WatcherAvailability::Available,
+        },
         scope: WatcherScope::PerDirectory,
         observes_external_writers: external,
         can_lose_events: Answer::Yes,
@@ -314,17 +347,23 @@ fn topology_for(transport: TransportHint) -> AccessTopology {
     }
 }
 
-fn capabilities_of(instance: Option<&Instance>) -> DomainCapabilities {
+fn capabilities_of(instance: Option<&Instance>, declarations: &Declarations) -> DomainCapabilities {
     let fs_type = instance.map_or("", |instance| instance.fs_type.as_str());
     let backing = backing_of(fs_type);
     let semantics = semantics_of(fs_type);
     let (topology, transport, media) = topology_of(backing, instance.and_then(|i| i.source.as_deref()));
-    let case = case_of(fs_type);
-    let granularity = granularity_of(fs_type);
+    let case = declarations.case.get(fs_type).copied().unwrap_or_else(|| case_of(fs_type));
+    let granularity =
+        declarations.timestamp_granularity.get(fs_type).copied().unwrap_or_else(|| granularity_of(fs_type));
     let reliability = reliability_of(fs_type, backing);
     let watcher = watcher_of(backing);
+    let filesystem = match instance.and_then(|instance| instance.device) {
+        Some(device) => FilesystemInstance::Known(FilesystemInstanceKey::linux_superblock(device.major, device.minor)),
+        None => FilesystemInstance::Unknown,
+    };
     DomainCapabilities {
         sources: DeclarationSources {
+            filesystem: detected(filesystem != FilesystemInstance::Unknown),
             semantics: detected(semantics != FilesystemSemantics::Unknown),
             topology: detected(topology != AccessTopology::Unknown),
             transport: detected(transport != TransportHint::Unknown),
@@ -336,6 +375,7 @@ fn capabilities_of(instance: Option<&Instance>) -> DomainCapabilities {
             observation: DeclarationSource::Declared,
             watcher: DeclarationSource::Declared,
         },
+        filesystem,
         semantics,
         topology,
         transport,
@@ -393,28 +433,66 @@ fn sysfs_flag(path: &Path) -> Option<bool> {
     }
 }
 
-fn transport_of(disk: &Path) -> TransportHint {
-    let mut scsi = false;
-    let mut ata = false;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChainNode {
+    name: String,
+    subsystem: Option<String>,
+}
+
+fn device_chain(disk: &Path) -> Vec<ChainNode> {
+    let mut chain = Vec::new();
     let mut node = disk.to_path_buf();
     while node.starts_with("/sys/devices") {
-        if node.file_name().and_then(|name| name.to_str()).is_some_and(is_ata_host) {
-            ata = true;
-        }
-        match subsystem_of(&node).as_deref() {
-            Some("nvme") => return TransportHint::Nvme,
-            Some("usb") => return TransportHint::Usb,
-            Some("mmc") => return TransportHint::Sd,
-            Some("virtio") => return TransportHint::Virtual,
-            Some("scsi") => scsi = true,
-            _ => {}
-        }
+        let name = node.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_owned();
+        chain.push(ChainNode { name, subsystem: subsystem_of(&node) });
         match node.parent() {
             Some(parent) => node = parent.to_path_buf(),
             None => break,
         }
     }
-    if scsi && ata { TransportHint::Sata } else { TransportHint::Unknown }
+    chain
+}
+
+fn transport_of(disk: &Path) -> TransportHint {
+    transport_from_chain(&device_chain(disk))
+}
+
+fn transport_from_chain(chain: &[ChainNode]) -> TransportHint {
+    let mut scsi = false;
+    let mut ata = false;
+    let mut sas = false;
+    let mut fibre_channel = false;
+    let mut iscsi = false;
+    for node in chain {
+        if is_ata_host(&node.name) {
+            ata = true;
+        }
+        match node.subsystem.as_deref() {
+            Some("nvme") => return TransportHint::Nvme,
+            Some("usb") => return TransportHint::Usb,
+            Some("mmc") => return TransportHint::Sd,
+            Some("virtio") => return TransportHint::Virtual,
+            Some("iscsi_session" | "iscsi_host" | "iscsi_connection") => iscsi = true,
+            Some("fc_host" | "fc_remote_ports" | "fc_transport") => fibre_channel = true,
+            Some("sas_device" | "sas_end_device" | "sas_port" | "sas_phy" | "sas_expander" | "sas_host") => {
+                sas = true;
+            }
+            Some("ata_port" | "ata_link" | "ata_device") => ata = true,
+            Some("scsi") => scsi = true,
+            _ => {}
+        }
+    }
+    if iscsi {
+        TransportHint::Iscsi
+    } else if fibre_channel {
+        TransportHint::FibreChannel
+    } else if sas {
+        TransportHint::Sas
+    } else if scsi && ata {
+        TransportHint::Sata
+    } else {
+        TransportHint::Unknown
+    }
 }
 
 fn is_ata_host(name: &str) -> bool {
@@ -435,10 +513,13 @@ fn statmount_instance(mount: u64) -> Option<Instance> {
     const REQUEST_SIZE: usize = 24;
     const REQUEST_FLAGS: libc::c_uint = 0;
     const REQUEST_MASK: u64 = 0x1 | 0x2 | 0x20 | 0x100 | 0x200;
+    const MASK_SB_BASIC: u64 = 0x1;
     const MASK_FS_TYPE: u64 = 0x20;
     const MASK_FS_SUBTYPE: u64 = 0x100;
     const MASK_SB_SOURCE: u64 = 0x200;
     const OFFSET_MASK: usize = 8;
+    const OFFSET_SB_DEV_MAJOR: usize = 16;
+    const OFFSET_SB_DEV_MINOR: usize = 20;
     const OFFSET_FS_TYPE: usize = 36;
     const OFFSET_FS_SUBTYPE: usize = 120;
     const OFFSET_SB_SOURCE: usize = 124;
@@ -463,12 +544,17 @@ fn statmount_instance(mount: u64) -> Option<Instance> {
         if mask & MASK_FS_SUBTYPE != 0 { string_at(strings, read_u32(&buffer, OFFSET_FS_SUBTYPE)?) } else { None };
     let source =
         if mask & MASK_SB_SOURCE != 0 { string_at(strings, read_u32(&buffer, OFFSET_SB_SOURCE)?) } else { None };
+    let device = if mask & MASK_SB_BASIC != 0 {
+        Some(Device { major: read_u32(&buffer, OFFSET_SB_DEV_MAJOR)?, minor: read_u32(&buffer, OFFSET_SB_DEV_MINOR)? })
+    } else {
+        None
+    };
 
     let fs_type = match (fs_type?, subtype) {
         (base, Some(subtype)) if base == "fuse" => format!("fuse.{subtype}"),
         (base, _) => base,
     };
-    Some(Instance { fs_type, source })
+    Some(Instance { fs_type, source, device })
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -514,7 +600,7 @@ struct MountLine<'a> {
 
 impl MountLine<'_> {
     fn instance(&self) -> Instance {
-        Instance { fs_type: self.fs_type.to_owned(), source: Some(unescape(self.source)) }
+        Instance { fs_type: self.fs_type.to_owned(), source: Some(unescape(self.source)), device: Some(self.device) }
     }
 }
 
@@ -578,13 +664,28 @@ mod tests {
 
     const LINE: &str = "36 35 98:0 /a /mnt/point rw,noatime master:1 - ext4 /dev/root rw,errors=continue";
 
+    fn instance(fs_type: &str) -> Instance {
+        Instance { fs_type: fs_type.to_owned(), source: None, device: None }
+    }
+
+    fn table(fs_type: &str) -> DomainCapabilities {
+        capabilities_of(Some(&instance(fs_type)), &Declarations::default())
+    }
+
     #[test]
     fn parses_a_mountinfo_line_past_its_optional_fields() {
         let entry = parse_mountinfo(LINE).expect("mountinfo line");
         assert_eq!(entry.mount, 36);
         assert_eq!(entry.device, Device { major: 98, minor: 0 });
         assert_eq!(entry.fs_type, "ext4");
-        assert_eq!(entry.instance(), Instance { fs_type: "ext4".to_owned(), source: Some("/dev/root".to_owned()) });
+        assert_eq!(
+            entry.instance(),
+            Instance {
+                fs_type: "ext4".to_owned(),
+                source: Some("/dev/root".to_owned()),
+                device: Some(Device { major: 98, minor: 0 })
+            }
+        );
     }
 
     #[test]
@@ -618,9 +719,11 @@ mod tests {
 
     #[test]
     fn a_domain_without_a_resolved_instance_declares_unknown_for_every_detected_field() {
-        let capabilities = capabilities_of(None);
+        let capabilities = capabilities_of(None, &Declarations::default());
+        assert_eq!(capabilities.filesystem, FilesystemInstance::Unknown);
         assert_eq!(capabilities.semantics, FilesystemSemantics::Unknown);
         assert_eq!(capabilities.topology, AccessTopology::Unknown);
+        assert_eq!(capabilities.sources.filesystem, DeclarationSource::Unknown);
         assert_eq!(capabilities.sources.semantics, DeclarationSource::Unknown);
         assert_eq!(capabilities.sources.topology, DeclarationSource::Unknown);
         assert_eq!(capabilities.watcher.observes_external_writers, Answer::Unknown);
@@ -628,9 +731,22 @@ mod tests {
     }
 
     #[test]
+    fn a_resolved_instance_names_the_superblock_it_supplies() {
+        let resolved =
+            Instance { fs_type: "btrfs".to_owned(), source: None, device: Some(Device { major: 0, minor: 29 }) };
+        let capabilities = capabilities_of(Some(&resolved), &Declarations::default());
+        assert_eq!(
+            capabilities.filesystem,
+            FilesystemInstance::Known(FilesystemInstanceKey::linux_superblock(0, 29)),
+            "RFC 14.3: a domain records the underlying filesystem instance where the platform exposes it"
+        );
+        assert_eq!(capabilities.sources.filesystem, DeclarationSource::Detected);
+    }
+
+    #[test]
     fn a_network_domain_declares_that_it_cannot_observe_external_writers() {
-        let instance = Instance { fs_type: "nfs4".to_owned(), source: Some("server:/export".to_owned()) };
-        let capabilities = capabilities_of(Some(&instance));
+        let resolved = Instance { fs_type: "nfs4".to_owned(), source: Some("server:/export".to_owned()), device: None };
+        let capabilities = capabilities_of(Some(&resolved), &Declarations::default());
         assert_eq!(capabilities.semantics, FilesystemSemantics::Nfs);
         assert_eq!(capabilities.topology, AccessTopology::Remote);
         assert_eq!(capabilities.transport, TransportHint::Network);
@@ -641,15 +757,255 @@ mod tests {
 
     #[test]
     fn a_per_directory_case_attribute_is_declared_as_such() {
-        let instance = Instance { fs_type: "ext4".to_owned(), source: None };
-        let capabilities = capabilities_of(Some(&instance));
+        let capabilities = table("ext4");
         assert_eq!(
             capabilities.case,
             DomainCaseSensitivity::PerDirectory { domain_default: CaseSensitivity::Sensitive }
         );
         assert_eq!(capabilities.sources.case, DeclarationSource::Declared);
-        assert_eq!(capabilities.timestamp_granularity, TimestampGranularity::Resolution(Duration::from_nanos(1)));
+        assert_eq!(
+            capabilities.timestamp_granularity,
+            TimestampGranularity::Unknown,
+            "RFC 10.3: ext4 stores nanosecond timestamps only with 256-byte inodes, which no query reports, so the \
+             table declares Unknown"
+        );
+        assert_eq!(capabilities.sources.timestamp_granularity, DeclarationSource::Unknown);
         assert_eq!(capabilities.identity_reliability, IdentityReliability::Stable);
+    }
+
+    #[test]
+    fn a_declared_override_replaces_the_table_entry_for_one_filesystem_type() {
+        let declarations = LinuxProbe::new()
+            .declare_timestamp_granularity("ext4", TimestampGranularity::Resolution(Duration::from_nanos(1)))
+            .declare_case("xfs", DomainCaseSensitivity::Insensitive)
+            .declarations;
+        let ext4 = capabilities_of(Some(&instance("ext4")), &declarations);
+        assert_eq!(ext4.timestamp_granularity, TimestampGranularity::Resolution(Duration::from_nanos(1)));
+        assert_eq!(ext4.sources.timestamp_granularity, DeclarationSource::Declared);
+        let xfs = capabilities_of(Some(&instance("xfs")), &declarations);
+        assert_eq!(xfs.case, DomainCaseSensitivity::Insensitive, "RFC 14.3: table-driven with a declared override");
+        assert_eq!(capabilities_of(Some(&instance("ext3")), &declarations).case, DomainCaseSensitivity::Sensitive);
+    }
+
+    #[test]
+    fn xfs_and_zfs_declare_unknown_case_because_the_format_can_be_insensitive() {
+        for fs_type in ["xfs", "zfs"] {
+            let capabilities = table(fs_type);
+            assert_eq!(
+                capabilities.case,
+                DomainCaseSensitivity::Unknown,
+                "RFC 10.3: {fs_type} can be formatted case-insensitive and exposes no query, so Unknown is required"
+            );
+            assert_eq!(capabilities.sources.case, DeclarationSource::Unknown);
+            assert_eq!(capabilities.identity_reliability, IdentityReliability::Stable);
+            assert_eq!(capabilities.timestamp_granularity, TimestampGranularity::Resolution(Duration::from_nanos(1)));
+        }
+        assert_eq!(table("zfs").topology, AccessTopology::Unknown);
+    }
+
+    #[test]
+    fn a_pseudo_filesystem_declares_its_watcher_unavailable_and_requires_polling() {
+        for fs_type in ["proc", "sysfs", "cgroup2"] {
+            let watcher = table(fs_type).watcher;
+            assert_eq!(
+                watcher.availability,
+                WatcherAvailability::Unavailable,
+                "RFC 10.4: inotify cannot monitor a pseudo-filesystem such as {fs_type}, so the watcher is declared \
+                 unavailable, never available with silent gaps"
+            );
+            assert_eq!(watcher.observes_external_writers, Answer::No, "{fs_type}");
+            assert_eq!(watcher.polling_fallback_required, Answer::Yes, "{fs_type}");
+        }
+        assert_eq!(table("tmpfs").watcher.availability, WatcherAvailability::Available);
+        assert_eq!(table("ext4").watcher.availability, WatcherAvailability::Available);
+    }
+
+    #[test]
+    fn tmpfs_is_local_memory_storage_with_stable_identity() {
+        let capabilities = table("tmpfs");
+        assert_eq!(capabilities.semantics, FilesystemSemantics::Tmpfs);
+        assert_eq!(
+            (capabilities.topology, capabilities.transport, capabilities.media),
+            (AccessTopology::Local, TransportHint::Memory, MediaHint::Memory)
+        );
+        assert_eq!(capabilities.case, DomainCaseSensitivity::Sensitive);
+        assert_eq!(capabilities.identity_reliability, IdentityReliability::Stable);
+        assert_eq!(capabilities.watcher.observes_external_writers, Answer::Yes);
+    }
+
+    #[test]
+    fn overlay_declares_advisory_identity_and_no_view_of_external_writers() {
+        let capabilities = table("overlay");
+        assert_eq!(capabilities.semantics, FilesystemSemantics::Overlay);
+        assert_eq!(capabilities.identity_reliability, IdentityReliability::Advisory);
+        assert!(!capabilities.identity_reliability.establishes_rename());
+        assert_eq!(capabilities.watcher.observes_external_writers, Answer::No);
+        assert_eq!(capabilities.watcher.polling_fallback_required, Answer::Yes);
+        assert_eq!(capabilities.topology, AccessTopology::Unknown);
+    }
+
+    #[test]
+    fn fat_family_declares_no_identity_insensitive_names_and_coarse_timestamps() {
+        for fs_type in ["vfat", "msdos", "exfat"] {
+            let capabilities = table(fs_type);
+            assert_eq!(capabilities.identity_reliability, IdentityReliability::None, "{fs_type}");
+            assert_eq!(capabilities.case, DomainCaseSensitivity::Insensitive, "{fs_type}");
+        }
+        assert_eq!(table("vfat").timestamp_granularity, TimestampGranularity::Resolution(Duration::from_secs(2)));
+        assert_eq!(table("exfat").timestamp_granularity, TimestampGranularity::Resolution(Duration::from_millis(10)));
+        assert_eq!(table("exfat").semantics, FilesystemSemantics::ExFat);
+        assert_eq!(table("msdos").semantics, FilesystemSemantics::Fat);
+    }
+
+    #[test]
+    fn mounted_smb_and_ceph_are_remote_with_advisory_identity_and_server_decided_case() {
+        for fs_type in ["cifs", "smb3", "ceph"] {
+            let capabilities = table(fs_type);
+            assert_eq!(capabilities.topology, AccessTopology::Remote, "{fs_type}");
+            assert_eq!(capabilities.transport, TransportHint::Network, "{fs_type}");
+            assert_eq!(capabilities.identity_reliability, IdentityReliability::Advisory, "{fs_type}");
+            assert_eq!(capabilities.case, DomainCaseSensitivity::Unknown, "{fs_type}");
+            assert_eq!(capabilities.watcher.observes_external_writers, Answer::No, "{fs_type}");
+        }
+        assert_eq!(table("cifs").semantics, FilesystemSemantics::Smb);
+        assert_eq!(table("ceph").semantics, FilesystemSemantics::Other("ceph".to_owned()));
+    }
+
+    #[test]
+    fn fuse_and_sshfs_declare_unknown_for_everything_the_daemon_decides() {
+        for fs_type in ["fuse", "fuse.sshfs", "fuse.gvfsd-fuse"] {
+            let capabilities = table(fs_type);
+            assert_eq!(capabilities.semantics, FilesystemSemantics::Fuse, "{fs_type}");
+            assert_eq!(capabilities.topology, AccessTopology::Userspace, "{fs_type}");
+            assert_eq!(capabilities.transport, TransportHint::Unknown, "{fs_type}");
+            assert_eq!(capabilities.case, DomainCaseSensitivity::Unknown, "{fs_type}");
+            assert_eq!(capabilities.timestamp_granularity, TimestampGranularity::Unknown, "{fs_type}");
+            assert_eq!(capabilities.identity_reliability, IdentityReliability::Advisory, "{fs_type}");
+            assert_eq!(capabilities.watcher.observes_external_writers, Answer::No, "{fs_type}");
+            assert_eq!(capabilities.watcher.polling_fallback_required, Answer::Yes, "{fs_type}");
+        }
+    }
+
+    #[test]
+    fn the_probe_asks_statx_for_kernel_local_facts_without_forcing_a_server_round_trip() {
+        assert!(PROBE_FLAGS.contains(AtFlags::STATX_DONT_SYNC));
+        assert!(PROBE_FLAGS.contains(AtFlags::NO_AUTOMOUNT));
+        assert!(PROBE_FLAGS.contains(AtFlags::SYMLINK_NOFOLLOW));
+        assert!(!PROBE_FLAGS.contains(AtFlags::STATX_FORCE_SYNC));
+        assert_eq!(PROBE_MASK, StatxFlags::TYPE | STATX_MNT_ID_UNIQUE | StatxFlags::MNT_ID);
+    }
+
+    #[test]
+    fn the_mount_identifier_prefers_the_unique_id_then_the_reusable_id_then_the_device() {
+        assert_eq!(mount_id(STATX_MNT_ID_UNIQUE.bits() | StatxFlags::TYPE.bits(), 7), MountId::Unique(7));
+        assert_eq!(mount_id(StatxFlags::MNT_ID.bits(), 7), MountId::Reusable(7));
+        assert_eq!(mount_id(StatxFlags::TYPE.bits(), 7), MountId::Device);
+        let device = Device { major: 8, minor: 1 };
+        assert_eq!(identity_of(MountId::Unique(7), device), DomainIdentity::Known(DomainKey::linux_unique_mount(7)));
+        assert_eq!(
+            identity_of(MountId::Reusable(7), device),
+            DomainIdentity::Known(DomainKey::linux_reusable_mount(7))
+        );
+        assert_eq!(identity_of(MountId::Device, device), DomainIdentity::Known(DomainKey::linux_device(8, 1)));
+    }
+
+    #[test]
+    fn the_mount_root_attribute_is_read_only_where_the_kernel_supports_it() {
+        assert_eq!(mount_root_of(StatxAttributes::empty(), StatxAttributes::MOUNT_ROOT), None);
+        assert_eq!(mount_root_of(StatxAttributes::MOUNT_ROOT, StatxAttributes::MOUNT_ROOT), Some(true));
+        assert_eq!(mount_root_of(StatxAttributes::MOUNT_ROOT, StatxAttributes::empty()), Some(false));
+    }
+
+    #[test]
+    fn on_the_device_fallback_only_the_mount_root_attribute_proves_a_crossing() {
+        let parent =
+            ProbeResult { identity: DomainIdentity::Known(DomainKey::linux_device(8, 1)), ..ProbeResult::unknown() };
+        let other = DomainIdentity::Known(DomainKey::linux_device(0, 40));
+        assert_eq!(
+            crossing(Some(&parent), &other, MountId::Device, Some(false)),
+            Crossing::Inconclusive,
+            "RFC 14.3: a changed st_dev alone is not a crossing, a Btrfs subvolume changes it within one mount"
+        );
+        assert_eq!(crossing(Some(&parent), &other, MountId::Device, None), Crossing::Inconclusive);
+        assert_eq!(crossing(Some(&parent), &other, MountId::Device, Some(true)), Crossing::Proven);
+        let same = DomainIdentity::Known(DomainKey::linux_device(8, 1));
+        assert_eq!(
+            crossing(Some(&parent), &same, MountId::Device, Some(true)),
+            Crossing::Proven,
+            "RFC 14.3: bind mounts share one st_dev, so an equal st_dev is not proof of the opposite"
+        );
+        let reusable = DomainIdentity::Known(DomainKey::linux_reusable_mount(3));
+        let reusable_parent = ProbeResult { identity: reusable.clone(), ..ProbeResult::unknown() };
+        assert_eq!(crossing(Some(&reusable_parent), &reusable, MountId::Reusable(3), None), Crossing::NotCrossed);
+        let next = DomainIdentity::Known(DomainKey::linux_reusable_mount(4));
+        assert_eq!(crossing(Some(&reusable_parent), &next, MountId::Reusable(4), None), Crossing::Proven);
+        assert_eq!(crossing(None, &next, MountId::Reusable(4), Some(true)), Crossing::NotCrossed);
+    }
+
+    fn chain(nodes: &[(&str, Option<&str>)]) -> Vec<ChainNode> {
+        nodes
+            .iter()
+            .map(|(name, subsystem)| ChainNode { name: (*name).to_owned(), subsystem: subsystem.map(str::to_owned) })
+            .collect()
+    }
+
+    #[test]
+    fn the_device_chain_classifies_iscsi_fibre_channel_sas_and_sata_transports() {
+        let iscsi = chain(&[
+            ("sda", Some("block")),
+            ("2:0:0:0", Some("scsi")),
+            ("target2:0:0", Some("scsi")),
+            ("session1", Some("iscsi_session")),
+            ("host2", Some("scsi")),
+            ("platform", None),
+        ]);
+        assert_eq!(
+            transport_from_chain(&iscsi),
+            TransportHint::Iscsi,
+            "RFC 10.3: an ext4 filesystem reached over iSCSI is topologically remote block storage"
+        );
+        assert_eq!(topology_for(TransportHint::Iscsi), AccessTopology::Remote);
+        let fibre = chain(&[
+            ("sdb", Some("block")),
+            ("3:0:1:0", Some("scsi")),
+            ("target3:0:1", Some("scsi")),
+            ("rport-3:0-1", Some("fc_remote_ports")),
+            ("host3", Some("scsi")),
+            ("0000:03:00.0", Some("pci")),
+        ]);
+        assert_eq!(transport_from_chain(&fibre), TransportHint::FibreChannel);
+        let sas = chain(&[
+            ("sdc", Some("block")),
+            ("4:0:2:0", Some("scsi")),
+            ("target4:0:2", Some("scsi")),
+            ("end_device-4:2", Some("sas_device")),
+            ("port-4:2", Some("sas_port")),
+            ("host4", Some("scsi")),
+        ]);
+        assert_eq!(transport_from_chain(&sas), TransportHint::Sas);
+        let sata = chain(&[
+            ("sdd", Some("block")),
+            ("0:0:0:0", Some("scsi")),
+            ("target0:0:0", Some("scsi")),
+            ("host0", Some("scsi")),
+            ("ata1", Some("ata_port")),
+            ("0000:00:17.0", Some("pci")),
+        ]);
+        assert_eq!(transport_from_chain(&sata), TransportHint::Sata);
+        let usb = chain(&[
+            ("sde", Some("block")),
+            ("5:0:0:0", Some("scsi")),
+            ("host5", Some("scsi")),
+            ("2-1:1.0", Some("usb")),
+            ("usb2", Some("usb")),
+        ]);
+        assert_eq!(transport_from_chain(&usb), TransportHint::Usb);
+        let bare = chain(&[("sdf", Some("block")), ("6:0:0:0", Some("scsi")), ("host6", Some("scsi"))]);
+        assert_eq!(transport_from_chain(&bare), TransportHint::Unknown);
+        assert_eq!(
+            transport_from_chain(&chain(&[("nvme0n1", Some("block")), ("nvme0", Some("nvme"))])),
+            TransportHint::Nvme
+        );
     }
 
     fn mount_points() -> Vec<String> {
@@ -659,13 +1015,11 @@ mod tests {
 
     #[test]
     fn statmount_and_mountinfo_agree_wherever_both_resolve_an_instance() {
-        let mask = StatxFlags::TYPE | STATX_MNT_ID_UNIQUE | StatxFlags::MNT_ID;
-        let flags = AtFlags::NO_AUTOMOUNT | AtFlags::SYMLINK_NOFOLLOW;
         for path in mount_points() {
-            let Ok(stat) = statx(CWD, path.as_str(), flags, mask) else {
+            let Ok(stat) = statx(CWD, path.as_str(), PROBE_FLAGS, PROBE_MASK) else {
                 continue;
             };
-            let MountId::Unique(mount) = mount_id(&stat) else {
+            let MountId::Unique(mount) = mount_id(stat.stx_mask, stat.stx_mnt_id) else {
                 continue;
             };
             let Some(direct) = statmount_instance(mount) else {
@@ -676,6 +1030,11 @@ mod tests {
                 continue;
             };
             assert_eq!(direct.fs_type, fallback.fs_type, "{path}");
+            assert_eq!(
+                direct.device, fallback.device,
+                "RFC 14.3: statmount's superblock device and mountinfo's major:minor name one filesystem instance \
+                 for {path}"
+            );
         }
     }
 
@@ -687,6 +1046,11 @@ mod tests {
             };
             let capabilities = &result.capabilities;
             let sources = &capabilities.sources;
+            assert_eq!(
+                capabilities.filesystem != FilesystemInstance::Unknown,
+                sources.filesystem != DeclarationSource::Unknown,
+                "{path}"
+            );
             assert_eq!(
                 capabilities.semantics != FilesystemSemantics::Unknown,
                 sources.semantics != DeclarationSource::Unknown,
@@ -706,6 +1070,40 @@ mod tests {
             if capabilities.transport != TransportHint::Unknown {
                 assert_ne!(capabilities.topology, AccessTopology::Unknown, "{path}");
             }
+        }
+    }
+
+    #[test]
+    fn two_mounts_of_one_btrfs_filesystem_share_the_instance_and_split_the_identity_space_per_subvolume() {
+        let probe = LinuxProbe::new();
+        let mut btrfs: Vec<(String, ProbeResult)> = Vec::new();
+        for path in mount_points() {
+            let Ok(result) = probe.probe(Path::new(&path), None) else {
+                continue;
+            };
+            if result.capabilities.semantics == FilesystemSemantics::Btrfs {
+                btrfs.push((path, result));
+            }
+        }
+        let mut pairs = 0;
+        for (index, (first_path, first)) in btrfs.iter().enumerate() {
+            for (second_path, second) in btrfs.iter().skip(index + 1) {
+                if !first.capabilities.same_filesystem_as(&second.capabilities) {
+                    continue;
+                }
+                pairs += 1;
+                assert_ne!(first.identity, second.identity, "{first_path} and {second_path} are two mounts");
+                if first.capabilities.identity_space != second.capabilities.identity_space {
+                    assert!(
+                        !first.capabilities.identities_comparable(&second.capabilities),
+                        "RFC 7.1: two subvolumes of one Btrfs filesystem are two identity spaces; {first_path} and \
+                         {second_path}"
+                    );
+                }
+            }
+        }
+        if btrfs.len() >= 2 {
+            assert!(pairs > 0 || btrfs.iter().all(|(_, r)| r.capabilities.filesystem == FilesystemInstance::Unknown));
         }
     }
 
@@ -782,5 +1180,22 @@ mod tests {
             }
         }
         assert!(probed > 0, "no mount on this host could be probed");
+    }
+
+    #[test]
+    fn a_symbolic_link_to_a_directory_is_never_probed_as_the_directory_it_names() {
+        let base = std::env::temp_dir().join(format!("tree-fucker-linux-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("target")).expect("target");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(base.join("target"), &link).expect("symlink");
+        assert_eq!(
+            LinuxProbe::new().probe(&link, None),
+            Err(ProbeError::NotDirectory),
+            "RFC 14.2: symbolic links are entries and are never traversed, so the probe answers for the link itself"
+        );
+        assert_eq!(directory_case(&link), None);
+        assert!(LinuxProbe::new().probe(&base.join("target"), None).is_ok());
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -96,7 +96,10 @@ impl Coordinator {
             }
             (WatchDecision::Capped, None) | (WatchDecision::NotNeeded, _) => None,
         };
-        let domain = entry.and_then(|e| self.domain_of(e));
+        let domain = match need {
+            ReadNeed::Domain => None,
+            ReadNeed::Metadata | ReadNeed::Listing | ReadNeed::Enrichment(_) => entry.and_then(|e| self.domain_of(e)),
+        };
         let origin = self.origin_of(entry, barriers);
         let now = self.now;
         let reservation = Reservation {

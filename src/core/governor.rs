@@ -718,7 +718,7 @@ impl Governor {
     }
 
     pub fn quarantined(&self, domain: Option<StorageDomainId>) -> bool {
-        self.stuck.get(&domain).copied().unwrap_or(0) > 0
+        domain.is_some() && self.stuck.get(&domain).copied().unwrap_or(0) > 0
     }
 
     pub fn in_flight_on(&self, domain: Option<StorageDomainId>) -> usize {
@@ -747,9 +747,9 @@ impl Governor {
     }
 
     pub fn window_of(&self, domain: Option<StorageDomainId>) -> usize {
-        match domain.and_then(|id| self.domains.get(&id)) {
-            Some(state) => state.window,
-            None => 1,
+        match domain {
+            Some(id) => self.domains.get(&id).map(|state| state.window).unwrap_or(1),
+            None => self.config.maximum_in_flight,
         }
     }
 

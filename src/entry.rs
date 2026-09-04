@@ -121,7 +121,7 @@ impl MetadataFields {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     pub device: u64,
-    pub inode: u64,
+    pub inode: u128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,7 +164,7 @@ pub fn entry_bytes(entry: &Entry) -> u64 {
 pub type CollisionKey<'a> = (
     &'a std::ffi::OsStr,
     u8,
-    Option<(u64, u64)>,
+    Option<(u64, u128)>,
     Option<std::time::SystemTime>,
     Option<std::time::SystemTime>,
     Option<u64>,

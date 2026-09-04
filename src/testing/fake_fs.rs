@@ -103,7 +103,7 @@ struct Inner {
     injected_position: InjectedPosition,
     watches: HashMap<WatchId, Watch>,
     next_watch: u64,
-    next_inode: u64,
+    next_inode: u128,
     clock: SystemTime,
     drop_events: bool,
     paused: bool,
@@ -1100,7 +1100,7 @@ impl Order {
                 let info = EntryInfo {
                     kind: EntryKind::File,
                     metadata: Metadata::default(),
-                    identity: Some(FileIdentity { device: 1, inode: u64::try_from(index).unwrap_or(u64::MAX) }),
+                    identity: Some(FileIdentity { device: 1, inode: u128::try_from(index).unwrap_or(u128::MAX) }),
                 };
                 Some((name.clone(), dir.join(&name).ok(), info))
             }

@@ -25,7 +25,7 @@ use crate::snapshot::Snapshot;
 use crate::update::{Health, RecoverableError, StreamError, UpdateEvent};
 
 enum Message {
-    Input(Input),
+    Input(Box<Input>),
     WatcherReady,
 }
 
@@ -204,7 +204,7 @@ impl WorkerGuard {
 
     fn finish(mut self, input: Input) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.unbounded_send(Message::Input(input));
+            let _ = tx.unbounded_send(Message::Input(Box::new(input)));
         }
     }
 }
@@ -212,7 +212,7 @@ impl WorkerGuard {
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.unbounded_send(Message::Input(Input::WorkerLost(self.loss)));
+            let _ = tx.unbounded_send(Message::Input(Box::new(Input::WorkerLost(self.loss))));
         }
     }
 }
@@ -372,7 +372,7 @@ impl Actor {
                     let sleep = self.runtime.sleep(delay);
                     self.runtime.spawn(Box::pin(async move {
                         sleep.await;
-                        let _ = tx.unbounded_send(Message::Input(Input::Timer(id)));
+                        let _ = tx.unbounded_send(Message::Input(Box::new(Input::Timer(id))));
                     }));
                 }
                 Output::Stopped(outcome) => {
@@ -414,7 +414,7 @@ impl Actor {
 
     fn dispatch(&mut self, message: Message) -> Option<TerminalOutcome> {
         match message {
-            Message::Input(input) => self.handle(input),
+            Message::Input(input) => self.handle(*input),
             Message::WatcherReady => self.drain_watcher(),
         }
     }
@@ -536,7 +536,7 @@ impl Tree {
             };
             match message {
                 Message::Input(input) => {
-                    let _ = actor.handle(input);
+                    let _ = actor.handle(*input);
                 }
                 Message::WatcherReady => {
                     let _ = actor.drain_watcher();
@@ -629,7 +629,7 @@ impl TreeHandle {
         let id = CommandId::new(self.shared.next_command.fetch_add(1, Ordering::SeqCst));
         let (tx, rx) = oneshot::channel();
         lock(&self.shared.replies).insert(id, tx);
-        if self.shared.tx.unbounded_send(Message::Input(Input::Command { id, command })).is_err() {
+        if self.shared.tx.unbounded_send(Message::Input(Box::new(Input::Command { id, command }))).is_err() {
             lock(&self.shared.replies).remove(&id);
             return Err(self.shared.terminal_error());
         }

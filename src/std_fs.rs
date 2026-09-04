@@ -33,7 +33,22 @@ fn platform_probe() -> Arc<dyn DomainProbe> {
     {
         Arc::new(crate::domain::WindowsProbe::new())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(target_os = "freebsd")]
+    {
+        Arc::new(crate::domain::FreeBsdProbe::new())
+    }
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    {
+        Arc::new(crate::domain::IllumosProbe::new())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "solaris",
+        windows
+    )))]
     {
         Arc::new(crate::domain::UnknownProbe)
     }
@@ -76,7 +91,11 @@ impl StdFileSystem {
 fn probe_at(probe: &dyn DomainProbe, full: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, FsError> {
     let mut result = probe.probe(full, parent)?;
     result.capabilities.kind_source = KindSource::Sometimes;
-    result.capabilities.identity_source = if cfg!(unix) { IdentitySource::Inline } else { IdentitySource::None };
+    if cfg!(unix) {
+        result.capabilities.identity_source = IdentitySource::Inline;
+    } else if !cfg!(windows) {
+        result.capabilities.identity_source = IdentitySource::None;
+    }
     result.capabilities.metadata_sources = inline_metadata_sources();
     result.capabilities.sources.observation = DeclarationSource::Declared;
     Ok(result)
@@ -127,7 +146,7 @@ fn permissions_of(metadata: &std::fs::Metadata) -> Option<u32> {
 #[cfg(unix)]
 fn identity_of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
-    Some(FileIdentity { device: metadata.dev(), inode: metadata.ino() })
+    Some(FileIdentity { device: metadata.dev(), inode: u128::from(metadata.ino()) })
 }
 
 #[cfg(not(unix))]
@@ -223,6 +242,8 @@ pub struct RawEntry {
 pub trait EntrySource: Send {
     fn next_entry(&mut self) -> Option<Result<RawEntry, FsError>>;
     fn resolve_kind(&mut self, name: &OsStr) -> Result<EntryKind, FsError>;
+    fn resolve_identity(&mut self, name: &OsStr) -> Result<Option<FileIdentity>, FsError>;
+    fn resolves_by_descriptor(&self) -> bool;
 }
 
 pub struct Opened<S> {
@@ -283,6 +304,16 @@ fn unix_kind(file_type: rustix::fs::FileType) -> Option<EntryKind> {
     }
 }
 
+#[cfg(all(unix, not(any(target_os = "illumos", target_os = "solaris"))))]
+fn dirent_kind(entry: &rustix::fs::DirEntry) -> Option<EntryKind> {
+    unix_kind(entry.file_type())
+}
+
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn dirent_kind(_entry: &rustix::fs::DirEntry) -> Option<EntryKind> {
+    None
+}
+
 #[cfg(windows)]
 fn inline_metadata(item: &std::fs::DirEntry) -> Metadata {
     match item.metadata() {
@@ -316,8 +347,8 @@ impl EntrySource for PlatformSource {
             }
             return Some(Ok(RawEntry {
                 name: OsStr::from_bytes(bytes).to_os_string(),
-                kind: unix_kind(entry.file_type()),
-                identity: Some(FileIdentity { device: self.device, inode: entry.ino() }),
+                kind: dirent_kind(&entry),
+                identity: Some(FileIdentity { device: self.device, inode: u128::from(entry.ino()) }),
                 metadata: Metadata::default(),
             }));
         }
@@ -348,6 +379,20 @@ impl EntrySource for PlatformSource {
     #[cfg(not(unix))]
     fn resolve_kind(&mut self, name: &OsStr) -> Result<EntryKind, FsError> {
         Ok(kind_of(std::fs::symlink_metadata(self.full.join(name))?.file_type()))
+    }
+
+    #[cfg(windows)]
+    fn resolve_identity(&mut self, name: &OsStr) -> Result<Option<FileIdentity>, FsError> {
+        crate::domain::windows_file_identity(&self.full.join(name))
+    }
+
+    #[cfg(not(windows))]
+    fn resolve_identity(&mut self, _name: &OsStr) -> Result<Option<FileIdentity>, FsError> {
+        Ok(None)
+    }
+
+    fn resolves_by_descriptor(&self) -> bool {
+        cfg!(unix)
     }
 }
 
@@ -409,6 +454,22 @@ impl<S: EntrySource + 'static> StdSession<S> {
         self.entries.push(DirEntry::new(name, Observation { kind, metadata, identity }));
     }
 
+    fn per_child_identity(&self) -> bool {
+        match &self.stream {
+            Stream::Open(opened) | Stream::Exhausted(opened) => {
+                opened.domain.capabilities.identity_source == IdentitySource::PerChildRead
+            }
+            Stream::Unopened(_) | Stream::Failed => false,
+        }
+    }
+
+    fn by_descriptor(&self) -> bool {
+        match &self.stream {
+            Stream::Open(opened) | Stream::Exhausted(opened) => opened.source.resolves_by_descriptor(),
+            Stream::Unopened(_) | Stream::Failed => false,
+        }
+    }
+
     fn admit(&mut self, raw: RawEntry, operations_left: &mut usize, cost: &mut SessionCost) -> bool {
         let RawEntry { name, kind, identity, metadata } = raw;
         let kind = match kind {
@@ -425,15 +486,41 @@ impl<S: EntrySource + 'static> StdSession<S> {
                     Stream::Open(opened) | Stream::Exhausted(opened) => opened.source.resolve_kind(&name),
                     Stream::Unopened(_) | Stream::Failed => Err(FsError::NotFound),
                 };
+                let vanished = self.by_descriptor();
                 match resolved {
                     Ok(kind) => ObservedKind::Resolved(kind),
-                    Err(FsError::NotFound) => {
+                    Err(FsError::NotFound) if vanished => {
                         cost.entries_enumerated += 1;
                         return true;
                     }
                     Err(_) => ObservedKind::Unresolved,
                 }
             }
+        };
+        let identity = match identity {
+            Some(identity) => Some(identity),
+            None if self.per_child_identity() => {
+                if *operations_left == 0 {
+                    self.stashed = Some(RawEntry { name, kind: kind.resolved(), identity, metadata });
+                    return false;
+                }
+                *operations_left -= 1;
+                cost.identity_reads += 1;
+                let vanished = self.by_descriptor();
+                let resolved = match &mut self.stream {
+                    Stream::Open(opened) | Stream::Exhausted(opened) => opened.source.resolve_identity(&name),
+                    Stream::Unopened(_) | Stream::Failed => Ok(None),
+                };
+                match resolved {
+                    Ok(identity) => identity,
+                    Err(FsError::NotFound) if vanished => {
+                        cost.entries_enumerated += 1;
+                        return true;
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
         };
         cost.entries_enumerated += 1;
         self.push(name, kind, identity, metadata);
@@ -550,7 +637,9 @@ mod tests {
     struct Scripted {
         entries: VecDeque<RawEntry>,
         kinds: HashMap<OsString, EntryKind>,
+        identities: HashMap<OsString, FileIdentity>,
         resolutions: usize,
+        by_descriptor: bool,
     }
 
     impl EntrySource for Scripted {
@@ -562,6 +651,15 @@ mod tests {
             self.resolutions += 1;
             self.kinds.get(name).copied().ok_or(FsError::NotFound)
         }
+
+        fn resolve_identity(&mut self, name: &OsStr) -> Result<Option<FileIdentity>, FsError> {
+            self.resolutions += 1;
+            self.identities.get(name).copied().map(Some).ok_or(FsError::NotFound)
+        }
+
+        fn resolves_by_descriptor(&self) -> bool {
+            self.by_descriptor
+        }
     }
 
     fn raw(name: &str, kind: Option<EntryKind>) -> RawEntry {
@@ -569,19 +667,82 @@ mod tests {
     }
 
     fn scripted(entries: Vec<RawEntry>, kinds: Vec<(&str, EntryKind)>) -> Box<dyn ListingSession> {
+        scripted_with(entries, kinds, Vec::new(), IdentitySource::Unknown, true)
+    }
+
+    fn scripted_with(
+        entries: Vec<RawEntry>,
+        kinds: Vec<(&str, EntryKind)>,
+        identities: Vec<(&str, FileIdentity)>,
+        identity_source: IdentitySource,
+        by_descriptor: bool,
+    ) -> Box<dyn ListingSession> {
         let source = Scripted {
             entries: entries.into_iter().collect(),
             kinds: kinds.into_iter().map(|(name, kind)| (OsString::from(name), kind)).collect(),
+            identities: identities.into_iter().map(|(name, identity)| (OsString::from(name), identity)).collect(),
             resolutions: 0,
+            by_descriptor,
         };
         let opener = move || {
+            let mut domain = ProbeResult { identity: DomainIdentity::Unknown, ..ProbeResult::unknown() };
+            domain.capabilities.identity_source = identity_source;
             Ok(Opened {
                 directory: EntryInfo { kind: EntryKind::Directory, metadata: Metadata::default(), identity: None },
-                domain: ProbeResult { identity: DomainIdentity::Unknown, ..ProbeResult::unknown() },
+                domain,
                 source,
             })
         };
         Box::new(StdSession::new(PathBuf::from("/scripted"), Ceilings::UNBOUNDED, CancellationToken::new(), opener))
+    }
+
+    #[test]
+    fn a_per_child_identity_read_is_leased_and_counted_only_where_the_domain_declares_it() {
+        let identity = FileIdentity { device: 9, inode: 1 << 70 };
+        let entries: Vec<RawEntry> = (0..3).map(|i| raw(&format!("e{i}"), Some(EntryKind::File))).collect();
+        let session = scripted_with(
+            entries,
+            Vec::new(),
+            vec![("e0", identity), ("e2", identity)],
+            IdentitySource::PerChildRead,
+            false,
+        );
+        let (listing, costs, suspensions) = drain(session, Lease { entries: 64, operations: 1 });
+        assert_eq!(
+            suspensions, 2,
+            "RFC 10.2: a per-child identity read holds the operations lease like any other per-child operation"
+        );
+        assert_eq!(costs.iter().map(|cost| cost.identity_reads).sum::<u32>(), 3);
+        assert_eq!(costs.iter().map(|cost| cost.metadata_operations).sum::<u32>(), 0);
+        let identities: Vec<Option<FileIdentity>> = listing.entries.iter().map(|entry| entry.info.identity).collect();
+        assert_eq!(
+            identities,
+            vec![Some(identity), None, Some(identity)],
+            "a path-based identity lookup that answers NotFound keeps the child with identity None, never drops it"
+        );
+        assert_eq!(listing.entries.len(), 3, "no child is dropped when its path-based identity lookup fails");
+
+        let entries: Vec<RawEntry> = (0..3).map(|i| raw(&format!("e{i}"), Some(EntryKind::File))).collect();
+        let inline = scripted_with(entries, Vec::new(), vec![("e0", identity)], IdentitySource::Inline, false);
+        let (_, costs, suspensions) = drain(inline, Lease { entries: 64, operations: 1 });
+        assert_eq!((suspensions, costs.iter().map(|cost| cost.identity_reads).sum::<u32>()), (0, 0));
+    }
+
+    #[test]
+    fn a_directory_renamed_during_a_path_based_enumeration_keeps_every_remaining_child() {
+        let entries: Vec<RawEntry> = (0..3).map(|i| raw(&format!("e{i}"), None)).collect();
+        let session = scripted_with(entries, Vec::new(), Vec::new(), IdentitySource::None, false);
+        let (listing, _costs, _) = drain(session, Lease { entries: 64, operations: 64 });
+        assert_eq!(
+            listing.entries.len(),
+            3,
+            "RFC 10.1: on a path-based source NotFound is not proof the entry vanished, so a directory renamed \
+             mid-enumeration does not silently lose the children whose path-based kind lookup now fails"
+        );
+        assert!(
+            listing.entries.iter().all(|entry| entry.info.kind == ObservedKind::Unresolved),
+            "a failed path-based kind lookup leaves the child unresolved, never removed"
+        );
     }
 
     fn drain(mut session: Box<dyn ListingSession>, lease: Lease) -> (DirectoryListing, Vec<SessionCost>, usize) {
