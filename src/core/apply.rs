@@ -171,14 +171,19 @@ impl Coordinator {
         let previous_domain =
             self.dir_state(dir_id).and_then(|d| d.domain.as_ref()).map(|b| b.probe.capabilities.clone());
         let binding = self.bind_domain(&listing.domain);
+        let own_id = binding.id;
         effects.domains.push((dir_id, binding));
         let own_domain = listing.domain.as_ref();
         let was_loading = dir.shape == Shape::Directory(LoadState::Loading);
         let new_metadata = listing.directory.metadata.project(fields);
-        if was_loading || dir.metadata != new_metadata || dir.identity != listing.directory.identity {
+        let own_identity = match self.parent_of(dir_id).and_then(|parent| self.domain_of(parent)) {
+            Some(parent_domain) if parent_domain != own_id => dir.identity,
+            _ => listing.directory.identity,
+        };
+        if was_loading || dir.metadata != new_metadata || dir.identity != own_identity {
             let _ = builder.update(dir_id, |e| {
                 e.metadata = new_metadata;
-                e.identity = listing.directory.identity;
+                e.identity = own_identity;
                 if was_loading {
                     e.shape = Shape::Directory(LoadState::Loaded);
                 }
@@ -296,12 +301,22 @@ impl Coordinator {
             Some(existing) => {
                 existing.path = path;
                 existing.fields = fields;
+                existing.scope = EnrichmentScope::Directory;
                 existing.reasons.merge(reasons);
                 existing.due = None;
             }
             None => {
-                self.pending_enrichment
-                    .insert(dir, EnrichmentRequest { path, fields, reasons, attempts: 0, due: None });
+                self.pending_enrichment.insert(
+                    dir,
+                    EnrichmentRequest {
+                        path,
+                        fields,
+                        scope: EnrichmentScope::Directory,
+                        reasons,
+                        attempts: 0,
+                        due: None,
+                    },
+                );
             }
         }
     }
@@ -337,15 +352,24 @@ impl Coordinator {
             .into_iter()
             .filter_map(|(name, metadata)| Some((dir_key.child(&name, case).ok()?, metadata)))
             .collect();
+        let failed: HashSet<PathKey> =
+            read.failed.iter().filter_map(|(name, _)| dir_key.child(name, case).ok()).collect();
         let ctx = self.context_for_children(dir_id).unwrap_or_else(PolicyContext::unit);
         let children: Vec<Arc<Entry>> = builder.children(dir_id);
+        let mut degraded: Vec<EntryId> = Vec::new();
+        let mut recovered: Vec<EntryId> = Vec::new();
         for child in children {
             let Some(key) = child.path.file_name().map(|name| dir_key.descend(name, case)) else {
                 continue;
             };
+            if failed.contains(&key) {
+                degraded.push(child.id);
+                continue;
+            }
             let Some(metadata) = by_key.get(&key).copied() else {
                 continue;
             };
+            recovered.push(child.id);
             let merged = child.metadata.merged(metadata, supplied);
             if merged == child.metadata {
                 continue;
@@ -358,6 +382,24 @@ impl Coordinator {
         }
         self.commit(builder, effects, Some(job));
         self.entries.set_metadata_degraded(dir_id, None);
+        for child in recovered {
+            self.entries.set_metadata_degraded(child, None);
+        }
+        for (name, error) in &read.failed {
+            self.push_error(
+                dir.path.join(name).unwrap_or_else(|_| dir.path.clone()),
+                Operation::Metadata,
+                error.clone(),
+            );
+        }
+        for child in &degraded {
+            self.entries.set_metadata_degraded(*child, Some(DegradedCause::Enrichment));
+        }
+        if !degraded.is_empty() {
+            self.enrichment_failures += 1;
+            let names: Vec<OsString> = read.failed.into_iter().map(|(name, _)| name).collect();
+            self.schedule_enrichment_retry(dir_id, job, fields, EnrichmentScope::Children(names));
+        }
         JobOutcome::Accepted
     }
 
@@ -708,14 +750,20 @@ impl Coordinator {
             self.commit(builder, effects, Some(job));
             return if was_directory { JobOutcome::Removed } else { JobOutcome::Accepted };
         }
-        let changed = entry.metadata != metadata || entry.identity != info.identity;
+        let own_identity = match (self.dir_state(id).and_then(|d| d.domain.as_ref()), self.parent_of(id)) {
+            (Some(binding), Some(parent)) if self.domain_of(parent).is_some_and(|domain| domain != binding.id) => {
+                entry.identity
+            }
+            _ => info.identity,
+        };
+        let changed = entry.metadata != metadata || entry.identity != own_identity;
         if changed {
             let _ = builder.update(id, |e| {
                 e.metadata = metadata;
-                e.identity = info.identity;
+                e.identity = own_identity;
             });
             if !entry.path.is_root() {
-                let current = Entry { metadata, identity: info.identity, ..entry.clone() };
+                let current = Entry { metadata, identity: own_identity, ..entry.clone() };
                 let decision = self.policy.classify(&parent_ctx, &entry.path, &info);
                 self.apply_decision(&mut builder, &mut effects, &current, decision, inherit);
             }

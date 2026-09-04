@@ -197,10 +197,34 @@ impl DomainRequest {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum EnrichmentScope {
+    #[default]
+    Directory,
+    Children(Vec<std::ffi::OsString>),
+}
+
+impl EnrichmentScope {
+    pub fn widen(self, other: EnrichmentScope) -> EnrichmentScope {
+        match (self, other) {
+            (EnrichmentScope::Directory, _) | (_, EnrichmentScope::Directory) => EnrichmentScope::Directory,
+            (EnrichmentScope::Children(mut held), EnrichmentScope::Children(more)) => {
+                for name in more {
+                    if !held.contains(&name) {
+                        held.push(name);
+                    }
+                }
+                EnrichmentScope::Children(held)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EnrichmentRequest {
     pub path: RelativePath,
     pub fields: MetadataFields,
+    pub scope: EnrichmentScope,
     pub reasons: Reasons,
     pub attempts: u32,
     pub due: Option<MonotonicTime>,
@@ -312,6 +336,16 @@ impl JobTarget {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct EnrichmentProgress {
+    pub scope: EnrichmentScope,
+    pub cursor: usize,
+    pub directory: Option<crate::entry::Metadata>,
+    pub children: Vec<(std::ffi::OsString, crate::entry::Metadata)>,
+    pub failed: Vec<(std::ffi::OsString, FsError)>,
+    pub metadata_operations: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ActiveJob {
     pub id: JobId,
@@ -330,6 +364,7 @@ pub struct ActiveJob {
     pub leases: u32,
     pub session_open: bool,
     pub registration: Option<super::WatchScope>,
+    pub enrichment: Option<EnrichmentProgress>,
 }
 
 impl ActiveJob {

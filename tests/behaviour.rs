@@ -8,9 +8,9 @@ use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{FailureMode, FakeFileSystem, FakeOp, Harness, InjectedPosition};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RoundResult, UpdateEvent, WatcherHealth};
 use tree_fucker::{
-    CaseSensitivity, Config, DomainCapabilities, EntryKind, Error, FsError, HostConfig, IdentityReliability, LoadAll,
-    LoadState, MetadataFields, PathChange, PathPredicate, PolicyRevision, RelativePath, WatchRegistrationFailure,
-    WatcherKind,
+    CaseSensitivity, Config, DomainCapabilities, EntryKind, Error, FileSystem, FsError, HostConfig,
+    IdentityReliability, LoadAll, LoadState, MetadataFields, PathChange, PathPredicate, PolicyRevision, RelativePath,
+    WatchRegistrationFailure, WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
@@ -624,6 +624,30 @@ fn replaced_entry_with_new_identity_gets_new_entry_id() {
     h.run_round();
     let new = h.entry("root.txt").expect("file").id;
     assert_ne!(old, new);
+}
+
+#[test]
+fn a_delete_then_rename_on_the_server_converges_from_enumeration() {
+    let fs = populated(WatcherKind::None);
+    fs.create_file("target", 1);
+    let mut h = Harness::open_default(fs.clone(), Arc::new(LoadAll));
+    h.run_until_idle();
+    let source = h.entry("root.txt").expect("source").id;
+    let old_target = h.entry("target").expect("target").id;
+    fs.remove_silently("target");
+    h.run_round();
+    assert!(!h.paths().contains(&"target".to_string()), "the intermediate state without the target is observed");
+    fs.rename("root.txt", "target");
+    h.run_round();
+    assert!(h.paths().contains(&"target".to_string()));
+    assert!(!h.paths().contains(&"root.txt".to_string()));
+    let renamed = h.entry("target").expect("renamed target");
+    assert_ne!(renamed.id, old_target, "the deleted target never resurrects");
+    assert_eq!(renamed.identity, fs.metadata(fs.root(), &path("target")).expect("metadata").identity);
+    assert!(h.entry("root.txt").is_none(), "the source is gone once the rename is observed; source was {source:?}");
+    h.run_round();
+    assert_eq!(h.health().reconciliation.last_round, Some(RoundResult::Successful));
+    assert_eq!(h.paths(), [".", "a", "a/b", "a/b/f1", "a/f2", "c", "target"]);
 }
 
 #[test]

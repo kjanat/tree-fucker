@@ -311,7 +311,7 @@ impl Harness {
             }
             Work::Metadata => self.fs.cost_of(FakeOp::Metadata, &spec.path),
             Work::ResolveDomain { .. } => self.fs.domain_resolution_cost(&spec.path),
-            Work::Enrichment { .. } => self.fs.enrichment_cost(&spec.path),
+            Work::Enrichment { batch } => self.fs.enrichment_cost(&spec.path, batch),
         };
         let domain = self.fs.domain_of(&spec.path);
         let due = self.now + cost;
@@ -474,7 +474,7 @@ impl Harness {
             Work::ResolveDomain { parent } => {
                 JobResult::Domain(self.fs.resolve_domain(self.fs.root(), &spec.path, parent.as_deref()))
             }
-            Work::Enrichment { fields } => JobResult::Enrichment(self.fs.enrich(self.fs.root(), &spec.path, *fields)),
+            Work::Enrichment { batch } => JobResult::Enrichment(self.fs.enrich(self.fs.root(), &spec.path, batch)),
         }
     }
 

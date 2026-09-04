@@ -28,8 +28,8 @@ use crate::domain::{
 use crate::entry::{LoadState, MetadataFields, Shape};
 use crate::error::Error;
 use crate::fs::{
-    CancellationToken, Ceilings, Enrichment, EntryInfo, FsCapabilities, FsError, Lease, SessionCost, SessionStep,
-    WatcherEvent, WatcherKind,
+    CancellationToken, Ceilings, Enrichment, EnrichmentBatch, EntryInfo, FsCapabilities, FsError, Lease, SessionCost,
+    SessionStep, WatcherEvent, WatcherKind,
 };
 use crate::ids::*;
 use crate::path::RelativePath;
@@ -206,7 +206,7 @@ pub enum Work {
     Listing(ListingWork),
     Metadata,
     ResolveDomain { parent: Option<Box<ProbeResult>> },
-    Enrichment { fields: MetadataFields },
+    Enrichment { batch: EnrichmentBatch },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,7 +222,7 @@ impl JobSpec {
             Work::Listing(_) => JobOperation::Listing,
             Work::Metadata => JobOperation::Metadata,
             Work::ResolveDomain { .. } => JobOperation::DomainResolution,
-            Work::Enrichment { fields } => JobOperation::Enrichment { fields: *fields },
+            Work::Enrichment { batch } => JobOperation::Enrichment { fields: batch.fields },
         }
     }
 }

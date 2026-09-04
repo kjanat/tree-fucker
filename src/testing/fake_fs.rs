@@ -9,9 +9,9 @@ use crate::domain::{
 };
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
-    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem,
-    FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome,
-    WatcherEvent, WatcherKind, WatcherSink, entry_bytes,
+    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EnrichmentBatch, EntryInfo,
+    FileSystem, FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost,
+    SessionOutcome, WatcherEvent, WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -125,6 +125,8 @@ struct Inner {
     path_scoped_costs: usize,
     domain_scoped_costs: usize,
     per_child_cost_ops: usize,
+    synthetic: HashMap<RelativePath, usize>,
+    own_identities: HashMap<RelativePath, FileIdentity>,
 }
 
 pub struct FakeFileSystem {
@@ -196,8 +198,28 @@ impl FakeFileSystem {
                 path_scoped_costs: 0,
                 domain_scoped_costs: 0,
                 per_child_cost_ops: 0,
+                synthetic: HashMap::new(),
+                own_identities: HashMap::new(),
             })),
         }
+    }
+
+    pub fn set_synthetic_children(&self, p: &str, count: usize) {
+        let path = Self::path(p);
+        lock(&self.inner).synthetic.insert(path, count);
+    }
+
+    pub fn report_own_identity(&self, p: &str, identity: FileIdentity) {
+        let path = Self::path(p);
+        lock(&self.inner).own_identities.insert(path, identity);
+    }
+
+    fn own_info(inner: &Inner, path: &RelativePath) -> Result<EntryInfo, FsError> {
+        let mut info = Self::lookup(inner, path)?;
+        if let Some(identity) = inner.own_identities.get(path) {
+            info.identity = Some(*identity);
+        }
+        Ok(info)
     }
 
     pub fn root(&self) -> &Path {
@@ -686,7 +708,7 @@ impl FakeFileSystem {
         if inner.per_child_cost_ops == 0 {
             return total;
         }
-        for (_, child, info) in Self::enumeration_order(&inner, path).into_iter().skip(skip).take(take) {
+        for (_, child, info) in Self::enumeration_order(&inner, path).iter().skip(skip).take(take) {
             let Some(child) = child else {
                 continue;
             };
@@ -695,10 +717,10 @@ impl FakeFileSystem {
         total
     }
 
-    fn enumeration_order(
-        inner: &Inner,
-        path: &RelativePath,
-    ) -> Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> {
+    fn enumeration_order(inner: &Inner, path: &RelativePath) -> Order {
+        if let Some(count) = inner.synthetic.get(path) {
+            return Order::Synthetic { dir: path.clone(), count: *count };
+        }
         let depth = path.depth() + 1;
         let real: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)> = inner
             .nodes
@@ -712,31 +734,21 @@ impl FakeFileSystem {
             .filter(|c| c.dir == *path)
             .map(|c| (c.name.clone(), path.join(&c.name).ok(), c.info))
             .collect();
-        match inner.injected_position {
+        Order::Listed(match inner.injected_position {
             InjectedPosition::Last => real.into_iter().chain(injected).collect(),
             InjectedPosition::First => injected.into_iter().chain(real).collect(),
-        }
+        })
     }
 
-    pub fn enrichment_cost(&self, path: &RelativePath) -> Duration {
+    pub fn enrichment_cost(&self, path: &RelativePath, batch: &EnrichmentBatch) -> Duration {
         let inner = lock(&self.inner);
-        let mut total = Self::scoped_cost(&inner, FakeOp::Enrich, path);
-        for child in Self::child_paths(&inner, path) {
-            total += Self::scoped_cost(&inner, FakeOp::Enrich, &child);
-        }
-        total
-    }
-
-    fn child_paths(inner: &Inner, path: &RelativePath) -> Vec<RelativePath> {
-        let depth = path.depth() + 1;
-        let mut children: Vec<RelativePath> =
-            inner.nodes.keys().filter(|k| k.depth() == depth && k.starts_with(path)).cloned().collect();
-        for injected in inner.injected.iter().filter(|c| c.dir == *path) {
-            if let Ok(child) = path.join(&injected.name) {
-                children.push(child);
+        let mut total = if batch.directory { Self::scoped_cost(&inner, FakeOp::Enrich, path) } else { Duration::ZERO };
+        for name in &batch.children {
+            if let Ok(child) = path.join(name) {
+                total += Self::scoped_cost(&inner, FakeOp::Enrich, &child);
             }
         }
-        children
+        total
     }
 
     fn scoped_cost(inner: &Inner, op: FakeOp, path: &RelativePath) -> Duration {
@@ -939,7 +951,7 @@ impl FileSystem for FakeFileSystem {
         if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Metadata) {
             return Err(err);
         }
-        Self::lookup(&inner, path)
+        Self::own_info(&inner, path)
     }
 
     fn open_listing(
@@ -986,35 +998,43 @@ impl FileSystem for FakeFileSystem {
         Ok(Self::probe_for(&inner, path, parent))
     }
 
-    fn enrich(&self, _root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError> {
+    fn enrich(&self, _root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError> {
         let mut inner = lock(&self.inner);
-        inner.ops.push((FakeOp::Enrich, path.clone()));
-        if Self::take_panic(&mut inner, path, FakeOp::Enrich) {
-            drop(inner);
-            panic!("injected enrichment panic for {path}");
-        }
-        if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Enrich) {
-            return Err(err);
-        }
-        let own = Self::lookup(&inner, path)?;
-        let mut metadata_operations = 1;
-        let directory = Some(own.metadata.project(fields));
+        let fields = batch.fields;
+        let mut metadata_operations = 0;
+        let directory = if batch.directory {
+            inner.ops.push((FakeOp::Enrich, path.clone()));
+            if Self::take_panic(&mut inner, path, FakeOp::Enrich) {
+                drop(inner);
+                panic!("injected enrichment panic for {path}");
+            }
+            if let Some(err) = Self::take_failure(&mut inner, path, FakeOp::Enrich) {
+                return Err(err);
+            }
+            metadata_operations += 1;
+            Some(Self::lookup(&inner, path)?.metadata.project(fields))
+        } else {
+            Self::lookup(&inner, path)?;
+            None
+        };
         let mut children = Vec::new();
-        for child in Self::child_paths(&inner, path) {
-            let Some(name) = child.file_name().map(|n| n.to_os_string()) else {
+        let mut failed = Vec::new();
+        for name in &batch.children {
+            let Ok(child) = path.join(name) else {
                 continue;
             };
             inner.ops.push((FakeOp::Enrich, child.clone()));
             metadata_operations += 1;
-            if Self::take_failure(&mut inner, &child, FakeOp::Enrich).is_some() {
+            if let Some(err) = Self::take_failure(&mut inner, &child, FakeOp::Enrich) {
+                failed.push((name.clone(), err));
                 continue;
             }
             let Ok(info) = Self::lookup(&inner, &child) else {
                 continue;
             };
-            children.push((name, info.metadata.project(fields)));
+            children.push((name.clone(), info.metadata.project(fields)));
         }
-        Ok(Enrichment { directory, children, supplied_fields: fields, metadata_operations })
+        Ok(Enrichment { directory, children, failed, supplied_fields: fields, metadata_operations })
     }
 
     fn watch(
@@ -1054,12 +1074,50 @@ struct ChildWork {
     blocking: Duration,
 }
 
+type Listed = (std::ffi::OsString, Option<RelativePath>, EntryInfo);
+
+enum Order {
+    Listed(Vec<Listed>),
+    Synthetic { dir: RelativePath, count: usize },
+}
+
+impl Order {
+    fn len(&self) -> usize {
+        match self {
+            Order::Listed(items) => items.len(),
+            Order::Synthetic { count, .. } => *count,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<Listed> {
+        match self {
+            Order::Listed(items) => items.get(index).cloned(),
+            Order::Synthetic { dir, count } => {
+                if index >= *count {
+                    return None;
+                }
+                let name = std::ffi::OsString::from(format!("f{index}"));
+                let info = EntryInfo {
+                    kind: EntryKind::File,
+                    metadata: Metadata::default(),
+                    identity: Some(FileIdentity { device: 1, inode: u64::try_from(index).unwrap_or(u64::MAX) }),
+                };
+                Some((name.clone(), dir.join(&name).ok(), info))
+            }
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Listed> + '_ {
+        (0..self.len()).filter_map(|index| self.get(index))
+    }
+}
+
 struct OpenedDirectory {
     directory: EntryInfo,
     supplied_fields: MetadataFields,
     domain: ProbeResult,
     inline_domains: bool,
-    order: Vec<(std::ffi::OsString, Option<RelativePath>, EntryInfo)>,
+    order: Order,
 }
 
 struct FakeSession {
@@ -1092,7 +1150,7 @@ impl FakeSession {
         if let Some(err) = FakeFileSystem::take_failure(&mut inner, &self.path, FakeOp::ReadDir) {
             return Err(err);
         }
-        let directory = FakeFileSystem::lookup(&inner, &self.path)?;
+        let directory = FakeFileSystem::own_info(&inner, &self.path)?;
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
@@ -1113,9 +1171,11 @@ impl FakeSession {
         let mut needed = 0;
         let mut fits = 0;
         for offset in 0..window {
-            let (_, child, info) = &opened.order[self.cursor + offset];
+            let Some((_, child, info)) = opened.order.get(self.cursor + offset) else {
+                break;
+            };
             let extra = match child {
-                Some(child) => FakeFileSystem::child_operations(&inner, child, info.kind),
+                Some(child) => FakeFileSystem::child_operations(&inner, &child, info.kind),
                 None => 0,
             };
             if needed + extra > operations {
@@ -1135,7 +1195,9 @@ impl FakeSession {
         let parent = opened.domain.clone();
         let mut inner = lock(&self.inner);
         for offset in 0..count {
-            let (name, child, info) = opened.order[self.cursor + offset].clone();
+            let Some((name, child, info)) = opened.order.get(self.cursor + offset) else {
+                break;
+            };
             let (observation, domain) = match child {
                 Some(child) => {
                     let (observation, work) = FakeFileSystem::observe(&mut inner, &child, info);

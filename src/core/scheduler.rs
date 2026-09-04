@@ -182,7 +182,33 @@ impl Coordinator {
             ReadNeed::Domain => Work::ResolveDomain {
                 parent: job.entry().and_then(|entry| self.parent_domain_probe(entry)).map(Box::new),
             },
-            ReadNeed::Enrichment(fields) => Work::Enrichment { fields },
+            ReadNeed::Enrichment(fields) => Work::Enrichment { batch: self.enrichment_batch(job, fields) },
+        }
+    }
+
+    fn enrichment_batch(&self, job: &ActiveJob, fields: crate::entry::MetadataFields) -> crate::fs::EnrichmentBatch {
+        let cursor = job.enrichment.as_ref().map(|progress| progress.cursor).unwrap_or(0);
+        let scope = job.enrichment.as_ref().map(|progress| progress.scope.clone()).unwrap_or_default();
+        let children = job
+            .entry()
+            .map(|entry| self.enrichment_targets(entry, &scope))
+            .unwrap_or_default()
+            .into_iter()
+            .skip(cursor)
+            .take(self.config.operations_per_lease.max(1))
+            .collect();
+        let directory = cursor == 0 && scope == EnrichmentScope::Directory;
+        crate::fs::EnrichmentBatch { fields, directory, children }
+    }
+
+    pub(super) fn enrichment_targets(&self, entry: EntryId, scope: &EnrichmentScope) -> Vec<std::ffi::OsString> {
+        match scope {
+            EnrichmentScope::Directory => self
+                .snapshot
+                .children(entry)
+                .filter_map(|child| child.path.file_name().map(|name| name.to_os_string()))
+                .collect(),
+            EnrichmentScope::Children(names) => names.clone(),
         }
     }
 
@@ -593,18 +619,23 @@ impl Coordinator {
                         continue;
                     }
                 };
-                match candidate {
+                let scope = match candidate {
                     Ready::Read(id) => {
                         self.pending.remove(&id);
+                        None
                     }
                     Ready::Domain(id) => {
                         self.pending_domain.remove(&id);
+                        None
                     }
-                    Ready::Enrich(id) => {
-                        self.pending_enrichment.remove(&id);
-                    }
-                }
+                    Ready::Enrich(id) => self.pending_enrichment.remove(&id).map(|request| request.scope),
+                };
                 let job_id = self.admit(grant, Some(id), request);
+                if let Some(scope) = scope
+                    && let Some(progress) = self.jobs.get_mut(&job_id).and_then(|job| job.enrichment.as_mut())
+                {
+                    progress.scope = scope;
+                }
                 members.insert(job_id);
             }
         }
@@ -673,6 +704,10 @@ impl Coordinator {
             leases: 1,
             session_open: false,
             registration,
+            enrichment: match request.need {
+                ReadNeed::Enrichment(_) => Some(EnrichmentProgress::default()),
+                ReadNeed::Domain | ReadNeed::Metadata | ReadNeed::Listing => None,
+            },
         };
         if let Some(entry_id) = entry {
             self.active_by_entry.insert(entry_id, id);

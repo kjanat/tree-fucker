@@ -284,9 +284,17 @@ pub fn entry_bytes(name: &std::ffi::OsStr) -> u64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnrichmentBatch {
+    pub fields: MetadataFields,
+    pub directory: bool,
+    pub children: Vec<OsString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Enrichment {
     pub directory: Option<Metadata>,
     pub children: Vec<(OsString, Metadata)>,
+    pub failed: Vec<(OsString, FsError)>,
     pub supplied_fields: MetadataFields,
     pub metadata_operations: u32,
 }
@@ -360,7 +368,7 @@ pub trait FileSystem: Send + Sync {
         ceilings: Ceilings,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession>;
-    fn enrich(&self, root: &Path, path: &RelativePath, fields: MetadataFields) -> Result<Enrichment, FsError>;
+    fn enrich(&self, root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError>;
     fn watch(
         &self,
         root: &Path,

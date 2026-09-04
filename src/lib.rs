@@ -29,9 +29,9 @@ pub use domain::{
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};
 pub use fs::{
-    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EntryInfo, FileSystem,
-    FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome,
-    SessionState, SessionStep, WatcherEvent, WatcherKind, WatcherSink, entry_bytes, list_directory,
+    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EnrichmentBatch, EntryInfo,
+    FileSystem, FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost,
+    SessionOutcome, SessionState, SessionStep, WatcherEvent, WatcherKind, WatcherSink, entry_bytes, list_directory,
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,

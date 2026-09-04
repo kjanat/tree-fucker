@@ -10,7 +10,7 @@ use tree_fucker::update::{
 use tree_fucker::{
     AccessTopology, CancellationToken, Ceilings, Config, Continuation, DomainCapabilities, DomainCrossing,
     DomainIdentity, EntryKind, FileSystem, FsError, HintKind, HostConfig, KindSource, Lease, LoadAll, MediaHint,
-    RelativePath, SessionOutcome, SessionStep, TransportHint, WatcherKind,
+    RelativePath, SessionOutcome, SessionStep, TransportHint, WatcherKind, entry_bytes,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -2571,6 +2571,120 @@ fn registration_latency_is_recorded_apart_from_the_listing_it_precedes() {
         stat.charged >= Duration::from_secs(10),
         "RFC 15.2: occupancy still covers the registration and the listing under one grant; {stat:?}"
     );
+}
+
+#[test]
+fn a_listing_lost_between_leases_restarts_from_a_fresh_enumeration() {
+    let fs = tree(&["wide"]);
+    for i in 0..6 {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    let config =
+        Config { entries_per_lease: 2, fixed_interval: Some(Duration::from_secs(86_400)), ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    fs.add_silently("wide/late", EntryKind::File);
+    let t = h.command(Command::Refresh(vec![path("wide")]));
+    let first = h.pending_job_for("wide").expect("the refresh listing started");
+    assert!(h.complete_job(first.id), "the first lease never ran");
+    let resumed = h.pending_job_for("wide").expect("the suspended session never resumed");
+    let reads = fs.count_ops(FakeOp::ReadDir, "wide");
+    assert!(h.lose_job(resumed.id));
+    assert_eq!(h.held_listing_sessions(), 0, "RFC 10.2: a lost session leaves no handle behind");
+
+    for _ in 0..600 {
+        if h.result(t).is_some() {
+            break;
+        }
+        h.run_jobs_until(h.now() + Duration::from_secs(1));
+    }
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(
+        fs.count_ops(FakeOp::ReadDir, "wide"),
+        reads + 1,
+        "RFC 10.2: the retry opens a fresh enumeration instead of trusting a remembered offset"
+    );
+    let mut children: Vec<String> = h.paths().into_iter().filter(|p| p.starts_with("wide/")).collect();
+    let total = children.len();
+    children.dedup();
+    assert_eq!(children.len(), total, "an entry was published twice");
+    assert_eq!(total, 8, "every entry of the restarted enumeration was published exactly once: {children:?}");
+}
+
+#[test]
+fn a_session_suspended_between_leases_accrues_no_occupancy_while_it_waits() {
+    let fs = wide(8);
+    fs.set_chunk_size(1);
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    let host = HostConfig {
+        maximum_in_flight: 1,
+        per_domain_concurrency: 1,
+        domain_background_duty: 0.001,
+        background_duty: 0.001,
+        ..Default::default()
+    };
+    let config = Config { entries_per_lease: 2, ..Default::default() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), host, config).expect("open");
+    assert!(h.advance_to_next_completion(), "the root listing never ran");
+    let big = h.pending_job_for("aaa").expect("the wide listing started");
+    assert!(h.advance_to_next_completion(), "the first lease never returned");
+    assert_eq!(h.stats().suspended_sessions, 1, "the first lease did not leave the session suspended");
+
+    for minute in 1..=10 {
+        h.run_jobs_until(h.now() + Duration::from_secs(60));
+        let stats = h.stats();
+        assert_eq!(stats.suspended_sessions, 1, "minute {minute}: the session was resumed before its lease refilled");
+        assert_eq!(
+            stats.governor.running_occupancy,
+            Duration::ZERO,
+            "RFC 10.2 and 17.5: a session waiting for its next lease holds no worker; minute {minute} reports {:?}",
+            stats.governor.running_occupancy
+        );
+        assert!(
+            !stats.blocking_slots.iter().any(|slot| slot.job() == Some(big.id)),
+            "minute {minute}: the suspended session holds a blocking slot"
+        );
+        assert_eq!(stats.governor.in_flight, 0, "minute {minute}: {}", stats.governor.in_flight);
+    }
+    assert_eq!(h.held_listing_sessions(), 1, "RFC 10.2: the session keeps its handle and buffer while it waits");
+}
+
+#[test]
+fn an_effectively_infinite_directory_stops_at_the_ceiling_plus_one_chunk_without_materialising_the_rest() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("huge");
+    fs.set_synthetic_children("huge", 10_000_000);
+    fs.set_chunk_size(16);
+    let mut session = fs.open_listing(fs.root(), &path("huge"), Ceilings::entries(100), CancellationToken::new());
+    let mut total_bytes = 0;
+    let mut enumerated = 0;
+    let outcome = loop {
+        let (continuation, cost) = session.resume(Lease { entries: 64, operations: 64 });
+        total_bytes = total_bytes.max(cost.bytes);
+        enumerated += cost.entries_enumerated;
+        match continuation {
+            Continuation::Suspended(next) => session = next,
+            Continuation::Finished(outcome) => break outcome,
+        }
+    };
+    let SessionOutcome::ResourceLimited(limited) = outcome else {
+        panic!("RFC 10.2: a directory over the ceiling ends ResourceLimited, not {outcome:?}");
+    };
+    assert!(limited.observed <= 116, "RFC 10.2: at most the ceiling plus one chunk is observed; {limited:?}");
+    assert!(enumerated <= 116, "{enumerated} entries were enumerated");
+    let widest = entry_bytes(std::ffi::OsStr::new("f9999999"));
+    assert!(
+        total_bytes <= 116 * widest,
+        "RFC 10.2 and 17.5: memory never scales with the hidden remainder; the session held {total_bytes} bytes"
+    );
+
+    let config = Config { entries_per_directory: 100, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    assert_eq!(h.paths(), [".", "huge"], "RFC 10.2 and 20: a directory over its limit publishes nothing");
+    let event = h.stats().resource_limits.into_iter().find(|e| e.path == path("huge")).expect("resource-limit event");
+    assert!(event.limited.observed <= 116, "{event:?}");
+    assert!(h.stats().snapshot_bytes < 116 * widest, "the snapshot never grew with the hidden remainder");
 }
 
 #[test]

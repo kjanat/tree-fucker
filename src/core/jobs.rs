@@ -3,7 +3,7 @@ use super::{Coordinator, JobResult, Output, Work, WorkerLoss};
 use crate::config::WatchRegistrationFailure;
 use crate::entry::{EntryKind, LoadState, Shape};
 use crate::error::Error;
-use crate::fs::{FsError, SessionOutcome, SessionState, SessionStep};
+use crate::fs::{Enrichment, FsError, SessionOutcome, SessionState, SessionStep};
 use crate::ids::*;
 use crate::update::{ErrorCause, Operation, ResourceLimitEvent, ResourceLimited, WatcherHealth};
 
@@ -129,7 +129,35 @@ impl Coordinator {
             (ReadNeed::Domain, _, JobResult::Domain(Err(FsError::NotFound))) => self.on_not_found(&job),
             (ReadNeed::Domain, _, JobResult::Domain(Err(err))) => self.finish_job(id, JobOutcome::Failed(err)),
             (ReadNeed::Enrichment(fields), _, JobResult::Enrichment(Ok(read))) => {
-                let outcome = self.commit_enrichment(&job, fields, read);
+                let Some(scope) = self.jobs.get(&id).and_then(|job| job.enrichment.as_ref()).map(|p| p.scope.clone())
+                else {
+                    self.finish_job(id, JobOutcome::ResultMismatch);
+                    return;
+                };
+                let total = self.enrichment_targets(entry, &scope).len();
+                let Some(progress) = self.jobs.get_mut(&id).and_then(|job| job.enrichment.as_mut()) else {
+                    self.finish_job(id, JobOutcome::ResultMismatch);
+                    return;
+                };
+                progress.cursor += self.config.operations_per_lease.max(1);
+                if progress.directory.is_none() {
+                    progress.directory = read.directory;
+                }
+                progress.children.extend(read.children);
+                progress.failed.extend(read.failed);
+                progress.metadata_operations = progress.metadata_operations.saturating_add(read.metadata_operations);
+                if progress.cursor < total {
+                    self.suspend_job(id);
+                    return;
+                }
+                let gathered = Enrichment {
+                    directory: progress.directory,
+                    children: std::mem::take(&mut progress.children),
+                    failed: std::mem::take(&mut progress.failed),
+                    supplied_fields: read.supplied_fields,
+                    metadata_operations: progress.metadata_operations,
+                };
+                let outcome = self.commit_enrichment(&job, fields, gathered);
                 self.finish_job(id, outcome);
             }
             (ReadNeed::Enrichment(_), _, JobResult::Enrichment(Err(err))) => {
@@ -741,6 +769,20 @@ impl Coordinator {
     }
 
     fn retry_enrichment(&mut self, entry: EntryId, job: &ActiveJob, fields: crate::entry::MetadataFields) {
+        if self.snapshot.get_by_id(entry).is_some_and(|current| current.is_loaded()) {
+            self.entries.set_metadata_degraded(entry, Some(DegradedCause::Enrichment));
+        }
+        let scope = job.enrichment.as_ref().map(|progress| progress.scope.clone()).unwrap_or_default();
+        self.schedule_enrichment_retry(entry, job, fields, scope);
+    }
+
+    pub(super) fn schedule_enrichment_retry(
+        &mut self,
+        entry: EntryId,
+        job: &ActiveJob,
+        fields: crate::entry::MetadataFields,
+        scope: EnrichmentScope,
+    ) {
         let Some(current) = self.snapshot.get_by_id(entry).cloned() else {
             return;
         };
@@ -748,13 +790,17 @@ impl Coordinator {
             self.pending_enrichment.remove(&entry);
             return;
         }
-        self.entries.set_metadata_degraded(entry, Some(DegradedCause::Enrichment));
-        let attempts = self.pending_enrichment.get(&entry).map(|r| r.attempts + 1).unwrap_or(1);
+        let (attempts, scope) = match self.pending_enrichment.remove(&entry) {
+            Some(existing) => (existing.attempts + 1, existing.scope.widen(scope)),
+            None => (1, scope),
+        };
         let due = self.now + self.backoff(attempts);
         let mut reasons = job.reasons;
         reasons.retry = true;
-        self.pending_enrichment
-            .insert(entry, EnrichmentRequest { path: current.path.clone(), fields, reasons, attempts, due: Some(due) });
+        self.pending_enrichment.insert(
+            entry,
+            EnrichmentRequest { path: current.path.clone(), fields, scope, reasons, attempts, due: Some(due) },
+        );
     }
 
     fn abandon_registration(&mut self, request: WatchRequestId) {

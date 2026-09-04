@@ -6,8 +6,8 @@ use tree_fucker::testing::DomainId;
 use tree_fucker::testing::{CostScope, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{ErrorCause, ResourceLimit, RoundResult, UpdateEvent};
 use tree_fucker::{
-    Config, DomainCapabilities, DomainCrossing, EntryKind, Error, FsError, IdentitySource, KindSource, LoadAll,
-    MetadataFields, MetadataSource, MetadataSources, RelativePath, WatcherKind,
+    Config, DomainCapabilities, DomainCrossing, EntryKind, Error, FileIdentity, FileSystem, FsError, IdentitySource,
+    KindSource, LoadAll, MetadataFields, MetadataSource, MetadataSources, PathChange, RelativePath, WatcherKind,
 };
 
 const PER_CHILD_IDENTITY: DomainId = DomainId::new(7);
@@ -427,6 +427,220 @@ fn a_domain_acquiring_identity_per_child_counts_one_operation_per_child_and_a_no
         "RFC 10.1: identity acquisition is not modelled as metadata I/O; the tree counted {} metadata operations",
         stats.metadata_operations
     );
+}
+
+fn membership_changes(h: &Harness) -> Vec<PathChange> {
+    h.events()
+        .iter()
+        .filter_map(|event| match event {
+            UpdateEvent::Delta(update) => Some(update.changes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|change| matches!(change, PathChange::Added { .. } | PathChange::Removed { .. }))
+        .collect()
+}
+
+#[test]
+fn a_mount_point_keeps_its_entry_when_its_own_identity_differs_from_its_directory_entry() {
+    let fs = populated();
+    fs.set_domain("a", DomainId::new(3));
+    fs.report_own_identity("a", FileIdentity { device: 2, inode: 1 });
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).expect("open");
+    h.run_until_idle();
+    let mount = h.entry("a").expect("mount point");
+    let inner = h.entry("a/b/f1").expect("inner file").id;
+    let dirent = fs.metadata(fs.root(), &path("a")).expect("own metadata").identity;
+    assert_ne!(mount.identity, dirent, "the fixture gives the mount point one identity in each domain");
+    h.take_events();
+    for _ in 0..3 {
+        h.run_round();
+    }
+    let t = h.command(Command::Refresh(vec![path("a"), path("")]));
+    h.run_until_idle();
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert_eq!(
+        h.entry("a").map(|e| e.id),
+        Some(mount.id),
+        "RFC 7.1 and 14.3: a mount point's identity in the containing filesystem and in the mounted filesystem are \
+         two identity spaces, so the parent listing must not replace the entry on every round"
+    );
+    assert_eq!(h.entry("a").and_then(|e| e.identity), mount.identity, "the entry keeps one identity space");
+    assert_eq!(h.entry("a/b/f1").map(|e| e.id), Some(inner), "the mounted subtree survived every parent listing");
+    let churn: Vec<PathChange> = membership_changes(&h).into_iter().filter(|c| c.path() == &path("a")).collect();
+    assert!(churn.is_empty(), "RFC 7.1: the mount point was removed and re-added: {churn:?}");
+}
+
+#[test]
+fn a_failed_child_enrichment_degrades_only_that_child_and_the_rest_of_the_directory_is_enriched() {
+    let fs = populated();
+    fs.set_default_capabilities(per_child_sizes());
+    fs.fail("a/f2", FakeOp::Enrich, FailureMode::Always(FsError::Transient("stat refused".into())));
+    let config =
+        Config { metadata_fields: sizes(), fixed_interval: Some(Duration::from_secs(3600)), ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    h.run_round();
+
+    assert_eq!(h.paths(), [".", "a", "a/b", "a/b/f1", "a/f2", "c", "root.txt"], "membership is unaffected");
+    assert_eq!(h.entry("a/b/f1").map(|e| e.metadata.size), Some(Some(10)), "the other children are enriched");
+    assert_eq!(h.entry("a/f2").map(|e| e.metadata.size), Some(None), "the failed child carries no guessed value");
+    let health = h.health();
+    assert!(
+        health.reconciliation.metadata_degraded_paths.contains(&path("a/f2")),
+        "RFC 10.1: enrichment failure degrades the metadata of the affected children; the tree reported {:?}",
+        health.reconciliation.metadata_degraded_paths
+    );
+    assert!(
+        !health.reconciliation.metadata_degraded_paths.contains(&path("a")),
+        "RFC 10.1: the directory whose other children were enriched is not degraded as a whole; {:?}",
+        health.reconciliation.metadata_degraded_paths
+    );
+    assert!(health.reconciliation.degraded_paths.is_empty(), "RFC 10.1: metadata failure is never membership failure");
+    assert_eq!(health.reconciliation.last_round, Some(RoundResult::Successful));
+    let causes = published_causes(&h);
+    assert!(
+        causes.iter().any(|c| matches!(c, ErrorCause::Fs(FsError::Transient(_)))),
+        "the failure is reported: {causes:?}"
+    );
+
+    fs.clear_failures();
+    fs.clear_ops();
+    h.run_jobs_until(h.now() + Duration::from_secs(120));
+    assert_eq!(h.entry("a/f2").map(|e| e.metadata.size), Some(Some(20)), "RFC 10.1: enrichment is retryable work");
+    assert!(fs.count_ops(FakeOp::Enrich, "a/f2") >= 1, "the failed child was read again");
+    for untouched in ["a", "a/b"] {
+        assert_eq!(
+            fs.count_ops(FakeOp::Enrich, untouched),
+            0,
+            "RFC 10.1: the retry reads only the children whose enrichment failed; {untouched} was read again: {:?}",
+            fs.ops()
+        );
+    }
+    assert!(
+        h.health().reconciliation.metadata_degraded_paths.is_empty(),
+        "a successful enrichment clears the child's metadata degradation: {:?}",
+        h.health().reconciliation.metadata_degraded_paths
+    );
+}
+
+#[test]
+fn enrichment_of_a_wide_directory_takes_one_lease_per_batch_of_children() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("wide");
+    for i in 0..40 {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    fs.set_default_capabilities(per_child_sizes());
+    fs.set_cost(CostScope::Everything, FakeOp::Enrich, Duration::from_millis(1));
+    let config = Config { metadata_fields: sizes(), operations_per_lease: 8, ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_jobs_until(h.now() + Duration::from_secs(600));
+
+    for i in 0..40 {
+        assert_eq!(
+            h.entry(&format!("wide/f{i}")).map(|e| e.metadata.size),
+            Some(Some(1)),
+            "wide/f{i} was not enriched"
+        );
+    }
+    let leases: Vec<_> = h
+        .admissions()
+        .into_iter()
+        .filter(|a| a.entry == path("wide") && matches!(a.operation, JobOperation::Enrichment { .. }))
+        .collect();
+    let renewals = leases.iter().filter(|a| a.lease > 0).count();
+    assert!(
+        renewals >= 4,
+        "RFC 10.2 and 15.3: forty children under an eight-operation lease are enriched in at least five governed \
+         batches; the enrichment took {renewals} further lease grants ({} admissions)",
+        leases.len()
+    );
+    let jobs: std::collections::BTreeSet<_> = leases.iter().map(|a| a.job).collect();
+    assert!(!jobs.is_empty());
+}
+
+#[test]
+fn only_unknown_kinds_receive_governed_lookups_and_those_consume_the_operations_lease() {
+    fn run(unknown: bool) -> (Arc<FakeFileSystem>, Harness) {
+        let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+        fs.mkdir("d");
+        for i in 0..8 {
+            fs.create_file(&format!("d/f{i}"), 1);
+            if unknown && i % 2 == 0 {
+                fs.report_unknown_kind(&format!("d/f{i}"));
+            }
+        }
+        fs.set_default_capabilities(sometimes_kinds());
+        let config = Config { operations_per_lease: 2, ..Default::default() };
+        let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+        h.run_until_idle();
+        (fs, h)
+    }
+
+    let (fs, h) = run(true);
+    for i in 0..8 {
+        let expected = usize::from(i % 2 == 0);
+        assert_eq!(
+            fs.count_ops(FakeOp::ResolveKind, &format!("d/f{i}")),
+            expected,
+            "RFC 10.1: only a child whose kind the enumeration did not supply receives a governed lookup"
+        );
+    }
+    assert_eq!(h.stats().kind_resolutions, 4);
+    assert!(
+        h.stats().lease_grants >= 1,
+        "RFC 10.2: four kind lookups under a two-operation lease must take further lease grants; the tree took {}",
+        h.stats().lease_grants
+    );
+    assert_eq!(h.paths().len(), 10);
+
+    let (_, control) = run(false);
+    assert_eq!(control.stats().kind_resolutions, 0);
+    assert_eq!(control.stats().lease_grants, 0, "without unknown kinds no per-child operation consumes the lease");
+}
+
+#[test]
+fn a_permission_denied_directory_retries_once_per_baseline_round_and_not_between_rounds() {
+    let fs = populated();
+    let config = Config { fixed_interval: Some(Duration::from_secs(60)), ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Always(FsError::PermissionDenied));
+    h.run_round();
+    assert!(h.health().reconciliation.degraded_paths.contains(&path("a")), "RFC 13.3: the path is degraded");
+    assert!(h.paths().contains(&"a/b/f1".to_string()), "RFC 13.3: the last known representation is retained");
+    let before = fs.count_ops(FakeOp::ReadDir, "a");
+    h.advance(Duration::from_secs(30));
+    assert_eq!(
+        fs.count_ops(FakeOp::ReadDir, "a"),
+        before,
+        "RFC 13.1: a Loaded directory denied permission retries once per baseline round, never on a timer between rounds"
+    );
+    h.run_round();
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), before + 1, "RFC 13.1: exactly one attempt per round");
+    h.run_round();
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "a"), before + 2, "RFC 13.1: exactly one attempt per round");
+    assert!(h.paths().contains(&"a/b/f1".to_string()));
+}
+
+#[test]
+fn a_permanently_failing_directory_has_bounded_retry_admissions_over_an_hour() {
+    let fs = populated();
+    let config = Config { fixed_interval: Some(Duration::from_secs(300)), ..Default::default() };
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), config).expect("open");
+    h.run_until_idle();
+    fs.fail("a", FakeOp::ReadDir, FailureMode::Always(FsError::Transient("always".into())));
+    let before = fs.count_ops(FakeOp::ReadDir, "a");
+    h.run_jobs_until(h.now() + Duration::from_secs(3600));
+    let attempts = fs.count_ops(FakeOp::ReadDir, "a") - before;
+    assert!(attempts >= 5, "the failing directory was retried only {attempts} times, so nothing was bounded");
+    assert!(
+        attempts <= 40,
+        "RFC 13.1 and 15.1 item 6: exponential backoff, the failure surcharge and one attempt per round bound a \
+         permanently failing target; it was attempted {attempts} times in an hour"
+    );
+    assert!(h.paths().contains(&"a/b/f1".to_string()), "RFC 13.1: the snapshot is retained through every failure");
 }
 
 const RFC16_MEDIA: DomainId = DomainId::new(11);
