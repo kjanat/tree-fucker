@@ -1,2 +1,3 @@
 rfc/** -linguist-detectable
-
+rfc/tree-fucker.txt linguist-detectable linguist-language=Formatted
+README* linguist-language=Formatted
