@@ -36,6 +36,7 @@ jobs:
 
   freebsd:
     name: freebsd-15
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -58,6 +59,7 @@ jobs:
 
   illumos:
     name: omnios-r151058
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
