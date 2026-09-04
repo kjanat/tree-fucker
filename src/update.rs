@@ -84,6 +84,7 @@ pub enum RoundResult {
 pub struct ReconciliationHealth {
     pub last_round: Option<RoundResult>,
     pub degraded_paths: BTreeSet<RelativePath>,
+    pub degraded_path_causes: BTreeMap<RelativePath, crate::core::DegradedCause>,
     pub metadata_degraded_paths: BTreeSet<RelativePath>,
     pub coverage_pending: bool,
 }

@@ -768,3 +768,30 @@ fn two_trees_reaching_one_domain_debit_one_domain_account() {
         two.charged_work()
     );
 }
+
+#[test]
+fn each_tree_under_one_host_governor_reports_its_own_charged_worker_time() {
+    let shared = HostGovernor::independent(&HostConfig::default());
+    let mut one = Harness::open_under(costed(&["a", "b", "c"]), Arc::new(LoadAll), Config::default(), shared.clone())
+        .expect("open");
+    let mut two = Harness::open_under(costed(&["d", "e", "f"]), Arc::new(LoadAll), Config::default(), shared.clone())
+        .expect("open");
+    let mut target = MonotonicTime::ZERO;
+    for step in 1..=60 {
+        target = MonotonicTime::ZERO + Duration::from_secs(step);
+        one.run_jobs_until(target);
+        two.run_jobs_until(target);
+    }
+    let first = one.stats().charged_worker_time;
+    let second = two.stats().charged_worker_time;
+    assert!(
+        first > Duration::ZERO && second > Duration::ZERO,
+        "line 1004: each tree reports the worker time charged for its own work; {first:?} and {second:?}"
+    );
+    let total = shared.view(target).charged;
+    assert!(
+        first + second <= total,
+        "line 1004 and RFC 15.9: the per-tree subtotals never exceed the process governor's charged total; \
+         {first:?} + {second:?} against {total:?}"
+    );
+}

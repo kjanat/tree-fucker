@@ -49,6 +49,14 @@ impl GrantId {
     }
 }
 
+struct OccupancyDelta {
+    domain: Option<StorageDomainId>,
+    origin: WorkOrigin,
+    delta: i128,
+    stuck: bool,
+    tree: Option<TreeNumber>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionDecision {
     Granted,
@@ -464,6 +472,7 @@ pub struct Governor {
     accounted_at: Option<MonotonicTime>,
     reserved_total: i128,
     charged_total: i128,
+    charged_by_tree: BTreeMap<TreeNumber, i128>,
     surcharged_total: i128,
     reported_total: i128,
     granted: u64,
@@ -503,6 +512,7 @@ impl Governor {
             accounted_at: None,
             reserved_total: 0,
             charged_total: 0,
+            charged_by_tree: BTreeMap::new(),
             surcharged_total: 0,
             reported_total: 0,
             granted: 0,
@@ -550,6 +560,7 @@ impl Governor {
     }
 
     pub fn forget_tree(&mut self, tree: TreeNumber) {
+        self.charged_by_tree.remove(&tree);
         if let Some(previous) = self.memory.remove(&tree) {
             self.memory_total = self.memory_total.saturating_sub(previous.0.saturating_add(previous.1));
             self.in_flight_total = self.in_flight_total.saturating_sub(previous.1);
@@ -690,19 +701,26 @@ impl Governor {
             state.bucket.refill(now);
             state.foreground.refill(now);
         }
-        let mut deltas: Vec<(Option<StorageDomainId>, WorkOrigin, i128, bool)> = Vec::new();
+        let mut deltas: Vec<OccupancyDelta> = Vec::new();
         for grant in self.grants.values_mut() {
             let Some(started) = grant.started else {
                 continue;
             };
             let occupancy = now.since(started);
             if occupancy > grant.charged {
-                deltas.push((grant.domain, grant.origin, nanos(occupancy - grant.charged), grant.stuck));
+                deltas.push(OccupancyDelta {
+                    domain: grant.domain,
+                    origin: grant.origin,
+                    delta: nanos(occupancy - grant.charged),
+                    stuck: grant.stuck,
+                    tree: grant.id.tree(),
+                });
                 grant.charged = occupancy;
             }
         }
-        for (domain, origin, delta, stuck) in deltas {
+        for OccupancyDelta { domain, origin, delta, stuck, tree } in deltas {
             self.charged_total += delta;
+            self.charge_tree(tree, delta);
             if !stuck {
                 self.global_bucket(origin).level -= delta;
             }
@@ -844,6 +862,7 @@ impl Governor {
         self.global_bucket(origin).level -= nanos(cost);
         self.reserved_total += nanos(cost);
         self.charged_total += nanos(cost);
+        self.charge_tree(id.tree(), nanos(cost));
         self.granted += 1;
         if lease > 0 {
             self.lease_granted += 1;
@@ -904,8 +923,10 @@ impl Governor {
         let domain = grant.domain;
         let origin = grant.origin;
         let stuck = grant.stuck;
+        let tree = grant.id.tree();
         grant.charged = charge;
         self.charged_total += extra;
+        self.charge_tree(tree, extra);
         if !stuck {
             self.global_bucket(origin).level -= extra;
         }
@@ -926,12 +947,28 @@ impl Governor {
         self.credit(domain, WorkOrigin::Background, 0, amount, 0, now);
     }
 
-    pub fn charge_release(&mut self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Duration {
+    fn charge_tree(&mut self, tree: Option<TreeNumber>, delta: i128) {
+        if let Some(tree) = tree {
+            *self.charged_by_tree.entry(tree).or_insert(0) += delta;
+        }
+    }
+
+    pub fn charged_by_tree(&self, tree: TreeNumber) -> Duration {
+        duration(self.charged_by_tree.get(&tree).copied().unwrap_or(0))
+    }
+
+    pub fn charge_release(
+        &mut self,
+        tree: TreeNumber,
+        domain: Option<StorageDomainId>,
+        now: MonotonicTime,
+    ) -> Duration {
         self.account(now);
         let cost = self.cost_of(domain, 1);
         let amount = nanos(cost);
         self.reserved_total += amount;
         self.charged_total += amount;
+        self.charge_tree(Some(tree), amount);
         self.granted += 1;
         self.watch_release_grants += 1;
         self.global.level -= amount;
@@ -1407,8 +1444,12 @@ impl HostGovernor {
         guard(&self.inner).charge_surcharge(domain, now)
     }
 
-    pub fn charge_release(&self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Duration {
-        guard(&self.inner).charge_release(domain, now)
+    pub fn charge_release(&self, tree: TreeNumber, domain: Option<StorageDomainId>, now: MonotonicTime) -> Duration {
+        guard(&self.inner).charge_release(tree, domain, now)
+    }
+
+    pub fn charged_by_tree(&self, tree: TreeNumber) -> Duration {
+        guard(&self.inner).charged_by_tree(tree)
     }
 
     pub fn start(&self, id: GrantId, at: MonotonicTime) {

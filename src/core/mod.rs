@@ -18,7 +18,7 @@ pub use governor::{
     LatencySummary, Reservation, TreeNumber, host_governor,
 };
 use types::*;
-pub use types::{Class, MonotonicTime, WorkOrigin};
+pub use types::{Class, DegradedCause, MonotonicTime, WorkOrigin};
 
 use crate::config::Config;
 use crate::domain::{
@@ -102,8 +102,13 @@ pub struct DomainStat {
     pub metadata_operations: u64,
     pub entries_enumerated: u64,
     pub per_child_lookups: u64,
+    pub kind_resolutions: u64,
+    pub identity_reads: u64,
     pub entries_per_second: f64,
     pub per_child_lookups_per_second: f64,
+    pub path: Option<RelativePath>,
+    pub last_listing_children: Option<usize>,
+    pub suspended_sessions: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,6 +117,9 @@ pub struct DomainOps {
     pub metadata_operations: u64,
     pub entries_enumerated: u64,
     pub per_child_lookups: u64,
+    pub kind_resolutions: u64,
+    pub identity_reads: u64,
+    pub last_listing_children: Option<usize>,
 }
 
 fn to_f64(count: u64) -> f64 {
@@ -306,6 +314,8 @@ pub struct BatchView {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stats {
+    pub observed_at: MonotonicTime,
+    pub charged_worker_time: Duration,
     pub version: SnapshotVersion,
     pub initial_scan: InitialScanState,
     pub reconciliation_generation: ReconciliationGeneration,
@@ -343,6 +353,7 @@ pub struct Stats {
     pub last_listing_children: Option<usize>,
     pub largest_directories: Vec<DirectorySize>,
     pub degraded_paths: BTreeSet<RelativePath>,
+    pub degraded_path_causes: BTreeMap<RelativePath, DegradedCause>,
     pub metadata_degraded_paths: BTreeSet<RelativePath>,
     pub metadata_operations: u64,
     pub listing_operations: u64,
@@ -396,6 +407,7 @@ pub struct Coordinator {
     unknown_domain: Option<StorageDomainId>,
     crossing_events: VecDeque<CrossingEvent>,
     domain_ops: BTreeMap<StorageDomainId, DomainOps>,
+    domain_paths: BTreeMap<StorageDomainId, RelativePath>,
     domain_resolutions: u64,
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
@@ -526,6 +538,7 @@ impl Coordinator {
             unknown_domain: None,
             crossing_events: VecDeque::new(),
             domain_ops: BTreeMap::new(),
+            domain_paths: BTreeMap::new(),
             domain_resolutions: 0,
             root_probe: None,
             probe_attempts: 0,
@@ -645,6 +658,8 @@ impl Coordinator {
             ops.metadata_operations += u64::from(cost.metadata_operations);
             ops.entries_enumerated += cost.entries_enumerated;
             ops.per_child_lookups += u64::from(cost.per_child_operations());
+            ops.kind_resolutions += u64::from(cost.kind_resolutions);
+            ops.identity_reads += u64::from(cost.identity_reads);
         }
     }
 
@@ -718,6 +733,9 @@ impl Coordinator {
     }
 
     pub(super) fn record_directory_size(&mut self, path: &RelativePath, children: usize) {
+        if let Some(domain) = self.snapshot.get(path).map(|e| e.id).and_then(|id| self.domain_of(id)) {
+            self.domain_ops.entry(domain).or_default().last_listing_children = Some(children);
+        }
         match self.largest_directories.iter().position(|entry| entry.path == *path) {
             Some(at) if self.largest_directories[at].children == children => return,
             Some(at) => self.largest_directories[at].children = children,
@@ -869,6 +887,8 @@ impl Coordinator {
         let resource = self.domain_resource_health();
         let domains = self.domain_stats(&view.domains, &resource);
         Stats {
+            observed_at: self.now,
+            charged_worker_time: self.governor.charged_by_tree(self.tree),
             version: self.snapshot.version(),
             initial_scan: self.initial_scan_state(),
             reconciliation_generation: self.round.as_ref().map(|r| r.generation).unwrap_or(self.recon_seq),
@@ -929,6 +949,7 @@ impl Coordinator {
             last_listing_children: self.last_listing_children,
             largest_directories: self.largest_directories.clone(),
             degraded_paths: self.degraded_paths(),
+            degraded_path_causes: self.degraded_path_causes(),
             metadata_degraded_paths: self.metadata_degraded_paths(),
             metadata_operations: self.metadata_operations,
             listing_operations: self.listing_operations,
@@ -957,6 +978,12 @@ impl Coordinator {
         resource: &BTreeMap<StorageDomainId, ResourceHealth>,
     ) -> Vec<DomainStat> {
         let watches = self.entries.watch_accounts();
+        let mut suspended: BTreeMap<StorageDomainId, usize> = BTreeMap::new();
+        for job in self.jobs.values().filter(|job| job.phase == JobPhase::Suspended) {
+            if let Some(domain) = job.domain {
+                *suspended.entry(domain).or_insert(0) += 1;
+            }
+        }
         self.domain_records
             .iter()
             .map(|(id, record)| {
@@ -998,8 +1025,13 @@ impl Coordinator {
                     metadata_operations: ops.metadata_operations,
                     entries_enumerated: ops.entries_enumerated,
                     per_child_lookups: ops.per_child_lookups,
+                    kind_resolutions: ops.kind_resolutions,
+                    identity_reads: ops.identity_reads,
                     entries_per_second: rate(ops.entries_enumerated, elapsed),
                     per_child_lookups_per_second: rate(ops.per_child_lookups, elapsed),
+                    path: self.domain_paths.get(id).cloned(),
+                    last_listing_children: ops.last_listing_children,
+                    suspended_sessions: suspended.get(id).copied().unwrap_or(0),
                 }
             })
             .collect()
@@ -1474,6 +1506,13 @@ impl Coordinator {
         self.entries.degraded_ids().filter_map(|id| self.snapshot.get_by_id(id).map(|e| e.path.clone())).collect()
     }
 
+    pub(super) fn degraded_path_causes(&self) -> BTreeMap<RelativePath, DegradedCause> {
+        self.entries
+            .degraded_causes()
+            .filter_map(|(id, cause)| self.snapshot.get_by_id(id).map(|e| (e.path.clone(), cause)))
+            .collect()
+    }
+
     fn metadata_degraded_paths(&self) -> BTreeSet<RelativePath> {
         self.entries
             .metadata_degraded_ids()
@@ -1517,6 +1556,7 @@ impl Coordinator {
             reconciliation: ReconciliationHealth {
                 last_round: self.last_round_result.clone(),
                 degraded_paths: self.degraded_paths(),
+                degraded_path_causes: self.degraded_path_causes(),
                 metadata_degraded_paths: self.metadata_degraded_paths(),
                 coverage_pending,
             },
@@ -1602,7 +1642,7 @@ impl Coordinator {
 
     pub(super) fn emit_unwatch(&mut self, watch: WatchId, domain: Option<StorageDomainId>) {
         let now = self.now;
-        self.governor.charge_release(domain, now);
+        self.governor.charge_release(self.tree, domain, now);
         self.outputs.push(Output::Unwatch(watch));
     }
 

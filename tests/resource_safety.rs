@@ -8,9 +8,10 @@ use tree_fucker::update::{
     ErrorCause, InitialScanState, ResourceHealth, ResourceLimit, RoundResult, ThrottleCause, UpdateEvent,
 };
 use tree_fucker::{
-    AccessTopology, CancellationToken, Ceilings, Config, Continuation, DomainCapabilities, DomainCrossing,
-    DomainIdentity, EntryKind, FileSystem, FsError, HintKind, HostConfig, KindSource, Lease, LoadAll, MediaHint,
-    RelativePath, SessionOutcome, SessionStep, TransportHint, WatcherKind, entry_bytes,
+    AccessTopology, CancellationToken, Ceilings, Config, Continuation, DegradedCause, DomainCapabilities,
+    DomainCrossing, DomainIdentity, EntryKind, FileSystem, FilesystemInstance, FilesystemSemantics, FsError, HintKind,
+    HostConfig, IdentitySource, KindSource, Lease, LoadAll, MediaHint, MetadataSource, MetadataSources, RelativePath,
+    SessionOutcome, SessionStep, TransportHint, WatcherKind, entry_bytes,
 };
 
 const BACKGROUND_DUTY_GLOBAL: f64 = 0.02;
@@ -2715,4 +2716,135 @@ fn per_domain_statistics_split_listing_and_metadata_latency_and_report_rates() {
     assert!(stat.entries_per_second > 0.0, "entries per second is missing: {stat:?}");
     assert!(stat.per_child_lookups > 0, "per-child lookups are missing after an unknown kind: {stat:?}");
     assert!(stat.per_child_lookups_per_second > 0.0, "per-child lookup rate is missing: {stat:?}");
+}
+
+fn smb_media() -> DomainCapabilities {
+    DomainCapabilities {
+        semantics: FilesystemSemantics::Smb,
+        topology: AccessTopology::Remote,
+        transport: TransportHint::Network,
+        filesystem: FilesystemInstance::Known(tree_fucker::FilesystemInstanceKey::declared(42)),
+        kind_source: KindSource::Sometimes,
+        identity_source: IdentitySource::PerChildRead,
+        metadata_sources: MetadataSources { size: MetadataSource::PerChildRead, ..MetadataSources::INLINE },
+        ..DomainCapabilities::inline()
+    }
+}
+
+#[test]
+fn production_observability_locates_a_stuck_smb_domain_from_the_public_api() {
+    let fs = tree(&["local", "media", "media/inner", "media/stuck"]);
+    fs.create_file("local/f", 1);
+    fs.create_file("media/inner/f", 1);
+    fs.set_domain("", HOME);
+    fs.set_domain("media", MEDIA);
+    fs.set_capabilities(MEDIA, smb_media());
+    fs.report_unknown_kind("media/inner/f");
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs.set_cost(CostScope::path("media/stuck"), FakeOp::ReadDir, Duration::from_secs(36_000));
+    let mut h = scanned(fs.clone(), follow());
+    h.run_jobs_until(h.now() + Duration::from_secs(600));
+
+    let media = domain_stat(&h, MEDIA);
+    assert_eq!(
+        media.path,
+        Some(path("media")),
+        "RFC 16 and line 1027: a domain is observable at the path it was entered; the stat reports {:?}",
+        media.path
+    );
+    assert_eq!(media.capabilities.semantics, FilesystemSemantics::Smb, "line 1027: the domain names itself SMB");
+    assert!(
+        matches!(media.capabilities.filesystem, FilesystemInstance::Known(_)),
+        "line 1008: the filesystem instance"
+    );
+    assert_eq!(media.capabilities.transport, TransportHint::Network, "line 1009: the transport hint is observable");
+    assert_eq!(
+        media.resource,
+        ResourceHealth::Throttled { cause: ThrottleCause::StuckWorker, resume: None },
+        "line 1028: the domain is quarantined and its resume is a wait for state change, not a timestamp"
+    );
+    assert!(media.stuck >= 1 && media.in_flight >= 1, "line 1029: the stuck physical read is counted, not hidden");
+    assert!(
+        media.last_listing_children == Some(1),
+        "line 1029: the last completed listing size is observable per domain; media reports {:?}",
+        media.last_listing_children
+    );
+    assert!(
+        media.kind_resolutions >= 1 || media.per_child_lookups >= 1,
+        "line 1016: per-child type/identity lookups are observable per domain; media reports {media:?}"
+    );
+
+    let slot = h
+        .stats()
+        .stuck_workers
+        .into_iter()
+        .find(|slot| slot.path == path("media/stuck"))
+        .expect("line 1028: the stuck worker is reported with its path and start time");
+    let age = h.stats().observed_at.since(slot.started);
+    assert!(
+        age >= STUCK_THRESHOLD,
+        "line 1012 and 1028: stuck-worker age is computable from the observation time and the start time; age {age:?}"
+    );
+    assert!(
+        !matches!(domain_stat(&h, HOME).resource, ResourceHealth::Throttled { cause: ThrottleCause::StuckWorker, .. }),
+        "line 1031: the local workspace domain is never quarantined by the SMB domain's stuck worker; it reports {:?}",
+        domain_stat(&h, HOME).resource
+    );
+    assert!(
+        h.paths().contains(&"local/f".to_string()),
+        "line 1031: local workspace reconciliation remains active while the SMB domain is stuck"
+    );
+    assert!(h.stats().listing_operations > 0, "line 1015: tree-level listing operations are observable");
+}
+
+#[test]
+fn a_degraded_directory_names_its_cause_through_health() {
+    let fs = tree(&["denied", "denied/inner"]);
+    fs.create_file("denied/inner/f", 1);
+    let mut h = scanned(fs.clone(), Config::default());
+    fs.fail("denied", FakeOp::ReadDir, FailureMode::Always(FsError::PermissionDenied));
+    for _ in 0..6 {
+        h.run_round();
+        h.run_until_idle();
+    }
+
+    let causes = h.health().reconciliation.degraded_path_causes;
+    assert_eq!(
+        causes.get(&path("denied")),
+        Some(&DegradedCause::PermissionDenied),
+        "RFC 13.1 and 15.6 and line 1022: a degraded path names its cause, distinguishing lack of permission from \
+         absence; the tree reports {causes:?}"
+    );
+    assert!(
+        h.snapshot().get(&path("denied")).is_some(),
+        "line 1022: a permission-denied directory is degraded, not removed as absent",
+    );
+}
+
+#[test]
+fn suspended_sessions_are_counted_per_domain() {
+    let fs = wide(8);
+    fs.set_chunk_size(1);
+    fs.set_domain("", HOME);
+    fs.set_domain("aaa", MEDIA);
+    fs.set_cost(CostScope::path("aaa"), FakeOp::ReadDir, Duration::from_secs(5));
+    let config = Config { entries_per_lease: 2, ..follow() };
+    let mut h = Harness::open_with_host(fs.clone(), Arc::new(LoadAll), one_worker(), config).expect("open");
+    for _ in 0..8 {
+        if h.stats().suspended_sessions > 0 {
+            break;
+        }
+        assert!(h.advance_to_next_completion(), "no completion was scheduled before a session suspended");
+    }
+    assert_eq!(h.stats().suspended_sessions, 1, "the wide listing never suspended, so nothing is counted");
+    assert_eq!(
+        domain_stat(&h, MEDIA).suspended_sessions,
+        1,
+        "line 1017: a suspended session is counted against the domain of its job"
+    );
+    assert_eq!(
+        domain_stat(&h, HOME).suspended_sessions,
+        0,
+        "line 1017: a domain with no suspended session reports none"
+    );
 }

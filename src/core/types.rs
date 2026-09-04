@@ -759,6 +759,10 @@ impl EntryStates {
         self.degraded.iter().copied()
     }
 
+    pub fn degraded_causes(&self) -> impl Iterator<Item = (EntryId, DegradedCause)> + '_ {
+        self.degraded.iter().filter_map(|id| self.states.get(id).and_then(|s| s.degraded).map(|cause| (*id, cause)))
+    }
+
     pub fn set_directory(&mut self, id: EntryId, directory: bool) {
         let state = self.states.entry(id).or_default();
         let previous = state.coverage();
