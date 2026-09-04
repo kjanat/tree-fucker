@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tree_fucker::core::{Command, MonotonicTime};
+use tree_fucker::core::{Command, JobOperation, MonotonicTime};
 use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{CostScope, DomainId, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{RoundResult, WatcherHealth};
@@ -464,4 +464,243 @@ fn a_remote_domain_declaring_no_external_writers_is_still_reconciled_under_the_d
     );
     assert_eq!(fs.count_ops(FakeOp::Watch, "net"), 0, "RFC 10.4: an unloaded mount point takes no watch registration");
     assert_eq!(h.stats().paths_unwatched_by_cap, 0, "nothing was turned away by the cap in this tree");
+}
+
+#[test]
+fn a_symbolic_link_entry_receives_no_watch_registration() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    fs.mkdir("dir");
+    fs.create_file("dir/f", 1);
+    fs.add_silently("link", tree_fucker::EntryKind::Symlink);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+
+    assert_eq!(
+        h.entry("link").map(|e| e.kind()),
+        Some(tree_fucker::EntryKind::Symlink),
+        "RFC 14.2: a symbolic link is represented as an entry"
+    );
+    assert_eq!(
+        fs.count_ops(FakeOp::Watch, "link"),
+        0,
+        "RFC 14.2 and 10.4: a symbolic link is never traversed, so it takes no watch registration; the adapter \
+         performed {:?}",
+        fs.ops()
+    );
+    assert!(fs.count_ops(FakeOp::Watch, "dir") > 0, "the real directory registered nothing, so nothing was compared");
+    assert_eq!(fs.count_ops(FakeOp::ReadDir, "link"), 0, "RFC 14.2: a symbolic link entry is never listed");
+}
+
+#[test]
+fn a_hint_delivered_during_an_in_flight_listing_discards_the_stale_result() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    fs.mkdir("d0");
+    fs.create_file("d0/f", 1);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    fs.clear_ops();
+    let stale_before = h.stats().stale_results;
+    let reads_before = fs.count_ops(FakeOp::ReadDir, "d0");
+
+    let t = h.command(Command::Refresh(vec![path("d0")]));
+    let job = loop {
+        if let Some(job) = h.pending_job_for("d0") {
+            break job;
+        }
+        let next = h.now() + Duration::from_secs(1);
+        h.run_jobs_until(next);
+    };
+    fs.add_silently("d0/late", tree_fucker::EntryKind::File);
+    h.inject_watcher_event(tree_fucker::fs::WatcherEvent::Hint { paths: vec![path("d0")], kind: HintKind::Modify });
+    h.deliver_watcher_events();
+    h.complete_job(job.id);
+
+    assert_eq!(
+        h.stats().stale_results,
+        stale_before + 1,
+        "RFC 11.2: accepting a watcher hint increments the target's change epoch, so the listing that was in flight \
+         when the hint arrived is stale and its result MUST NOT commit"
+    );
+    h.run_until_idle();
+    assert!(
+        fs.count_ops(FakeOp::ReadDir, "d0") > reads_before + 1,
+        "RFC 11.2: the stale target is queued again, so d0 is listed a second time before the hint is served"
+    );
+    assert_eq!(h.result(t), Some(Ok(())));
+    assert!(
+        h.paths().contains(&"d0/late".to_string()),
+        "the re-listing after the hint observes the change; the tree holds {:?}",
+        h.paths()
+    );
+}
+
+fn watched_tree() -> Arc<FakeFileSystem> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    for i in 0..3 {
+        fs.mkdir(&format!("d{i}"));
+        fs.create_file(&format!("d{i}/f"), 1);
+    }
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(5));
+    fs
+}
+
+#[test]
+fn a_watcher_triggered_read_carries_a_governor_admission_like_any_other() {
+    let fs = watched_tree();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    fs.clear_ops();
+    let before = h.admissions().len();
+
+    fs.emit_storm(&["d0", "d1", "d2"], HintKind::Modify, 1);
+    h.deliver_watcher_events();
+    h.run_until_idle();
+
+    let performed: usize = ["d0", "d1", "d2"].iter().map(|d| fs.count_ops(FakeOp::ReadDir, d)).sum();
+    assert!(performed > 0, "the hints triggered no read, so the property was never tested");
+    let watcher_admissions: Vec<_> = h.admissions().into_iter().skip(before).collect();
+    let listings = watcher_admissions.iter().filter(|a| a.operation == JobOperation::Listing).count();
+    assert!(
+        listings >= performed,
+        "RFC 15.1 item 1 and lines 886-906: every watcher-triggered read passes through the governor; {performed} \
+         reads ran against {listings} logged listing admissions"
+    );
+}
+
+#[test]
+fn a_watcher_storm_changes_priority_never_capacity_ceiling_or_window() {
+    let fs = watched_tree();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    let before_capacity = h.governor().capacity;
+    let before: Vec<usize> = h.stats().domains.iter().map(|d| d.ceiling).collect();
+    let before_windows: Vec<usize> = h.stats().domains.iter().map(|d| d.window).collect();
+
+    let target = h.now() + Duration::from_secs(120);
+    let emitted = h.flood_hints_until(&["d0", "d1", "d2"], HintKind::Modify, target);
+    assert!(emitted > 100, "the storm emitted only {emitted} hints");
+
+    assert_eq!(
+        h.governor().capacity,
+        before_capacity,
+        "RFC 15.1 item 3 and line 972: a watcher storm must not change the background admission envelope"
+    );
+    let after: Vec<usize> = h.stats().domains.iter().map(|d| d.ceiling).collect();
+    assert_eq!(
+        after, before,
+        "RFC 15.1 item 3 and 15.5: a watcher storm changes priority, never the per-domain concurrency ceiling; \
+         before {before:?} after {after:?}"
+    );
+    let after_windows: Vec<usize> = h.stats().domains.iter().map(|d| d.window).collect();
+    assert!(
+        after_windows.iter().zip(&after).all(|(window, ceiling)| window <= ceiling),
+        "RFC 15.5: the concurrency window adapts to measurements but never past its ceiling; windows {after_windows:?} \
+         against ceilings {after:?} (before {before_windows:?})"
+    );
+    assert!(
+        h.stats().dropped_hints > 0 || h.stats().coalesced_hints > 0,
+        "the storm was neither coalesced nor dropped, so it was not absorbed"
+    );
+}
+
+#[test]
+fn an_overflow_storm_coalesces_and_the_overflow_itself_publishes_no_change() {
+    let fs = watched_tree();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    h.take_events();
+    let version = h.snapshot().version();
+
+    for _ in 0..50 {
+        fs.emit_overflow();
+    }
+    h.deliver_watcher_events();
+    assert_eq!(
+        h.snapshot().version(),
+        version,
+        "RFC 11.6 and line 975: an overflow infers no state and commits nothing, so the snapshot version is \
+         unchanged by the overflow itself"
+    );
+    assert!(
+        h.events().iter().all(|event| !matches!(event, tree_fucker::UpdateEvent::Delta(_))),
+        "RFC 11.6: repeated overflows coalesce into a reconciliation requirement and publish no delta of their own"
+    );
+
+    fs.add_silently("d0/late", tree_fucker::EntryKind::File);
+    h.run_round();
+    h.run_until_idle();
+    assert!(
+        h.paths().contains(&"d0/late".to_string()),
+        "RFC 11.6: the coalesced overflow schedules the reconciliation that recovers the missed change"
+    );
+}
+
+#[test]
+fn a_silent_write_under_a_domain_that_declares_no_external_writers_converges_by_baseline() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    fs.mkdir("net");
+    fs.mkdir("net/inner");
+    fs.create_file("net/inner/f", 1);
+    fs.set_domain("net", REMOTE);
+    fs.set_capabilities(REMOTE, declaring(watching(WatcherScope::PerDirectory, Answer::No)));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).expect("open");
+    h.run_until_idle();
+    assert!(h.paths().contains(&"net/inner/f".to_string()));
+
+    fs.add_silently("net/inner/late", tree_fucker::EntryKind::File);
+    for _ in 0..4 {
+        h.run_round();
+        h.run_until_idle();
+    }
+    assert!(
+        h.paths().contains(&"net/inner/late".to_string()),
+        "RFC 10.4 and line 973: a domain whose watcher cannot see external writers mutates without an event, and \
+         periodic reconciliation still converges on the change; the tree holds {:?}",
+        h.paths()
+    );
+}
+
+#[test]
+fn an_unknown_hint_reconciles_the_named_directory_and_its_parent() {
+    let fs = watched_tree();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), Config::default()).expect("open");
+    h.run_until_idle();
+    fs.clear_ops();
+
+    fs.replace_with_kind("d0/f", tree_fucker::EntryKind::Directory);
+    h.deliver_watcher_events();
+    h.run_until_idle();
+    assert!(
+        fs.count_ops(FakeOp::ReadDir, "d0") > 0,
+        "RFC 11.2 and lines 330-334: an unknown hint carries no child names, so it reconciles the containing \
+         directory rather than inventing precision; the adapter performed {:?}",
+        fs.ops()
+    );
+}
+
+#[test]
+fn a_whole_watcher_failure_charges_every_release_to_its_owning_domain_not_the_bootstrap_scope() {
+    let fs = two_domains();
+    fs.set_capabilities(DomainId::ROOT, declaring(watching(WatcherScope::PerDirectory, Answer::Yes)));
+    fs.set_capabilities(MEDIA, declaring(watching(WatcherScope::PerDirectory, Answer::Yes)));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).expect("open");
+    h.run_until_idle();
+    assert!(h.stats().paths_watched > 0, "no watch was registered, so no release can be charged");
+
+    fs.emit_watcher_failure("backend restarted");
+    h.deliver_watcher_events();
+    h.run_until_idle();
+
+    assert_eq!(
+        h.governor().bootstrap.granted,
+        Duration::ZERO,
+        "RFC 15.3 and lines 1027-1031: a watch release is charged to the domain of the directory it watched, so a \
+         whole-watcher failure strands no release in the process-wide bootstrap scope; it holds {:?}",
+        h.governor().bootstrap
+    );
+    assert!(
+        h.governor().watch_release_grants > 0,
+        "the failure released no watch, so the charging path was never exercised"
+    );
 }

@@ -310,6 +310,16 @@ mod tests {
         assert_eq!(local.topology, AccessTopology::Local);
         assert_eq!(local.watcher.observes_external_writers, Answer::Yes);
         assert_eq!(local.filesystem, FilesystemInstance::Known(FilesystemInstanceKey::fsid(1, 2)));
+        assert_eq!(
+            (local.watcher.scope, local.watcher.can_lose_events, local.watcher.signals_overflow),
+            (WatcherScope::Recursive, Answer::Yes, Answer::Yes),
+            "RFC 10.4: FSEvents is recursive, coalesces, and signals its own loss"
+        );
+        assert_eq!(
+            remote.watcher.polling_fallback_required,
+            Answer::Yes,
+            "RFC 10.4 and 14.3: FSEvents sees only local-kernel changes, so a non-local volume requires polling"
+        );
     }
 
     #[test]

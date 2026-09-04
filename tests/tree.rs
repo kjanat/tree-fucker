@@ -6,7 +6,8 @@ use tree_fucker::policy::{PathPredicate, ScanDecision};
 use tree_fucker::testing::{BlockingMode, DeterministicRuntime, FailureMode, FakeFileSystem, FakeOp, HoldingRuntime};
 use tree_fucker::update::{ErrorCause, InitialScanState, Operation, RecoverableError, RoundResult, UpdateEvent};
 use tree_fucker::{
-    Config, EntryKind, Error, FsError, HostConfig, LagMode, LoadAll, LoadState, RelativePath, Tree, WatcherKind,
+    Config, EntryKind, Error, FsError, HintKind, HostConfig, LagMode, LoadAll, LoadState, RelativePath, Tree,
+    WatcherKind,
 };
 
 fn path(p: &str) -> RelativePath {
@@ -60,6 +61,44 @@ fn open_scan_refresh_and_shutdown_over_the_async_layer() {
     }
     assert!(saw_terminal);
     assert_eq!(runtime.block_on(handle.refresh(vec![path("a")])), Err(Error::Shutdown));
+}
+
+#[test]
+fn the_tree_level_watcher_sink_bounds_its_queue_and_reports_the_drops() {
+    let runtime = Arc::new(DeterministicRuntime::new());
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    for i in 0..3 {
+        fs.mkdir(&format!("d{i}"));
+        fs.create_file(&format!("d{i}/f"), 1);
+    }
+    let config = Config { watcher_path_limit: 2, ..Default::default() };
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let (handle, _stream) =
+        runtime.block_on(open_tree(fs.clone(), fs.root().to_path_buf(), Arc::new(LoadAll), config, rt)).expect("open");
+    runtime.block_on(handle.initial_scan_complete()).expect("scan");
+    runtime.run_until_stalled();
+    let dropped_before = handle.stats().dropped_hints;
+
+    fs.add_silently("d0/late", EntryKind::File);
+    let emitted = fs.emit_storm(&[".", "d0", "d1", "d2"], HintKind::Modify, 40);
+    assert!(emitted > 2, "the storm delivered only {emitted} events, too few to overflow a bound of two");
+    runtime.run_until_stalled();
+
+    assert!(
+        handle.stats().dropped_hints > dropped_before,
+        "RFC 12 and 13.6: the tree-level watcher sink is bounded and reports its drops; dropped_hints went from \
+         {dropped_before} to {}",
+        handle.stats().dropped_hints
+    );
+
+    runtime.advance(Duration::from_secs(2));
+    runtime.advance(Duration::from_secs(2));
+    assert!(
+        handle.snapshot().get(&path("d0/late")).is_some(),
+        "RFC 12: a bounded, lossy sink still converges because reconciliation recovers what the dropped events \
+         carried; the tree holds {:?}",
+        handle.snapshot().entries().map(|e| e.path.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

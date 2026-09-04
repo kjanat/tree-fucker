@@ -365,6 +365,12 @@ mod tests {
         assert_eq!(remote.topology, AccessTopology::Remote);
         assert_eq!(remote.identity_reliability, IdentityReliability::Advisory);
         assert_eq!(remote.watcher.observes_external_writers, Answer::No);
+        assert_eq!(
+            (remote.watcher.can_lose_events, remote.watcher.polling_fallback_required),
+            (Answer::Yes, Answer::Yes),
+            "RFC 10.4 and 14.3: ReadDirectoryChangesW over the network can lose events and requires polling fallback"
+        );
+        assert_eq!(unknown.watcher.can_lose_events, Answer::Yes, "RFC 10.4: the local watcher can also overflow");
         let fat = capabilities_of(&volume(Some(("FAT32", 0)), false, None));
         assert_eq!(fat.semantics, FilesystemSemantics::Fat);
         assert_eq!(fat.identity_reliability, IdentityReliability::None);

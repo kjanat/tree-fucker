@@ -1607,8 +1607,19 @@ impl Coordinator {
     }
 
     fn unwatch_all(&mut self) {
-        for id in std::mem::take(&mut self.watches) {
-            self.emit_unwatch(id, None);
+        let mut charged: std::collections::HashSet<WatchId> = std::collections::HashSet::new();
+        let watched: Vec<crate::ids::EntryId> = self.entries.watched_ids().collect();
+        for id in watched {
+            if let Some(WatchState::Registered(watch)) = self.dir_state(id).map(|d| d.watch()) {
+                let domain = self.domain_of(id);
+                self.emit_unwatch(watch, domain);
+                charged.insert(watch);
+            }
+        }
+        for watch in std::mem::take(&mut self.watches) {
+            if !charged.contains(&watch) {
+                self.emit_unwatch(watch, None);
+            }
         }
         self.entries.reset_watches();
     }
