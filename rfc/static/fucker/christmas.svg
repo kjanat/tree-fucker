@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 128 128"
+     aria-label="Treefucker icon" role="img"
+     xmlns="http://www.w3.org/2000/svg">
+	<title>
+		treefucker
+	</title>
+
+	<!-- tree: triangle canopy + trunk -->
+	<polygon points="92,18 118,78 66,78" fill="#2F5D3A" />
+	<rect x="84" y="78" width="16" height="34" fill="#5A3A22" />
+
+	<!-- person silhouette, side view, hips into trunk -->
+	<g fill="#1A1A1A">
+		<circle cx="42" cy="46" r="11" />
+		<!-- torso angled into tree -->
+		<polygon points="38,56 58,62 62,86 40,84" />
+		<!-- rear hip bump -->
+		<ellipse cx="42" cy="78" rx="10" ry="8" />
+		<!-- back leg kicked -->
+		<polygon points="40,84 28,104 38,106 48,86" />
+		<!-- planted leg -->
+		<polygon points="52,84 58,106 70,104 62,82" />
+		<!-- arms around trunk -->
+		<rect x="58" y="64" rx="3.5" width="30" height="7" />
+	</g>
+
+	<!-- hip-thrust ticks -->
+	<g fill="none" stroke="#1A1A1A" stroke-width="3" stroke-linecap="round">
+		<path d="M24 70h10" />
+		<path d="M22 78h10" />
+		<path d="M26 86h8" />
+	</g>
+</svg>
