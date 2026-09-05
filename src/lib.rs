@@ -25,7 +25,7 @@ pub use domain::{
     DomainCrossing, DomainIdentity, DomainKey, DomainProbe, FilesystemInstance, FilesystemInstanceKey,
     FilesystemSemantics, IdentityReliability, IdentitySource, IdentitySpace, IdentitySpaceKey, KindSource, MediaHint,
     MetadataSource, MetadataSources, ProbeError, ProbeResult, StorageDomainId, TimestampGranularity, TransportHint,
-    WatcherAvailability, WatcherCapabilities, WatcherScope,
+    WatcherAvailability, WatcherCapabilities, WatcherScope, WeakDomainKey,
 };
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};

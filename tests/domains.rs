@@ -1056,3 +1056,142 @@ fn per_domain_watch_accounting_matches_a_recomputed_scan() {
     );
     assert_eq!(stats.loaded_directories, h.snapshot().loaded_directories().count());
 }
+
+#[test]
+fn two_mounts_the_adapter_cannot_tell_apart_are_two_domains_and_a_relist_rebinds_the_one_it_holds() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    for dir in ["near", "near/inner", "far", "far/inner"] {
+        fs.mkdir(dir);
+        fs.create_file(&format!("{dir}/f"), 1);
+    }
+    fs.set_domain("near", MEDIA);
+    fs.set_domain("far", BIND);
+    fs.report_unknown_domain_identity(MEDIA);
+    fs.report_unknown_domain_identity(BIND);
+    let indistinguishable = DomainCapabilities { topology: AccessTopology::Local, ..DomainCapabilities::inline() };
+    fs.set_capabilities(MEDIA, indistinguishable.clone());
+    fs.set_capabilities(BIND, indistinguishable);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_until_idle();
+
+    let unknown: Vec<_> =
+        h.stats().domains.into_iter().filter(|domain| domain.identity == DomainIdentity::Unknown).collect();
+    assert_eq!(
+        unknown.len(),
+        2,
+        "RFC 15.9: a domain whose identity is unavailable is accounted as its own domain, so two mounts the adapter \
+         cannot tell apart are two storage domains; the tree entered {unknown:?}"
+    );
+    let near = unknown
+        .iter()
+        .find(|domain| domain.entry_path == Some(path("near")))
+        .unwrap_or_else(|| panic!("the near mount was never entered; the tree holds {unknown:?}"));
+    let far = unknown
+        .iter()
+        .find(|domain| domain.entry_path == Some(path("far")))
+        .unwrap_or_else(|| panic!("the far mount was never entered; the tree holds {unknown:?}"));
+    assert_eq!(
+        near.capabilities, far.capabilities,
+        "the fixture gives the two mounts one set of capabilities, so nothing but the path separates them"
+    );
+    assert_ne!(
+        near.id, far.id,
+        "RFC 15.9: splitting the envelope is conservative and merging it is not, so two indistinguishable mounts \
+         must not collapse onto one domain id"
+    );
+
+    let ticket = h.command(Command::Refresh(vec![path("near"), path("far")]));
+    h.run_until_idle();
+    assert_eq!(h.result(ticket), Some(Ok(())));
+    for _ in 0..3 {
+        h.run_round();
+        h.run_until_idle();
+    }
+    let after: Vec<_> =
+        h.stats().domains.into_iter().filter(|domain| domain.identity == DomainIdentity::Unknown).collect();
+    assert_eq!(
+        (
+            after.iter().find(|domain| domain.entry_path == Some(path("near"))).map(|domain| domain.id),
+            after.iter().find(|domain| domain.entry_path == Some(path("far"))).map(|domain| domain.id),
+        ),
+        (Some(near.id), Some(far.id)),
+        "RFC 15.7: a relisted mount rebinds the domain it already holds rather than minting another; the tree \
+         entered {after:?}"
+    );
+    assert_eq!(after.len(), 2, "the relisting minted a domain; the tree entered {after:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_relisted_mount_is_the_one_its_weak_evidence_names_whatever_its_capabilities_say() {
+    use tree_fucker::WeakDomainKey;
+
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    for dir in ["mnt", "mnt/inner"] {
+        fs.mkdir(dir);
+        fs.create_file(&format!("{dir}/f"), 1);
+    }
+    fs.set_domain("mnt", MEDIA);
+    fs.report_weak_domain_identity(MEDIA, WeakDomainKey::linux_reusable_mount(11));
+    fs.set_capabilities(MEDIA, DomainCapabilities { media: MediaHint::Rotational, ..DomainCapabilities::inline() });
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_until_idle();
+
+    let entered = |h: &Harness, key: WeakDomainKey| {
+        let matching: Vec<_> = h
+            .stats()
+            .domains
+            .into_iter()
+            .filter(|domain| domain.identity == DomainIdentity::Weak(key.clone()))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "RFC 15.9: one mount holds one storage domain and one account of worker time; the tree entered \
+             {matching:?}"
+        );
+        matching.into_iter().next().expect("one domain")
+    };
+    let first = entered(&h, WeakDomainKey::linux_reusable_mount(11));
+    assert_eq!(
+        first.capabilities.media,
+        MediaHint::Rotational,
+        "the fixture did not declare the capabilities this test changes"
+    );
+
+    let solid_state = DomainCapabilities { media: MediaHint::SolidState, ..DomainCapabilities::inline() };
+    fs.set_capabilities(MEDIA, solid_state.clone());
+    for _ in 0..4 {
+        h.run_round();
+        h.run_until_idle();
+    }
+    let relearned = entered(&h, WeakDomainKey::linux_reusable_mount(11));
+    assert_eq!(
+        relearned.capabilities.media,
+        MediaHint::SolidState,
+        "the relist did not carry the new capabilities, so the scenario is untested"
+    );
+    assert_eq!(
+        relearned.id, first.id,
+        "RFC 15.9: an equal weak key on one entry names one mount, so a learned media hint rebinds the domain the \
+         entry already holds instead of splitting its account in two"
+    );
+
+    fs.report_weak_domain_identity(MEDIA, WeakDomainKey::linux_reusable_mount(12));
+    fs.set_capabilities(MEDIA, solid_state);
+    for _ in 0..4 {
+        h.run_round();
+        h.run_until_idle();
+    }
+    let recycled = entered(&h, WeakDomainKey::linux_reusable_mount(12));
+    assert_eq!(
+        recycled.capabilities.media,
+        MediaHint::SolidState,
+        "the capabilities are equal across the recycle, so only the weak key separates the two mounts"
+    );
+    assert_ne!(
+        recycled.id, relearned.id,
+        "RFC 15.9: a reusable mount identifier is recycled, so a changed weak key on one entry is a different mount \
+         and must not inherit the window, debt and latency of the one it replaced"
+    );
+}

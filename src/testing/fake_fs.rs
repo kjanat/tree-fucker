@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::domain::{
     DeclaredProbe, DomainCapabilities, DomainIdentity, DomainKey, DomainProbe, IdentitySource, IdentitySpace,
-    IdentitySpaceKey, KindSource, ProbeResult,
+    IdentitySpaceKey, KindSource, ProbeResult, WeakDomainKey,
 };
 use crate::entry::{EntryKind, FileIdentity, Metadata, MetadataFields};
 use crate::fs::{
@@ -117,6 +117,7 @@ struct Inner {
     identity_spaces: HashMap<DomainId, u64>,
     directory_cases: HashMap<RelativePath, CaseSensitivity>,
     unknown_identities: BTreeSet<DomainId>,
+    weak_identities: HashMap<DomainId, WeakDomainKey>,
     non_domain_roots: BTreeSet<DomainId>,
     inline_domains: bool,
     unknown_kinds: BTreeSet<RelativePath>,
@@ -190,6 +191,7 @@ impl FakeFileSystem {
                 identity_spaces: HashMap::new(),
                 directory_cases: HashMap::new(),
                 unknown_identities: BTreeSet::new(),
+                weak_identities: HashMap::new(),
                 non_domain_roots: BTreeSet::new(),
                 inline_domains: true,
                 unknown_kinds: BTreeSet::new(),
@@ -548,6 +550,10 @@ impl FakeFileSystem {
         lock(&self.inner).unknown_identities.insert(domain);
     }
 
+    pub fn report_weak_domain_identity(&self, domain: DomainId, key: WeakDomainKey) {
+        lock(&self.inner).weak_identities.insert(domain, key);
+    }
+
     pub fn report_not_domain_root(&self, domain: DomainId) {
         lock(&self.inner).non_domain_roots.insert(domain);
     }
@@ -601,10 +607,10 @@ impl FakeFileSystem {
 
     fn probe_for(inner: &Inner, path: &RelativePath, parent: Option<&ProbeResult>) -> ProbeResult {
         let domain = Self::domain_for(inner, path);
-        let identity = if inner.unknown_identities.contains(&domain) {
-            DomainIdentity::Unknown
-        } else {
-            DomainIdentity::Known(Self::domain_key(domain))
+        let identity = match inner.weak_identities.get(&domain) {
+            Some(weak) => DomainIdentity::Weak(weak.clone()),
+            None if inner.unknown_identities.contains(&domain) => DomainIdentity::Unknown,
+            None => DomainIdentity::Known(Self::domain_key(domain)),
         };
         let probe = DeclaredProbe::new(
             identity,

@@ -164,6 +164,14 @@ fn watcher_backend(capabilities: WatcherCapabilities) -> WatcherKind {
     }
 }
 
+fn names_the_same_mount(held: &ProbeResult, probe: &ProbeResult) -> bool {
+    match (held.identity.weak(), probe.identity.weak()) {
+        (Some(held), Some(observed)) => held == observed,
+        (None, None) => !held.identity.is_known() && held.capabilities == probe.capabilities,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum DomainSite<'a> {
     Represented(EntryId),
@@ -1134,8 +1142,7 @@ impl Coordinator {
             DomainSite::Child { .. } | DomainSite::Detached => None,
         };
         if let Some(binding) = held
-            && !binding.probe.identity.is_known()
-            && binding.probe.capabilities == probe.capabilities
+            && names_the_same_mount(&binding.probe, probe)
         {
             return binding.id;
         }

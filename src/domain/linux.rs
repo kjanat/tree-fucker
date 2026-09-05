@@ -14,7 +14,7 @@ use super::{
     DomainIdentity, DomainKey, DomainProbe, FilesystemInstance, FilesystemInstanceKey, FilesystemSemantics,
     IdentityReliability, IdentitySource, IdentitySpace, IdentitySpaceKey, KindSource, MediaHint, MetadataSources,
     ProbeError, ProbeResult, TimestampGranularity, TransportHint, WatcherAvailability, WatcherCapabilities,
-    WatcherScope,
+    WatcherScope, WeakDomainKey,
 };
 use crate::path::CaseSensitivity;
 
@@ -157,11 +157,11 @@ fn mount_root_of(supported: StatxAttributes, attributes: StatxAttributes) -> Opt
 }
 
 fn identity_of(mount: MountId, device: Device) -> DomainIdentity {
-    DomainIdentity::Known(match mount {
-        MountId::Unique(id) => DomainKey::linux_unique_mount(id),
-        MountId::Reusable(id) => DomainKey::linux_reusable_mount(id),
-        MountId::Device => DomainKey::linux_device(device.major, device.minor),
-    })
+    match mount {
+        MountId::Unique(id) => DomainIdentity::Known(DomainKey::linux_unique_mount(id)),
+        MountId::Reusable(id) => DomainIdentity::Weak(WeakDomainKey::linux_reusable_mount(id)),
+        MountId::Device => DomainIdentity::Weak(WeakDomainKey::linux_device(device.major, device.minor)),
+    }
 }
 
 fn crossing(
@@ -177,10 +177,9 @@ fn crossing(
     if matches!(mount, MountId::Device) {
         return proven_by_attribute;
     }
-    match (parent.identity.key(), identity.key()) {
-        (Some(outer), Some(inner)) if outer == inner => Crossing::NotCrossed,
-        (Some(_), Some(_)) => Crossing::Proven,
-        _ => proven_by_attribute,
+    match identity.crossing_from(&parent.identity) {
+        Crossing::Inconclusive => proven_by_attribute,
+        verdict => verdict,
     }
 }
 
@@ -900,13 +899,25 @@ mod tests {
         assert_eq!(mount_id(STATX_MNT_ID_UNIQUE.bits() | StatxFlags::TYPE.bits(), 7), MountId::Unique(7));
         assert_eq!(mount_id(StatxFlags::MNT_ID.bits(), 7), MountId::Reusable(7));
         assert_eq!(mount_id(StatxFlags::TYPE.bits(), 7), MountId::Device);
+    }
+
+    #[test]
+    fn only_a_unique_mount_identifier_becomes_a_process_stable_domain_key() {
         let device = Device { major: 8, minor: 1 };
-        assert_eq!(identity_of(MountId::Unique(7), device), DomainIdentity::Known(DomainKey::linux_unique_mount(7)));
         assert_eq!(
-            identity_of(MountId::Reusable(7), device),
-            DomainIdentity::Known(DomainKey::linux_reusable_mount(7))
+            identity_of(MountId::Unique(7), device),
+            DomainIdentity::Known(DomainKey::linux_unique_mount(7)),
+            "RFC 15.9: a unique mount identifier is unique for the lifetime of the process, so it names a storage \
+             domain every tree in the process shares"
         );
-        assert_eq!(identity_of(MountId::Device, device), DomainIdentity::Known(DomainKey::linux_device(8, 1)));
+        for weak in [identity_of(MountId::Reusable(7), device), identity_of(MountId::Device, device)] {
+            assert!(
+                !weak.is_known(),
+                "RFC 15.9: a reusable mount identifier is recycled and a device number cannot tell two bind mounts \
+                 apart, so neither may name a process-wide storage domain; the probe answered {weak:?}"
+            );
+            assert_eq!(weak.key(), None, "the weak evidence must not reach the process-wide key table");
+        }
     }
 
     #[test]
@@ -919,8 +930,8 @@ mod tests {
     #[test]
     fn on_the_device_fallback_only_the_mount_root_attribute_proves_a_crossing() {
         let parent =
-            ProbeResult { identity: DomainIdentity::Known(DomainKey::linux_device(8, 1)), ..ProbeResult::unknown() };
-        let other = DomainIdentity::Known(DomainKey::linux_device(0, 40));
+            ProbeResult { identity: DomainIdentity::Weak(WeakDomainKey::linux_device(8, 1)), ..ProbeResult::unknown() };
+        let other = DomainIdentity::Weak(WeakDomainKey::linux_device(0, 40));
         assert_eq!(
             crossing(Some(&parent), &other, MountId::Device, Some(false)),
             Crossing::Inconclusive,
@@ -928,16 +939,16 @@ mod tests {
         );
         assert_eq!(crossing(Some(&parent), &other, MountId::Device, None), Crossing::Inconclusive);
         assert_eq!(crossing(Some(&parent), &other, MountId::Device, Some(true)), Crossing::Proven);
-        let same = DomainIdentity::Known(DomainKey::linux_device(8, 1));
+        let same = DomainIdentity::Weak(WeakDomainKey::linux_device(8, 1));
         assert_eq!(
             crossing(Some(&parent), &same, MountId::Device, Some(true)),
             Crossing::Proven,
             "RFC 14.3: bind mounts share one st_dev, so an equal st_dev is not proof of the opposite"
         );
-        let reusable = DomainIdentity::Known(DomainKey::linux_reusable_mount(3));
+        let reusable = DomainIdentity::Weak(WeakDomainKey::linux_reusable_mount(3));
         let reusable_parent = ProbeResult { identity: reusable.clone(), ..ProbeResult::unknown() };
         assert_eq!(crossing(Some(&reusable_parent), &reusable, MountId::Reusable(3), None), Crossing::NotCrossed);
-        let next = DomainIdentity::Known(DomainKey::linux_reusable_mount(4));
+        let next = DomainIdentity::Weak(WeakDomainKey::linux_reusable_mount(4));
         assert_eq!(crossing(Some(&reusable_parent), &next, MountId::Reusable(4), None), Crossing::Proven);
         assert_eq!(crossing(None, &next, MountId::Reusable(4), Some(true)), Crossing::NotCrossed);
     }

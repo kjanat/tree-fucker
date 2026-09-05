@@ -101,13 +101,6 @@ enum Key {
     Declared(u64),
     #[cfg(target_os = "linux")]
     LinuxUniqueMount(u64),
-    #[cfg(target_os = "linux")]
-    LinuxReusableMount(u64),
-    #[cfg(target_os = "linux")]
-    LinuxDevice {
-        major: u32,
-        minor: u32,
-    },
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     Fsid {
         first: i32,
@@ -129,16 +122,6 @@ impl DomainKey {
         DomainKey(Key::LinuxUniqueMount(id))
     }
 
-    #[cfg(target_os = "linux")]
-    pub(super) fn linux_reusable_mount(id: u64) -> DomainKey {
-        DomainKey(Key::LinuxReusableMount(id))
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn linux_device(major: u32, minor: u32) -> DomainKey {
-        DomainKey(Key::LinuxDevice { major, minor })
-    }
-
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub(super) fn fsid(first: i32, second: i32) -> DomainKey {
         DomainKey(Key::Fsid { first, second })
@@ -152,6 +135,29 @@ impl DomainKey {
     #[cfg(windows)]
     pub(super) fn windows_volume_guid(guid: String) -> DomainKey {
         DomainKey(Key::WindowsVolumeGuid(guid))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WeakDomainKey(WeakKey);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum WeakKey {
+    #[cfg(target_os = "linux")]
+    LinuxReusableMount(u64),
+    #[cfg(target_os = "linux")]
+    LinuxDevice { major: u32, minor: u32 },
+}
+
+impl WeakDomainKey {
+    #[cfg(target_os = "linux")]
+    pub fn linux_reusable_mount(id: u64) -> WeakDomainKey {
+        WeakDomainKey(WeakKey::LinuxReusableMount(id))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn linux_device(major: u32, minor: u32) -> WeakDomainKey {
+        WeakDomainKey(WeakKey::LinuxDevice { major, minor })
     }
 }
 
@@ -253,6 +259,7 @@ impl IdentitySpaceKey {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DomainIdentity {
     Known(DomainKey),
+    Weak(WeakDomainKey),
     #[default]
     Unknown,
 }
@@ -261,12 +268,31 @@ impl DomainIdentity {
     pub fn key(&self) -> Option<&DomainKey> {
         match self {
             DomainIdentity::Known(key) => Some(key),
-            DomainIdentity::Unknown => None,
+            DomainIdentity::Weak(_) | DomainIdentity::Unknown => None,
+        }
+    }
+
+    pub fn weak(&self) -> Option<&WeakDomainKey> {
+        match self {
+            DomainIdentity::Weak(key) => Some(key),
+            DomainIdentity::Known(_) | DomainIdentity::Unknown => None,
         }
     }
 
     pub fn is_known(&self) -> bool {
         matches!(self, DomainIdentity::Known(_))
+    }
+
+    pub fn crossing_from(&self, outer: &DomainIdentity) -> Crossing {
+        let same = match (outer, self) {
+            (DomainIdentity::Known(outer), DomainIdentity::Known(inner)) => outer == inner,
+            (DomainIdentity::Weak(outer), DomainIdentity::Weak(inner)) => outer == inner,
+            _ => return Crossing::Inconclusive,
+        };
+        match same {
+            true => Crossing::NotCrossed,
+            false => Crossing::Proven,
+        }
     }
 }
 
@@ -590,13 +616,9 @@ impl Crossing {
     }
 
     pub fn between(parent: Option<&ProbeResult>, identity: &DomainIdentity) -> Crossing {
-        let Some(parent) = parent else {
-            return Crossing::NotCrossed;
-        };
-        match (parent.identity.key(), identity.key()) {
-            (Some(a), Some(b)) if a == b => Crossing::NotCrossed,
-            (Some(_), Some(_)) => Crossing::Proven,
-            _ => Crossing::Inconclusive,
+        match parent {
+            Some(parent) => identity.crossing_from(&parent.identity),
+            None => Crossing::NotCrossed,
         }
     }
 }
