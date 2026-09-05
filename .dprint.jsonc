@@ -5,7 +5,7 @@
 	"jsonSchemaSort": { "associations": ["**/schema.json", "**/*.schema.json"] },
 	"json": { "trailingCommas": "maintain" },
 	"typescript": { "lineWidth": 150 },
-	"markdown": { "textWrap": "always", "emphasisKind": "asterisks", "lineWidth": 80 },
+	"markdown": { "textWrap": "never", "emphasisKind": "asterisks" },
 	"markup": { "associations": ["!**/*.svg"] },
 	"ruff": { "preview": true },
 	"yaml": { "printWidth": 160 },
