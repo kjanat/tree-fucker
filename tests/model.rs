@@ -340,7 +340,8 @@ fn a_bucket_in_debt_admits_nothing_until_the_debt_is_repaid() {
     let expected: Vec<u64> = (1..=u64::try_from(ids.len()).unwrap_or(u64::MAX)).collect();
     assert_eq!(
         ids, expected,
-        "RFC 15.3: governor denial is not an admission outcome, so a denied job must consume no JobId; the          admitted ids have holes"
+        "RFC 15.3: governor denial is not an admission outcome, so a denied job must consume no JobId; the \
+         admitted ids have holes"
     );
 }
 
@@ -587,7 +588,8 @@ fn domained_history(seed: u64) -> (Harness, Arc<FakeFileSystem>, Vec<String>) {
         for stat in h.stats().domains {
             assert!(
                 stat.in_flight <= stat.window,
-                "RFC 15.3 and 17.5: physical in-flight workers never exceed the per-domain window, stuck workers                  included; seed {seed} step {step} reports {stat:?}"
+                "RFC 15.3 and 17.5: physical in-flight workers never exceed the per-domain window, stuck workers \
+                 included; seed {seed} step {step} reports {stat:?}"
             );
         }
     }

@@ -363,7 +363,7 @@ impl Coordinator {
                 | JobOutcome::Stuck
         );
         if surcharged {
-            self.governor.charge_surcharge(domain, now);
+            self.governor.charge_surcharge(domain, job.origin, now);
         }
         match outcome {
             JobOutcome::Accepted => self.governor.record_outcome(domain, false, now),

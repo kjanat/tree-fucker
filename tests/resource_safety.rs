@@ -1602,16 +1602,65 @@ fn a_repeatedly_failing_target_is_admitted_later_each_time_and_its_domain_carrie
     assert!(free >= 3, "the failing target was retried {free} times without a surcharge, too few to compare");
     assert!(
         charged_attempts < free,
-        "RFC 13.1 and 15.1 item 6: a failed attempt is charged a surcharge against its domain, so the admission          time of each retry is monotone non-decreasing in the cost already consumed; the target was admitted          {charged_attempts} times with the surcharge against {free} without it"
+        "RFC 13.1 and 15.1 item 6: a failed attempt is charged a surcharge against its domain, so the admission \
+         time of each retry is monotone non-decreasing in the cost already consumed; the target was admitted \
+         {charged_attempts} times with the surcharge against {free} without it"
     );
     let expected = Duration::from_millis(20) * u32::try_from(charged_attempts).unwrap_or(u32::MAX);
     assert!(
         surcharged >= expected,
-        "RFC 13.1: {charged_attempts} failed attempts carry at least {expected:?} of surcharge; the governor          charged {surcharged:?}"
+        "RFC 13.1: {charged_attempts} failed attempts carry at least {expected:?} of surcharge; the governor \
+         charged {surcharged:?}"
     );
     assert!(
         charged >= expected,
-        "RFC 13.1: the surcharge is charged against the failing target's domain; its bucket carries {charged:?}          over {charged_attempts} attempts"
+        "RFC 13.1: the surcharge is charged against the failing target's domain; its bucket carries {charged:?} \
+         over {charged_attempts} attempts"
+    );
+}
+
+#[test]
+fn a_failing_foreground_read_surcharges_the_foreground_allowance_alone() {
+    const SURCHARGE: Duration = Duration::from_millis(20);
+
+    let fs = tree(&["media", "media/inner"]);
+    fs.set_domain("media", MEDIA);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let host = HostConfig { failure_surcharge: SURCHARGE, ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, follow());
+    fs.fail("media/inner", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("blip".into())));
+
+    let before = domain_stat(&h, MEDIA);
+    let surcharged = h.governor().surcharged;
+    let ticket = h.command(Command::Refresh(vec![path("media/inner")]));
+    let read = h.pending_job_for("media/inner").expect("the refresh dispatched a listing");
+    assert_eq!(
+        h.admissions().last().map(|admission| admission.origin),
+        Some(WorkOrigin::Foreground),
+        "the refresh read was not admitted as foreground work, so the surcharge origin is untested"
+    );
+    assert!(h.complete_job(read.id), "the failing listing never completed");
+    assert!(matches!(h.result(ticket), Some(Err(_))), "the refresh did not fail, so no surcharge was charged");
+
+    let after = domain_stat(&h, MEDIA);
+    assert_eq!(
+        h.governor().surcharged - surcharged,
+        SURCHARGE,
+        "the failure carried no surcharge, so this test measures nothing"
+    );
+    assert_eq!(
+        after.level, before.level,
+        "RFC 15.1 item 4: foreground and background allowances MUST NOT transfer capacity to each other, so a \
+         failing foreground read leaves the background bucket where it was; it went from {:?} to {:?}",
+        before.level, after.level
+    );
+    assert_eq!(
+        before.foreground_level.saturating_sub(after.foreground_level),
+        before.estimate + SURCHARGE,
+        "RFC 13.1 and 15.4: the read and the surcharge for its failure are both charged to the foreground \
+         allowance; the domain went from {:?} to {:?}",
+        before.foreground_level,
+        after.foreground_level
     );
 }
 
@@ -1630,7 +1679,8 @@ fn a_conservative_topology_starts_at_a_window_of_one_and_local_block_storage_sta
         let stat = h.stats().domains.into_iter().next().expect("the root domain was never entered");
         assert_eq!(
             stat.window, expected,
-            "RFC 15.5: a domain whose topology is {topology:?} and whose media is {media:?} starts with a window              of {expected}; it reports {stat:?}"
+            "RFC 15.5: a domain whose topology is {topology:?} and whose media is {media:?} starts with a window \
+             of {expected}; it reports {stat:?}"
         );
     }
 }
@@ -1654,7 +1704,8 @@ fn a_dead_domain_never_gains_a_second_stuck_worker() {
     assert_eq!(
         domain_stat(&h, MEDIA).window,
         1,
-        "RFC 15.5: the window never exceeds the configured per-domain maximum, so only one worker can be inside          the media domain"
+        "RFC 15.5: the window never exceeds the configured per-domain maximum, so only one worker can be inside \
+         the media domain"
     );
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(36_000));
     h.run_jobs_until(h.now() + Duration::from_secs(1800));
@@ -1764,13 +1815,15 @@ fn a_domain_in_debt_is_not_admitted_before_the_reported_resume_time() {
     assert_eq!(
         admissions_under(&h, "media", since),
         0,
-        "RFC 12 and 15.3: the governor reports {resume:?} as the earliest time it can grant the next background          job on the media domain, so nothing on that domain may be admitted before it"
+        "RFC 12 and 15.3: the governor reports {resume:?} as the earliest time it can grant the next background \
+         job on the media domain, so nothing on that domain may be admitted before it"
     );
 
     h.run_jobs_until(resume + Duration::from_secs(120));
     assert!(
         admissions_under(&h, "media", since) > 0,
-        "RFC 15.3: admission resumes once the reported refill time passes; the tree is at {:?} against a          reported resume of {resume:?}",
+        "RFC 15.3: admission resumes once the reported refill time passes; the tree is at {:?} against a \
+         reported resume of {resume:?}",
         h.now()
     );
 }

@@ -950,14 +950,14 @@ impl Governor {
         self.grants.get(&id).map(|grant| grant.charged.saturating_sub(grant.reserved)).unwrap_or_default()
     }
 
-    pub fn charge_surcharge(&mut self, domain: Option<StorageDomainId>, now: MonotonicTime) {
+    pub fn charge_surcharge(&mut self, domain: Option<StorageDomainId>, origin: WorkOrigin, now: MonotonicTime) {
         if self.surcharge.is_zero() {
             return;
         }
         self.account(now);
         let amount = nanos(self.surcharge);
         self.surcharged_total += amount;
-        self.credit(domain, WorkOrigin::Background, 0, amount, 0, now);
+        self.credit(domain, origin, 0, amount, 0, now);
     }
 
     fn charge_tree(&mut self, tree: Option<TreeNumber>, delta: i128) {
@@ -1447,8 +1447,8 @@ impl HostGovernor {
         guard(&self.inner).overshoot_of(id)
     }
 
-    pub fn charge_surcharge(&self, domain: Option<StorageDomainId>, now: MonotonicTime) {
-        guard(&self.inner).charge_surcharge(domain, now)
+    pub fn charge_surcharge(&self, domain: Option<StorageDomainId>, origin: WorkOrigin, now: MonotonicTime) {
+        guard(&self.inner).charge_surcharge(domain, origin, now)
     }
 
     pub fn charged_by_tree(&self, tree: TreeNumber) -> Duration {
