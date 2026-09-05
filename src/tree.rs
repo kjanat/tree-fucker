@@ -564,6 +564,20 @@ impl Tree {
     }
 }
 
+struct BootstrapGrant {
+    id: GrantId,
+    governor: HostGovernor,
+    runtime: Arc<dyn Runtime>,
+    base: Instant,
+}
+
+impl Drop for BootstrapGrant {
+    fn drop(&mut self) {
+        let now = MonotonicTime(self.runtime.now().saturating_duration_since(self.base));
+        self.governor.release(self.id, now);
+    }
+}
+
 async fn bootstrap<T: Send + 'static>(
     runtime: &Arc<dyn Runtime>,
     governor: &HostGovernor,
@@ -572,7 +586,7 @@ async fn bootstrap<T: Send + 'static>(
     work: impl FnOnce() -> std::result::Result<T, FsError> + Send + 'static,
 ) -> Result<T> {
     let id = GrantId::Bootstrap(governor.next_bootstrap());
-    loop {
+    let grant = loop {
         let now = MonotonicTime(runtime.now().saturating_duration_since(base));
         let reservation = Reservation {
             id,
@@ -585,10 +599,10 @@ async fn bootstrap<T: Send + 'static>(
             listing: false,
         };
         if governor.try_admit(reservation, now).is_ok() {
-            break;
+            break BootstrapGrant { id, governor: governor.clone(), runtime: runtime.clone(), base };
         }
         runtime.sleep(bootstrap_delay(governor, config, now)).await;
-    }
+    };
     loop {
         let now = MonotonicTime(runtime.now().saturating_duration_since(base));
         if governor.try_start(id, now).is_ok() {
@@ -596,9 +610,7 @@ async fn bootstrap<T: Send + 'static>(
         }
         runtime.sleep(bootstrap_delay(governor, config, now)).await;
     }
-    let outcome = blocking(runtime, work).await;
-    governor.release(id, MonotonicTime(runtime.now().saturating_duration_since(base)));
-    outcome
+    blocking(runtime, work, grant).await
 }
 
 fn bootstrap_delay(governor: &HostGovernor, config: &Config, now: MonotonicTime) -> Duration {
@@ -611,11 +623,14 @@ fn bootstrap_delay(governor: &HostGovernor, config: &Config, now: MonotonicTime)
 async fn blocking<T: Send + 'static>(
     runtime: &Arc<dyn Runtime>,
     work: impl FnOnce() -> std::result::Result<T, FsError> + Send + 'static,
+    grant: BootstrapGrant,
 ) -> Result<T> {
     let (tx, rx) = oneshot::channel();
     runtime
         .spawn_blocking(Box::new(move || {
-            let _ = tx.send(work());
+            let outcome = work();
+            drop(grant);
+            let _ = tx.send(outcome);
         }))
         .detach();
     match rx.await {

@@ -905,3 +905,143 @@ fn each_tree_under_one_host_governor_reports_its_own_charged_worker_time_after_o
          {first:?} + {second:?} against {total:?}"
     );
 }
+
+#[test]
+fn a_bootstrap_grant_outlives_the_cancellation_of_its_open() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let inner = Arc::new(tree_fucker::testing::DeterministicRuntime::new());
+    let runtime = Arc::new(tree_fucker::testing::HoldingRuntime::new(inner.clone()));
+    runtime.hold_next(1);
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let host = HostConfig { maximum_in_flight: 1, per_domain_concurrency: 1, ..Default::default() };
+    let governor = HostGovernor::independent(&host);
+    let now = MonotonicTime::ZERO;
+
+    {
+        let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+        let root = fs.root().to_path_buf();
+        let mut open = pin!(Tree::open_outside_host_governor(
+            fs,
+            root,
+            Arc::new(LoadAll),
+            Config::default(),
+            rt.clone(),
+            governor.clone()
+        ));
+        assert!(
+            open.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "the open blocks on the held root call"
+        );
+        assert_eq!(governor.view(now).in_flight, 1, "the open started its bootstrap read");
+    }
+    assert_eq!(runtime.held(), 1, "the root call is still outstanding after the open future is dropped");
+    runtime.release();
+    inner.run_until_stalled();
+
+    assert_eq!(
+        governor.view(now).in_flight,
+        0,
+        "RFC 15.1 item 1 and 15.3: the physical slot a cancelled open occupied is freed when its root call returns"
+    );
+    assert!(
+        governor.grants().is_empty(),
+        "RFC 15.3: a cancelled open leaves no grant behind, and it left {}",
+        governor.grants().len()
+    );
+
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    let root = fs.root().to_path_buf();
+    let mut second = pin!(Tree::open_outside_host_governor(
+        fs,
+        root,
+        Arc::new(LoadAll),
+        Config::default(),
+        rt.clone(),
+        governor.clone()
+    ));
+    let mut opened = None;
+    for _ in 0..50 {
+        inner.run_until_stalled();
+        if let Poll::Ready(result) = second.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            opened = Some(result);
+            break;
+        }
+        inner.run_until_stalled();
+        inner.advance(Duration::from_secs(1));
+    }
+    assert!(
+        matches!(opened, Some(Ok(_))),
+        "RFC 15.9: a later tree opens under the same host governor once the cancelled one released its slot"
+    );
+}
+
+#[test]
+fn a_bootstrap_reservation_is_released_when_its_open_is_cancelled_before_it_starts() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+
+    let inner = Arc::new(tree_fucker::testing::DeterministicRuntime::new());
+    let runtime = Arc::new(tree_fucker::testing::HoldingRuntime::new(inner.clone()));
+    runtime.hold();
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let host = HostConfig { maximum_in_flight: 1, per_domain_concurrency: 1, ..Default::default() };
+    let governor = HostGovernor::independent(&host);
+    let now = MonotonicTime::ZERO;
+
+    let holder_fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    let holder_root = holder_fs.root().to_path_buf();
+    let mut holder = pin!(Tree::open_outside_host_governor(
+        holder_fs,
+        holder_root,
+        Arc::new(LoadAll),
+        Config::default(),
+        rt.clone(),
+        governor.clone()
+    ));
+    assert!(
+        holder.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+        "the first open blocks on the held root call"
+    );
+    let alone = governor.view(now);
+    assert_eq!(alone.in_flight, 1, "the first open holds the only physical slot");
+    assert_eq!(governor.grants().len(), 1, "the first open holds one bootstrap grant");
+
+    {
+        let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+        let root = fs.root().to_path_buf();
+        let mut waiting = pin!(Tree::open_outside_host_governor(
+            fs,
+            root,
+            Arc::new(LoadAll),
+            Config::default(),
+            rt.clone(),
+            governor.clone()
+        ));
+        assert!(
+            waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "the second open waits for a free slot"
+        );
+        assert_eq!(governor.grants().len(), 2, "the second open is admitted while it waits to start");
+        assert!(
+            governor.view(now).bootstrap_outstanding > alone.bootstrap_outstanding,
+            "the second open reserved bootstrap allowance"
+        );
+        assert_eq!(governor.view(now).in_flight, 1, "the second open never started");
+    }
+
+    assert_eq!(
+        governor.grants().len(),
+        1,
+        "RFC 15.3: an open cancelled between admission and start releases its reservation"
+    );
+    let after = governor.view(now);
+    assert_eq!(
+        after.bootstrap_outstanding, alone.bootstrap_outstanding,
+        "RFC 15.9: one bootstrap allowance covers the process, so a cancelled open returns what it reserved"
+    );
+    assert_eq!(after.in_flight, alone.in_flight, "the surviving open still holds the only slot");
+}

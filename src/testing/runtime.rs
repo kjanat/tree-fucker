@@ -331,20 +331,22 @@ impl Runtime for DeterministicRuntime {
     }
 
     fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> BoxTaskHandle {
-        let mut inner = lock(&self.inner);
-        match inner.blocking_mode {
+        let mode = lock(&self.inner).blocking_mode;
+        match mode {
             BlockingMode::Discarded => {
                 drop(work);
                 Box::new(DiscardedHandle)
             }
             BlockingMode::Queued => {
                 let cancelled = Arc::new(AtomicBool::new(false));
-                inner.blocking.push_back(BlockingWork { work, cancelled: cancelled.clone() });
+                lock(&self.inner).blocking.push_back(BlockingWork { work, cancelled: cancelled.clone() });
                 self.woken.0.store(true, Ordering::SeqCst);
                 Box::new(BlockingHandle { cancelled, requests: self.cancel_requests.clone() })
             }
             BlockingMode::Uninterruptible => {
-                inner.blocking.push_back(BlockingWork { work, cancelled: Arc::new(AtomicBool::new(false)) });
+                lock(&self.inner)
+                    .blocking
+                    .push_back(BlockingWork { work, cancelled: Arc::new(AtomicBool::new(false)) });
                 self.woken.0.store(true, Ordering::SeqCst);
                 Box::new(UninterruptibleHandle { requests: self.cancel_requests.clone() })
             }
