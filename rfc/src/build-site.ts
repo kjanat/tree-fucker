@@ -7,28 +7,19 @@ const rfcRoot = `${dirname(import.meta.dir)}/`;
 const abs = (specifier: string, fromRoot?: boolean): string => Bun.fileURLToPath(import.meta.resolve(specifier, fromRoot ? rfcRoot : undefined));
 
 const siteDir = abs('./_site/', true);
-const iconSource = abs('./static/favicon.svg', true);
+const staticDir = abs('./static/', true);
+const rfcText = abs('./tree-fucker.txt', true);
 const dprintConfig = abs('./.dprint.json', true);
 const apiSource = abs('../target/doc/', true);
 const apiCrate = 'tree_fucker';
 
-const assets: Array<[source: string, target: string]> = [
-	['../static/style.css', 'style.css'],
-	['../static/robots.txt', 'robots.txt'],
-	['../tree-fucker.txt', 'tree-fucker.txt'],
-];
-
 await Bun.$`rm -rf ${siteDir}`;
-
-for (const [specifier, target] of assets) {
-	const file = Bun.file(abs(specifier));
-	if (!(await file.exists())) throw new Error(`Missing site asset: ${specifier}`);
-	await Bun.write(`${siteDir}${target}`, file);
-}
+await Bun.$`cp -R ${staticDir} ${siteDir}`;
+await Bun.write(`${siteDir}tree-fucker.txt`, Bun.file(rfcText));
 
 await Bun.$`cat < ${new Response(html)} | dprint fmt -c=${dprintConfig} --stdin index.html > ${Bun.file(`${siteDir}index.html`)}`;
 
-await Bun.$`bunx --bun svg-to-ico generate ${iconSource} --out-dir ${siteDir} --emit-source --quiet`;
+await Bun.$`bunx --bun svg-to-ico generate ${siteDir}favicon.svg --out-dir ${siteDir} --quiet`;
 
 if (await Bun.file(`${apiSource}${apiCrate}/index.html`).exists()) {
 	await Bun.$`cp -R ${apiSource} ${siteDir}api`;
