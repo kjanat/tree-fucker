@@ -11,6 +11,24 @@
 	--oxide: #9a4b32;
 	--code: #e7ece8;
 	--shadow: rgb(23 34 30 / 8%);
+	--rail-width: 14rem;
+	--rail-indent: 1rem;
+	--rail-top: 2rem;
+	--rail-dot: 7px;
+	--document-width: 52rem;
+	--narrow-width: 54rem;
+	--layout-gap-min: 2.5rem;
+	--layout-gap-max: 6rem;
+	--page-width: calc(var(--rail-width) + var(--layout-gap-max) + var(--document-width));
+	--page-margin: 2rem;
+	--gutter: max(var(--page-margin), (100vw - var(--page-width)) / 2);
+	--edge-inset: 3.5rem;
+	--edge-clearance: 1.25rem;
+	--edge: min(var(--edge-inset), var(--gutter) - var(--edge-clearance));
+	--sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+	--mono: "IBM Plex Mono", ui-monospace, monospace;
+	--ease: 140ms ease;
+	--underline-offset: 0.18em;
 	color-scheme: light;
 	font-synthesis: none;
 }
@@ -44,13 +62,13 @@ body {
 	background:
 		linear-gradient(
 			90deg,
-			transparent 0 3.5rem,
-			var(--soft-rule) 3.5rem calc(3.5rem + 1px),
-			transparent calc(3.5rem + 1px)
+			transparent 0 var(--edge),
+			var(--soft-rule) var(--edge) calc(var(--edge) + 1px),
+			transparent calc(var(--edge) + 1px)
 		),
 		var(--ground);
 	color: var(--ink);
-	font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+	font-family: var(--sans);
 	font-size: 16px;
 	line-height: 1.65;
 }
@@ -67,7 +85,7 @@ a:focus-visible {
 	position: fixed;
 	z-index: 20;
 	top: 0.75rem;
-	left: 0.75rem;
+	left: var(--edge);
 	padding: 0.55rem 0.8rem;
 	background: var(--ink);
 	color: var(--paper);
@@ -79,7 +97,7 @@ a:focus-visible {
 .progress {
 	position: fixed;
 	z-index: 10;
-	inset: 0 auto auto 3.5rem;
+	inset: 0 auto auto var(--edge);
 	width: 2px;
 	height: 100vh;
 	pointer-events: none;
@@ -95,17 +113,17 @@ a:focus-visible {
 }
 .layout {
 	display: grid;
-	grid-template-columns: 14rem minmax(0, 52rem);
-	gap: clamp(2.5rem, 6vw, 6rem);
-	width: min(100% - 4rem, 78rem);
+	grid-template-columns: var(--rail-width) minmax(0, var(--document-width));
+	gap: clamp(var(--layout-gap-min), 6vw, var(--layout-gap-max));
+	width: min(100% - 2 * var(--page-margin), var(--page-width));
 	margin: 0 auto;
 	padding: 4rem 0 7rem;
 }
 .rail {
 	position: sticky;
-	top: 2rem;
+	top: var(--rail-top);
 	align-self: start;
-	max-height: calc(100vh - 4rem);
+	max-height: calc(100vh - 2 * var(--rail-top));
 	overflow: auto;
 	scrollbar-width: thin;
 }
@@ -114,7 +132,7 @@ a:focus-visible {
 .meta,
 .section-number,
 .reference-key {
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 }
 .rail-label {
 	margin: 0 0 0.8rem;
@@ -126,7 +144,7 @@ a:focus-visible {
 }
 .rail ol {
 	margin: 0;
-	padding: 0 0 0 1rem;
+	padding: 0 0 0 var(--rail-indent);
 	border-left: 1px solid var(--rule);
 	list-style: none;
 }
@@ -143,20 +161,20 @@ a:focus-visible {
 	font-size: 0.76rem;
 	line-height: 1.25;
 	text-decoration: none;
-	transition: color 140ms ease;
+	transition: color var(--ease);
 }
 .rail a::before {
 	content: "";
 	position: absolute;
 	top: 0.65rem;
-	left: calc(-1rem - 4px);
-	width: 7px;
-	height: 7px;
+	left: calc(-1 * var(--rail-indent) - (var(--rail-dot) + 2px) / 2);
+	width: var(--rail-dot);
+	height: var(--rail-dot);
 	border: 1px solid var(--ground);
 	border-radius: 50%;
 	background: transparent;
 	transform: scale(0.5);
-	transition: background 140ms ease, transform 140ms ease;
+	transition: background var(--ease), transform var(--ease);
 }
 .rail a span {
 	color: var(--faint);
@@ -201,7 +219,7 @@ a:focus-visible {
 h1 {
 	max-width: 12ch;
 	margin: 0;
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 	font-size: clamp(2.35rem, 7vw, 5.25rem);
 	font-weight: 500;
 	letter-spacing: -0.075em;
@@ -247,7 +265,7 @@ h1 {
 	overflow-wrap: anywhere;
 }
 .authorship a {
-	text-underline-offset: 0.18em;
+	text-underline-offset: var(--underline-offset);
 }
 .status {
 	padding: 0.18rem 0.45rem;
@@ -259,7 +277,7 @@ h1 {
 }
 .source-link {
 	color: var(--ink);
-	text-underline-offset: 0.2em;
+	text-underline-offset: var(--underline-offset);
 }
 .mobile-toc {
 	display: none;
@@ -326,7 +344,7 @@ article li {
 }
 article li::marker {
 	color: var(--oxide);
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 	font-size: 0.82em;
 	font-weight: 600;
 }
@@ -343,7 +361,7 @@ article li::marker {
 code,
 pre,
 .normative {
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 }
 code {
 	padding: 0.08em 0.28em;
@@ -386,7 +404,7 @@ pre code {
 	border-bottom: 1px solid var(--soft-rule);
 }
 dt {
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 	font-size: 0.82rem;
 	font-weight: 600;
 }
@@ -396,19 +414,19 @@ dd {
 }
 .citation {
 	color: var(--moss);
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 	font-size: 0.8em;
 	font-weight: 600;
 	text-decoration-thickness: 1px;
-	text-underline-offset: 0.18em;
+	text-underline-offset: var(--underline-offset);
 }
 .section-reference {
 	color: inherit;
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 	font-size: 0.86em;
 	font-weight: 500;
 	text-decoration-color: var(--oxide);
-	text-underline-offset: 0.18em;
+	text-underline-offset: var(--underline-offset);
 }
 .reference {
 	display: grid;
@@ -433,7 +451,7 @@ dd {
 }
 .url {
 	overflow-wrap: anywhere;
-	text-underline-offset: 0.18em;
+	text-underline-offset: var(--underline-offset);
 }
 .document-footer {
 	display: flex;
@@ -443,7 +461,7 @@ dd {
 	padding: 1.2rem 0;
 	border-top: 1px solid var(--rule);
 	color: var(--muted);
-	font-family: "IBM Plex Mono", ui-monospace, monospace;
+	font-family: var(--mono);
 	font-size: 0.72rem;
 }
 
@@ -456,7 +474,7 @@ dd {
 	}
 	.layout {
 		display: block;
-		width: min(100% - 2rem, 54rem);
+		width: min(100% - 2rem, var(--narrow-width));
 		padding-top: 1rem;
 	}
 	.rail {
@@ -471,7 +489,7 @@ dd {
 	.mobile-toc summary {
 		padding: 0.75rem 1rem;
 		cursor: pointer;
-		font-family: "IBM Plex Mono", ui-monospace, monospace;
+		font-family: var(--mono);
 		font-size: 0.78rem;
 		font-weight: 600;
 	}
@@ -494,7 +512,7 @@ dd {
 
 @media (max-width: 560px) {
 	.layout {
-		width: min(100% - 1.25rem, 54rem);
+		width: min(100% - 1.25rem, var(--narrow-width));
 	}
 	.hero {
 		padding: 1.5rem;
