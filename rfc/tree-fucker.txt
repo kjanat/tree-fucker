@@ -1,6 +1,6 @@
 RFC: tree-fucker
 Status: Draft
-Date: 2026-09-03
+Date: 2026-09-05
 Author: Kaj Kowalski
 Organization: KJANAT
 Email: info@kajkowalski.nl
@@ -174,6 +174,18 @@ Abstract
       children that the adapter performs under a cancellation token and
       an entry ceiling. A session ends in exactly one typed outcome. Only
       a Complete outcome carries children.
+
+   Filesystem operation
+      One blocking call against the filesystem: an enumeration chunk, a
+      kind resolution, an identity read, a metadata read, the enrichment
+      read of one child, a domain probe, or a watch registration or
+      removal. Worker time is estimated and reserved per operation.
+
+   Work lease
+      The governor's permit for one step of a job: the entries a listing
+      session may enumerate and the per-child operations the session or
+      an enrichment batch may perform before it yields. The governor
+      sizes every lease under Section 15.3.
 
    Observation
       The minimum information a listing needs for membership
@@ -934,6 +946,8 @@ Abstract
       update-stream capacity             256
       coalesced watcher-path limit       16384
       entries per directory limit        250000
+      entries per lease                  4096
+      operations per lease, maximum      256
       represented entry limit            1000000
       snapshot byte ceiling              256 MiB
       foreground ceiling per command     30 worker-seconds
@@ -977,6 +991,7 @@ Abstract
       maximum_in_flight
       every burst and every byte ceiling is greater than zero
       entries_per_directory is at least 1
+      entries_per_lease and operations_per_lease are at least 1
       stuck_threshold is greater than zero
       minimum_period is greater than zero and at most maximum_period
       retry_maximum_delay is at least minimum_period
@@ -1083,13 +1098,18 @@ Abstract
 
    Admission of a session is not admission of unbounded work. A session
    runs under a work lease that covers a bounded number of enumerated
-   entries and per-child operations. Before each chunk, and before each
-   batch of kind-resolution or enrichment reads, the session MUST hold
-   remaining lease; when it does not, it MUST yield and continue only
-   after the governor grants a further lease. A lease that is not granted
-   leaves the session suspended with its partial state held in its
-   bounded buffer, or ends it as Cancelled when the coordinator prefers
-   to release the buffer. Chunking therefore bounds filesystem pressure,
+   entries and per-child operations. The entry bound is the configured
+   entries per lease. The per-child operations the lease permits are
+   derived by the governor under Section 15.3 from the budget that is
+   affordable at admission, at least one and at most the configured
+   maximum per lease, and the reservation covers every operation the
+   lease permits. Before each chunk, and before each batch of
+   kind-resolution or enrichment reads, the session MUST hold remaining
+   lease; when it does not, it MUST yield and continue only after the
+   governor grants a further lease. A lease that is not granted leaves
+   the session suspended with its partial state held in its bounded
+   buffer, or ends it as Cancelled when the coordinator prefers to
+   release the buffer. Chunking therefore bounds filesystem pressure,
    not only memory and cancellation latency: one underestimated listing
    cannot perform an unbounded number of operations before the governor
    can react.
@@ -2186,6 +2206,18 @@ Abstract
       represented entries and snapshot bytes
       error, cancellation, and stale-result counts
 
+   The governor keeps, per storage domain, an estimate of worker time
+   per filesystem operation. It starts at the configured initial cost
+   estimate. Every released grant updates it with the grant's charged
+   worker time divided by the operations the grant performed, where the
+   operations are those the adapter reported for it and otherwise the
+   reads the grant was admitted for. The estimate is the moving median
+   of that per-operation measure over a short history, never below its
+   moving minimum and never above the domain bucket's capacity. The
+   latency summaries, the standing-delay signal, and the adaptation of
+   Section 15.5 are computed on the same per-operation measure, so that
+   grants of different sizes remain comparable.
+
    A job whose reported blocking time is absent or exceeds its occupancy
    is charged its occupancy. An operation that has not completed is
    charged its occupancy so far at every accounting point: whenever the
@@ -2224,12 +2256,32 @@ Abstract
       accounted memory plus the estimated result size is within the
       configured ceiling.
 
-   Admission reserves the estimate. Completion, and every accounting
-   point before it, reconciles actual occupancy against both the domain
-   bucket and the global bucket in full. Global accounting is honest: it
-   MUST NOT ignore any part of a job's actual occupancy. Per-domain
-   fairness comes from the per-domain buckets and windows, not from
-   discounting the global meter.
+   A reservation names the operations the work will perform: the reads
+   and registrations it must perform, and the per-child operations it
+   asks to be permitted, which are bounded by the configured maximum per
+   lease. The governor permits as many of the requested operations as
+   the smaller of the applicable domain bucket and the applicable global
+   bucket can afford at the domain's estimated cost per operation once
+   the required reads are covered, and at least one when any were
+   requested. It reserves the estimated cost of every operation it
+   permits, required and permitted alike. Work whose required reads plus
+   one permitted operation are not affordable is denied. The permitted
+   count is part of the grant: the work lease of Section 10.2 and the
+   enrichment batch of Section 10.1 carry it, and the work MUST NOT
+   perform more per-child operations than the grant permits. The
+   reservation therefore covers the whole permitted work at the estimate
+   in force at admission. A grant that permits more work than its
+   reservation covers is not conforming. Overshoot arises only from a
+   misestimated cost per operation or from a call that cannot be
+   interrupted. The reservation of the smallest admissible grant is
+   capped at the smaller applicable bucket capacity, so a full bucket
+   always affords one grant and a slow domain keeps making progress.
+
+   Completion, and every accounting point before it, reconciles actual
+   occupancy against both the domain bucket and the global bucket in
+   full. Global accounting is honest: it MUST NOT ignore any part of a
+   job's actual occupancy. Per-domain fairness comes from the per-domain
+   buckets and windows, not from discounting the global meter.
 
    A worker declared stuck under Section 13.5 is the one exception to
    charging the global bucket. From the moment of declaration its further
@@ -2282,7 +2334,9 @@ Abstract
    Each command additionally has a ceiling on the worker time its reads
    may be admitted with. The ceiling bounds admission: once the cost
    admitted or charged for the command reaches it, no further operation
-   for that command is admitted. A running uninterruptible read MAY
+   for that command is admitted, and a grant for the command permits no
+   more operations than the remainder of the ceiling covers at the
+   domain's estimate. A running uninterruptible read MAY
    overshoot it. When a required read remains after the ceiling is
    reached, the command fails with ResourceLimited under Section 13.1;
    this is a terminal outcome, not throttling with a resume time.
@@ -2300,8 +2354,9 @@ Abstract
    removable, or virtual starts with a window of one. Local block
    storage MAY start higher but not above two.
 
-   The window adapts to measurements. The normative requirements on
-   adaptation are:
+   The window adapts to measurements taken per filesystem operation as
+   defined in Section 15.2. The normative requirements on adaptation
+   are:
 
       it starts from the conservative initial window above;
       it increases only on sustained evidence of low latency, bounded
@@ -2456,7 +2511,9 @@ Abstract
       throttled job count and total throttled duration
       effective background duty per domain
       listing, metadata, and enumeration counts per domain
-      per-domain latency summaries
+      per-domain latency summaries and estimated worker time per
+      operation
+      the operations each grant permitted and performed
       largest directories encountered
       accounted memory and snapshot bytes
       stuck workers with their paths, operations, and start times
@@ -2593,6 +2650,12 @@ Abstract
       envelope as without one
       a listing session yields at every lease boundary and performs no
       operation beyond its lease
+      every grant permits no more operations than its reservation covers
+      at the estimate in force at admission, and never more than the
+      configured maximum per lease
+      a domain whose measured cost per operation rises permits fewer
+      operations per grant within a bounded number of grants, and one
+      whose cost falls permits more, never beyond the maximum
       a starved baseline obligation is admitted once budget permits and
       a slot is free
       a stuck worker on one domain ends its logical job, leaves the
