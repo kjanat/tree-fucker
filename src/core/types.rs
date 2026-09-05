@@ -340,6 +340,7 @@ impl JobTarget {
 pub struct EnrichmentProgress {
     pub scope: EnrichmentScope,
     pub cursor: usize,
+    pub dispatched: usize,
     pub directory: Option<crate::entry::Metadata>,
     pub children: Vec<(std::ffi::OsString, crate::entry::Metadata)>,
     pub failed: Vec<(std::ffi::OsString, FsError)>,
@@ -362,6 +363,8 @@ pub struct ActiveJob {
     pub designated: bool,
     pub cancel: crate::fs::CancellationToken,
     pub leases: u32,
+    pub permitted: u32,
+    pub starved: bool,
     pub session_open: bool,
     pub registration: Option<super::WatchScope>,
     pub enrichment: Option<EnrichmentProgress>,

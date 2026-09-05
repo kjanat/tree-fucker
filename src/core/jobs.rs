@@ -41,6 +41,7 @@ impl Coordinator {
             self.record_session_cost(id, &cost);
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.session_open = suspended;
+                job.starved = suspended && cost.entries_enumerated == 0;
             }
         }
         if !self.guards_valid(&job) {
@@ -139,7 +140,7 @@ impl Coordinator {
                     self.finish_job(id, JobOutcome::ResultMismatch);
                     return;
                 };
-                progress.cursor += self.config.operations_per_lease.max(1);
+                progress.cursor += progress.dispatched.max(1);
                 if progress.directory.is_none() {
                     progress.directory = read.directory;
                 }

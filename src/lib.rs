@@ -17,7 +17,7 @@ pub mod testing;
 pub mod tree;
 pub mod update;
 
-pub use core::{DegradedCause, HostGovernor, HostGovernorError, Stats, host_governor};
+pub use core::{Admitted, DegradedCause, HostGovernor, HostGovernorError, Reported, Stats, host_governor};
 
 pub use config::{ClassWeights, Config, HostConfig, LagMode, WatchRegistrationFailure};
 pub use domain::{

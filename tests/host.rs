@@ -711,6 +711,8 @@ fn the_host_governor_counts_in_flight_workers_across_trees_against_one_ceiling()
                         path: RelativePath::root(),
                         reads: 1,
                         registrations: 0,
+                        operations: 0,
+                        ceiling: None,
                         lease: 0,
                         domain: Some(*domain),
                         origin: WorkOrigin::Background,
@@ -1044,4 +1046,126 @@ fn a_bootstrap_reservation_is_released_when_its_open_is_cancelled_before_it_star
         "RFC 15.9: one bootstrap allowance covers the process, so a cancelled open returns what it reserved"
     );
     assert_eq!(after.in_flight, alone.in_flight, "the surviving open still holds the only slot");
+}
+
+#[test]
+fn a_lease_reservation_permits_what_the_bucket_affords_and_reserves_every_permitted_operation() {
+    use tree_fucker::core::{GrantId, Reservation};
+    use tree_fucker::{DomainKey, JobId, StorageDomainId};
+
+    let governor = HostGovernor::independent(&HostConfig::default());
+    let domain = StorageDomainId::of(&DomainKey::declared(900));
+    let capabilities = DomainCapabilities {
+        topology: AccessTopology::Local,
+        media: MediaHint::SolidState,
+        ..DomainCapabilities::inline()
+    };
+    let now = MonotonicTime::ZERO;
+    governor.register_domain(domain, &capabilities, now);
+    let tree = governor.next_tree();
+    let lease = |id: JobId, operations: u32| Reservation {
+        id: GrantId::Job(tree, id),
+        path: RelativePath::root(),
+        reads: 1,
+        registrations: 0,
+        operations,
+        ceiling: None,
+        lease: 0,
+        domain: Some(domain),
+        origin: WorkOrigin::Background,
+        listing: true,
+    };
+
+    let first = governor.try_admit(lease(JobId::new(1), 256), now).expect("a fresh bucket admits the first lease");
+    assert_eq!(
+        first.operations, 11,
+        "RFC 15.3: the governor permits as many of the requested operations as the smaller bucket affords at the \
+         domain's estimated cost once the required reads are covered; a 250ms domain burst at a {INITIAL_COST_ESTIMATE:?} \
+         estimate affords eleven per-child operations beyond one required read"
+    );
+    assert_eq!(
+        first.cost,
+        Duration::from_millis(240),
+        "RFC 15.3: the reservation covers the estimated cost of every operation the grant permits, required and \
+         permitted alike"
+    );
+
+    assert_eq!(
+        governor.try_admit(lease(JobId::new(2), 256), now),
+        Err(ThrottleCause::DutyBudget),
+        "RFC 15.3: work whose required reads plus one permitted operation are not affordable is denied"
+    );
+
+    let single = governor
+        .try_admit(lease(JobId::new(3), 0), now + Duration::from_secs(3600))
+        .expect("single-operation work is admitted once the bucket refills");
+    assert_eq!(
+        (single.operations, single.cost),
+        (0, INITIAL_COST_ESTIMATE),
+        "RFC 15.3: work that requests no per-child operation reserves its required reads and nothing more"
+    );
+}
+
+#[test]
+fn a_full_bucket_always_affords_one_grant_on_a_domain_whose_estimate_reached_its_capacity() {
+    use tree_fucker::core::{GrantId, Reservation};
+    use tree_fucker::{DomainKey, JobId, StorageDomainId};
+
+    let governor = HostGovernor::independent(&HostConfig::default());
+    let domain = StorageDomainId::of(&DomainKey::declared(901));
+    let now = MonotonicTime::ZERO;
+    governor.register_domain(domain, &DomainCapabilities::inline(), now);
+    let tree = governor.next_tree();
+    let dear = GrantId::Job(tree, JobId::new(1));
+    governor
+        .try_admit(
+            Reservation {
+                id: dear,
+                path: RelativePath::root(),
+                reads: 1,
+                registrations: 0,
+                operations: 0,
+                ceiling: None,
+                lease: 0,
+                domain: Some(domain),
+                origin: WorkOrigin::Background,
+                listing: true,
+            },
+            now,
+        )
+        .expect("the first operation is admitted");
+    governor.start(dear, now);
+    governor.release(dear, now + Duration::from_secs(1));
+
+    let capacity = governor.view(now).domains.get(&domain).map(|view| view.capacity).expect("the domain is accounted");
+    assert_eq!(
+        governor.estimate_of(Some(domain)),
+        capacity,
+        "RFC 15.2: the estimate is never above the domain bucket's capacity"
+    );
+
+    let refilled = now + Duration::from_secs(100_000);
+    let admitted = governor
+        .try_admit(
+            Reservation {
+                id: GrantId::Job(tree, JobId::new(2)),
+                path: RelativePath::root(),
+                reads: 1,
+                registrations: 0,
+                operations: 256,
+                ceiling: None,
+                lease: 0,
+                domain: Some(domain),
+                origin: WorkOrigin::Background,
+                listing: true,
+            },
+            refilled,
+        )
+        .expect("RFC 15.3: a full bucket always affords one grant");
+    assert_eq!(
+        (admitted.operations, admitted.cost),
+        (1, capacity),
+        "RFC 15.3: the reservation of the smallest admissible grant is capped at the smaller applicable bucket \
+         capacity, so a slow domain keeps making progress"
+    );
 }

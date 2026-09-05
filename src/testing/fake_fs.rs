@@ -708,16 +708,29 @@ impl FakeFileSystem {
         lock(&self.inner).chunk
     }
 
-    pub fn lease_cost(&self, path: &RelativePath, first: bool, skip: usize, take: usize) -> Duration {
+    pub fn lease_cost(
+        &self,
+        path: &RelativePath,
+        first: bool,
+        skip: usize,
+        entries: usize,
+        operations: usize,
+    ) -> Duration {
         let inner = lock(&self.inner);
         let mut total = Self::scoped_cost(&inner, if first { FakeOp::ReadDir } else { FakeOp::Chunk }, path);
         if inner.per_child_cost_ops == 0 {
             return total;
         }
-        for (_, child, info) in Self::enumeration_order(&inner, path).iter().skip(skip).take(take) {
+        let mut left = operations;
+        for (_, child, info) in Self::enumeration_order(&inner, path).iter().skip(skip).take(entries) {
             let Some(child) = child else {
                 continue;
             };
+            let needed = Self::child_operations(&inner, &child, info.kind);
+            if needed > left {
+                break;
+            }
+            left -= needed;
             total += Self::child_cost(&inner, &child, info.kind);
         }
         total

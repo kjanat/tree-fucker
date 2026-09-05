@@ -781,3 +781,63 @@ fn every_rfc_16_observability_item_is_present_in_stats_or_health() {
     assert_eq!(slot.operation, JobOperation::Listing);
     assert!(slot.started < stuck.now());
 }
+
+#[test]
+fn an_enrichment_batch_never_carries_more_children_than_its_grant_permitted() {
+    use std::collections::BTreeMap;
+
+    use tree_fucker::JobId;
+    use tree_fucker::testing::Dispatched;
+
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("wide");
+    for i in 0..40 {
+        fs.create_file(&format!("wide/f{i}"), 1);
+    }
+    fs.set_default_capabilities(per_child_sizes());
+    fs.set_cost(CostScope::Everything, FakeOp::Enrich, Duration::from_millis(1));
+    let config = Config { metadata_fields: sizes(), ..Default::default() };
+    let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+
+    h.run_jobs_until(h.now() + Duration::from_secs(3600));
+
+    let mut batches: BTreeMap<JobId, Vec<usize>> = BTreeMap::new();
+    for dispatched in h.dispatches() {
+        if let Dispatched::Enrichment { job, children, .. } = dispatched {
+            batches.entry(job).or_default().push(children);
+        }
+    }
+    let mut permitted: BTreeMap<JobId, Vec<u32>> = BTreeMap::new();
+    for admission in h.admissions() {
+        if matches!(admission.operation, JobOperation::Enrichment { .. }) {
+            permitted.entry(admission.job).or_default().push(admission.operations);
+        }
+    }
+    assert!(!batches.is_empty(), "the wide directory was never enriched, so nothing is fenced");
+    for (job, sizes) in &batches {
+        let grants = permitted.get(job).cloned().unwrap_or_default();
+        assert!(
+            sizes.len() <= grants.len(),
+            "RFC 15.1 item 1: every enrichment batch runs under a grant; job {job:?} dispatched {} batches \
+             against {} grants",
+            sizes.len(),
+            grants.len()
+        );
+        for (index, children) in sizes.iter().enumerate() {
+            assert!(
+                *children <= usize::try_from(grants[index]).unwrap_or(usize::MAX),
+                "RFC 15.3: the enrichment batch carries the permitted count and the work MUST NOT perform more \
+                 per-child operations than the grant permits; batch {index} of job {job:?} carried {children} \
+                 children against {} permitted",
+                grants[index]
+            );
+        }
+    }
+    for i in 0..40 {
+        assert_eq!(
+            h.entry(&format!("wide/f{i}")).map(|e| e.metadata.size),
+            Some(Some(1)),
+            "RFC 10.1: every observed child is enriched however many batches it takes; wide/f{i} was not"
+        );
+    }
+}

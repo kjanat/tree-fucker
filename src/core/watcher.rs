@@ -159,6 +159,8 @@ impl Coordinator {
                         path: path.clone(),
                         reads: 0,
                         registrations: 1,
+                        operations: 0,
+                        ceiling: None,
                         lease: 0,
                         domain,
                         origin: WorkOrigin::Background,

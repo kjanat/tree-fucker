@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tree_fucker::core::{Class, Command, DomainStat, JobOperation, JobResult, JobSpec, MonotonicTime, WorkOrigin};
-use tree_fucker::testing::{Admission, CostScope, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
+use tree_fucker::testing::{Admission, CostScope, Dispatched, DomainId, FailureMode, FakeFileSystem, FakeOp, Harness};
 use tree_fucker::update::{
     ErrorCause, InitialScanState, ResourceHealth, ResourceLimit, RoundResult, ThrottleCause, UpdateEvent,
 };
@@ -2970,7 +2970,12 @@ fn per_domain_statistics_split_listing_and_metadata_latency_and_report_rates() {
     let stat = domain_stat(&h, HOME);
     assert!(stat.listing_latency.samples > 0, "listing latency is missing: {stat:?}");
     assert!(stat.metadata_latency.samples > 0, "metadata latency is missing after a metadata read: {stat:?}");
-    assert_eq!(stat.listing_latency.minimum, Duration::from_millis(10), "listing latency carries listings: {stat:?}");
+    assert_eq!(
+        stat.listing_latency.minimum,
+        Duration::from_millis(5),
+        "RFC 15.2: the listing latency window records the per-operation measure, so a 10ms listing that also \
+         resolved one unknown kind records 5ms: {stat:?}"
+    );
     assert_eq!(
         stat.metadata_latency.minimum,
         Duration::from_millis(5),
@@ -3109,5 +3114,187 @@ fn suspended_sessions_are_counted_per_domain() {
         domain_stat(&h, HOME).suspended_sessions,
         0,
         "line 1017: a domain with no suspended session reports none"
+    );
+}
+
+fn resolving(children: usize) -> Arc<FakeFileSystem> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("d");
+    for i in 0..children {
+        let child = format!("d/f{i}");
+        fs.create_file(&child, 1);
+        fs.report_unknown_kind(&child);
+    }
+    fs.set_domain("d", MEDIA);
+    fs.set_capabilities(
+        MEDIA,
+        DomainCapabilities {
+            kind_source: KindSource::Sometimes,
+            topology: AccessTopology::Local,
+            media: MediaHint::SolidState,
+            ..DomainCapabilities::inline()
+        },
+    );
+    fs
+}
+
+fn leases_for(h: &Harness, p: &str) -> Vec<Admission> {
+    let target = path(p);
+    h.admissions().into_iter().filter(|a| a.entry == target && a.operation == JobOperation::Listing).collect()
+}
+
+#[test]
+fn a_lease_permits_the_operations_the_budget_affords_and_the_session_receives_exactly_that() {
+    let fs = resolving(64);
+    fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ResolveKind, Duration::from_millis(1));
+    let mut h = Harness::open(fs, Arc::new(LoadAll), follow()).expect("open");
+
+    h.run_jobs_until(h.now() + Duration::from_secs(3600));
+
+    let received: Vec<usize> = h
+        .dispatches()
+        .into_iter()
+        .filter_map(|dispatched| match dispatched {
+            Dispatched::Listing { path: entry, operations, .. } if entry == path("d") => Some(operations),
+            _ => None,
+        })
+        .collect();
+    let leases = leases_for(&h, "d");
+    let first = leases.first().cloned().expect("the wide listing was never admitted");
+    let permitted: Vec<usize> = leases.iter().map(|a| usize::try_from(a.operations).unwrap_or(usize::MAX)).collect();
+    assert_eq!(
+        received, permitted,
+        "RFC 10.2: the work lease the adapter receives carries the per-child operations the grant permitted"
+    );
+    assert_eq!(
+        first.operations, 11,
+        "RFC 15.3: a 250ms domain burst at a {INITIAL_COST_ESTIMATE:?} estimate affords eleven per-child \
+         operations beyond the required read; the first lease permitted {}",
+        first.operations
+    );
+    assert!(
+        first.reserved >= INITIAL_COST_ESTIMATE * (1 + first.operations),
+        "RFC 15.3: a grant that permits more work than its reservation covers is not conforming; the first lease \
+         permitted {} operations against a reservation of {:?}",
+        first.operations,
+        first.reserved
+    );
+
+    for admission in leases_for(&h, "d") {
+        assert!(
+            admission.operations >= 1 && admission.operations <= 256,
+            "RFC 15.3: every grant permits at least one operation and never more than the configured maximum per \
+             lease; one lease permitted {}",
+            admission.operations
+        );
+    }
+    assert_eq!(h.paths().len(), 66, "the wide directory never converged");
+}
+
+#[test]
+fn a_domain_whose_cost_rises_permits_fewer_operations_per_grant_and_one_whose_cost_falls_permits_more() {
+    fn leases(per_child: Duration) -> Vec<u32> {
+        let fs = resolving(256);
+        fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ResolveKind, per_child);
+        let config = Config { fixed_interval: Some(Duration::from_secs(120)), ..follow() };
+        let mut h = Harness::open(fs, Arc::new(LoadAll), config).expect("open");
+        h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(3600));
+        leases_for(&h, "d").into_iter().map(|a| a.operations).collect()
+    }
+
+    let slow = leases(Duration::from_millis(200));
+    assert!(slow.len() >= 2, "the slow domain took {slow:?} leases, so the adaptation was never observed");
+    assert!(
+        slow[1] < slow[0],
+        "RFC 15.5 and 17.5: a domain whose measured cost per operation rises permits fewer operations per grant; \
+         it went from {} to {}",
+        slow[0],
+        slow[1]
+    );
+    assert!(
+        slow.iter().take(8).any(|permitted| *permitted == 1),
+        "RFC 15.3: a slow domain reaches one permitted operation per grant within a bounded number of leases; it \
+         permitted {slow:?}"
+    );
+
+    let fast = leases(Duration::from_millis(1));
+    assert!(fast.len() >= 2, "the fast domain took {} leases", fast.len());
+    assert!(
+        fast.iter().any(|permitted| *permitted > fast[0]),
+        "RFC 15.5 and 17.5: a domain whose cost per operation falls permits more operations per grant; it \
+         permitted {fast:?}"
+    );
+    assert!(
+        fast.iter().all(|permitted| *permitted <= 256),
+        "RFC 15.3: never more than the configured maximum per lease; it permitted {fast:?}"
+    );
+}
+
+#[test]
+fn a_foreground_lease_permits_no_more_than_the_remainder_of_its_command_ceiling() {
+    let fs = tree(&["a"]);
+    for i in 0..64 {
+        fs.create_file(&format!("a/f{i}"), 1);
+    }
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, INITIAL_COST_ESTIMATE);
+    fs.set_cost(CostScope::Everything, FakeOp::Chunk, INITIAL_COST_ESTIMATE);
+    let config = Config { foreground_ceiling_per_command: Duration::from_millis(100), ..Default::default() };
+    let mut h = scanned(fs, config);
+
+    let before = h.admissions().len();
+    let _ = h.command(Command::Refresh(vec![path("a")]));
+    h.run_jobs_until(h.now() + Duration::from_secs(120));
+    let foreground: Vec<Admission> = h
+        .admissions()
+        .into_iter()
+        .skip(before)
+        .filter(|a| a.entry == path("a") && a.origin == WorkOrigin::Foreground)
+        .collect();
+    assert!(!foreground.is_empty(), "the refresh admitted no foreground listing lease");
+    for admission in &foreground {
+        assert!(
+            admission.operations <= 4,
+            "RFC 15.4: a grant for a command permits no more operations than the remainder of the ceiling covers \
+             at the domain's estimate; a 100ms remainder at a {INITIAL_COST_ESTIMATE:?} estimate covers four \
+             beyond the required read, and this lease permitted {}",
+            admission.operations
+        );
+    }
+}
+
+#[test]
+fn per_operation_latency_keeps_leases_of_different_sizes_comparable() {
+    let unit = Duration::from_millis(5);
+    let fs = resolving(256);
+    fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, unit);
+    fs.set_cost(CostScope::Domain(MEDIA), FakeOp::Chunk, unit);
+    fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ResolveKind, unit);
+    let mut h = Harness::open(fs, Arc::new(LoadAll), follow()).expect("open");
+
+    let key = DomainIdentity::Known(FakeFileSystem::domain_key(MEDIA));
+    let mut start: Option<usize> = None;
+    for _ in 0..600 {
+        h.run_jobs_until(h.now() + Duration::from_secs(1));
+        let Some(stat) = h.stats().domains.into_iter().find(|stat| stat.identity == key) else {
+            continue;
+        };
+        let floor = *start.get_or_insert(stat.window);
+        assert!(
+            stat.window >= floor,
+            "RFC 15.5: a domain with constant per-operation latency shows no contention, so its window never \
+             falls below its start window of {floor}; it reports {}",
+            stat.window
+        );
+    }
+
+    let stat = domain_stat(&h, MEDIA);
+    let sizes: BTreeSet<u32> = leases_for(&h, "d").into_iter().map(|a| a.operations).collect();
+    assert!(sizes.len() >= 2, "every lease permitted the same count, so mixed sizes were never observed: {sizes:?}");
+    assert!(
+        stat.latency.tail <= stat.latency.minimum * 2,
+        "RFC 15.2: the latency summaries are computed per operation so that grants of different sizes remain \
+         comparable; the domain reports a tail of {:?} against a moving minimum of {:?} over lease sizes {sizes:?}",
+        stat.latency.tail,
+        stat.latency.minimum
     );
 }

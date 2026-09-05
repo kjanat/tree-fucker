@@ -593,6 +593,8 @@ async fn bootstrap<T: Send + 'static>(
             path: RelativePath::root(),
             reads: 1,
             registrations: 0,
+            operations: 0,
+            ceiling: None,
             lease: 0,
             domain: None,
             origin: WorkOrigin::Background,

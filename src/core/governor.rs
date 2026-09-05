@@ -76,6 +76,9 @@ pub struct Grant {
     pub id: GrantId,
     pub path: RelativePath,
     pub lease: u32,
+    pub required: u32,
+    pub operations: u32,
+    pub performed: Option<u32>,
     pub domain: Option<StorageDomainId>,
     pub origin: WorkOrigin,
     pub reserved: Duration,
@@ -145,10 +148,24 @@ pub struct Reservation {
     pub path: RelativePath,
     pub reads: u32,
     pub registrations: u32,
+    pub operations: u32,
+    pub ceiling: Option<Duration>,
     pub lease: u32,
     pub domain: Option<StorageDomainId>,
     pub origin: WorkOrigin,
     pub listing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    pub cost: Duration,
+    pub operations: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reported {
+    pub blocking: Option<Duration>,
+    pub operations: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -683,7 +700,10 @@ impl Governor {
                 WorkOrigin::Background => state.bucket.capacity,
                 WorkOrigin::Foreground => state.foreground.capacity,
             })
-            .unwrap_or(global);
+            .unwrap_or_else(|| match origin {
+                WorkOrigin::Background => nanos(self.config.domain_background_burst),
+                WorkOrigin::Foreground => nanos(self.config.domain_foreground_burst),
+            });
         duration(global.min(local))
     }
 
@@ -825,8 +845,38 @@ impl Governor {
         }
     }
 
-    pub fn try_admit(&mut self, reservation: Reservation, now: MonotonicTime) -> Result<Duration, ThrottleCause> {
-        let Reservation { id, path, reads, registrations, lease, domain, origin, listing } = reservation;
+    fn affordable(&self, domain: Option<StorageDomainId>, origin: WorkOrigin, ceiling: Option<Duration>) -> i128 {
+        let global = match origin {
+            WorkOrigin::Background => self.global.level,
+            WorkOrigin::Foreground => self.foreground.level,
+        };
+        let local = domain
+            .and_then(|id| self.domains.get(&id))
+            .map(|state| match origin {
+                WorkOrigin::Background => state.bucket.level,
+                WorkOrigin::Foreground => state.foreground.level,
+            })
+            .unwrap_or(global);
+        let mut level = global.min(local).min(nanos(self.capacity_for(domain, origin)));
+        if let Some(ceiling) = ceiling {
+            level = level.min(nanos(ceiling));
+        }
+        level.max(0)
+    }
+
+    fn permitted_operations(&self, estimate: Duration, required: u32, requested: u32, affordable: i128) -> u32 {
+        if requested == 0 {
+            return 0;
+        }
+        let unit = nanos(estimate).max(1);
+        let spare = affordable - unit.saturating_mul(i128::from(required));
+        let room = u32::try_from((spare / unit).max(0)).unwrap_or(u32::MAX);
+        requested.min(room).max(1)
+    }
+
+    pub fn try_admit(&mut self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
+        let Reservation { id, path, reads, registrations, operations, ceiling, lease, domain, origin, listing } =
+            reservation;
         self.account(now);
         if self.quarantined(domain) {
             self.deny(ThrottleCause::StuckWorker, domain, Duration::ZERO, now);
@@ -842,26 +892,22 @@ impl Governor {
             self.deny(ThrottleCause::Memory, domain, Duration::ZERO, now);
             return Err(ThrottleCause::Memory);
         }
-        let cost = self.cost_of(domain, reads + registrations).min(self.capacity_for(domain, origin));
-        let local = domain
-            .and_then(|id| self.domains.get(&id))
-            .map(|state| match origin {
-                WorkOrigin::Background => state.bucket.affordable(nanos(cost)),
-                WorkOrigin::Foreground => state.foreground.affordable(nanos(cost)),
-            })
-            .unwrap_or(true);
-        let global = match origin {
-            WorkOrigin::Background => self.global.affordable(nanos(cost)),
-            WorkOrigin::Foreground => self.foreground.affordable(nanos(cost)),
-        };
-        if !cleanup && (!global || !local) {
+        let estimate = self.estimate_of(domain);
+        let capacity = self.capacity_for(domain, origin);
+        let required = reads + registrations;
+        let affordable = self.affordable(domain, origin, ceiling);
+        let minimum = required + operations.min(1);
+        let floor_cost = estimate.saturating_mul(minimum).min(capacity);
+        if !cleanup && nanos(floor_cost) > affordable {
             let cause = match origin {
                 WorkOrigin::Background => ThrottleCause::DutyBudget,
                 WorkOrigin::Foreground => ThrottleCause::ForegroundCeiling,
             };
-            self.deny(cause, domain, cost, now);
+            self.deny(cause, domain, floor_cost, now);
             return Err(cause);
         }
+        let permitted = self.permitted_operations(estimate, required, operations, affordable);
+        let cost = estimate.saturating_mul(required + permitted).min(capacity);
         if !cleanup && domain.is_none() && self.bootstrap_outstanding + nanos(cost) > self.bootstrap_capacity {
             self.deny(ThrottleCause::DutyBudget, domain, cost, now);
             return Err(ThrottleCause::DutyBudget);
@@ -902,6 +948,9 @@ impl Governor {
                 id,
                 path,
                 lease,
+                required,
+                operations: permitted,
+                performed: None,
                 domain,
                 origin,
                 reserved: cost,
@@ -915,12 +964,16 @@ impl Governor {
                 registration_took: None,
             },
         );
-        Ok(cost)
+        Ok(Admitted { cost, operations: permitted })
     }
 
-    pub fn report(&mut self, id: GrantId, blocking: Duration, now: MonotonicTime) {
+    pub fn report(&mut self, id: GrantId, reported: Reported, now: MonotonicTime) {
         self.account(now);
         let Some(grant) = self.grants.get_mut(&id) else {
+            return;
+        };
+        grant.performed = Some(grant.performed.unwrap_or(0).saturating_add(reported.operations));
+        let Some(blocking) = reported.blocking else {
             return;
         };
         self.reported_total += nanos(blocking);
@@ -1025,11 +1078,12 @@ impl Governor {
         if grant.id.release().is_some() {
             return;
         }
+        let performed = grant.performed.unwrap_or(grant.required).max(1);
         let state = self.domain_mut(domain, now);
         match (grant.dispatched, grant.registration) {
-            (Some(dispatched), _) => state.record_latency(now.since(dispatched), grant.listing),
-            (None, true) => state.registration_latency.record(now.since(started)),
-            (None, false) => state.record_latency(now.since(started), grant.listing),
+            (Some(dispatched), _) => state.record_latency(now.since(dispatched) / performed, grant.listing),
+            (None, true) => state.registration_latency.record(now.since(started) / performed),
+            (None, false) => state.record_latency(now.since(started) / performed, grant.listing),
         }
         state.adapt(false);
     }
@@ -1435,12 +1489,12 @@ impl HostGovernor {
         guard(&self.inner).in_flight()
     }
 
-    pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Duration, ThrottleCause> {
+    pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
         guard(&self.inner).try_admit(reservation, now)
     }
 
-    pub fn report(&self, id: GrantId, blocking: Duration, now: MonotonicTime) {
-        guard(&self.inner).report(id, blocking, now)
+    pub fn report(&self, id: GrantId, reported: Reported, now: MonotonicTime) {
+        guard(&self.inner).report(id, reported, now)
     }
 
     pub fn overshoot_of(&self, id: GrantId) -> Duration {

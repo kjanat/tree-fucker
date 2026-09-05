@@ -671,6 +671,8 @@ fn an_open_under_an_exhausted_bootstrap_allowance_waits_rather_than_bypassing() 
                 path: path("."),
                 reads: 1,
                 registrations: 0,
+                operations: 0,
+                ceiling: None,
                 lease: 0,
                 domain: None,
                 origin: tree_fucker::core::WorkOrigin::Background,

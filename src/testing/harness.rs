@@ -33,8 +33,37 @@ pub struct Admission {
     pub batch: usize,
     pub reserved: Duration,
     pub lease: u32,
+    pub operations: u32,
     pub domain: Option<StorageDomainId>,
     pub origin: WorkOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dispatched {
+    Listing { job: JobId, path: RelativePath, operations: usize },
+    Enrichment { job: JobId, path: RelativePath, children: usize },
+    Metadata { job: JobId, path: RelativePath },
+    Domain { job: JobId, path: RelativePath },
+}
+
+impl Dispatched {
+    pub fn path(&self) -> &RelativePath {
+        match self {
+            Dispatched::Listing { path, .. }
+            | Dispatched::Enrichment { path, .. }
+            | Dispatched::Metadata { path, .. }
+            | Dispatched::Domain { path, .. } => path,
+        }
+    }
+
+    pub fn job(&self) -> JobId {
+        match self {
+            Dispatched::Listing { job, .. }
+            | Dispatched::Enrichment { job, .. }
+            | Dispatched::Metadata { job, .. }
+            | Dispatched::Domain { job, .. } => *job,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +126,7 @@ pub struct Harness {
     running: IdMap<JobId, Running>,
     job_domain: IdMap<JobId, DomainId>,
     charges: Vec<Charge>,
+    dispatches: Vec<Dispatched>,
     admissions: Vec<Admission>,
     admitted: HashSet<(JobId, u32), crate::ids::IdHashing>,
     grant_buffer: Vec<crate::core::Grant>,
@@ -158,6 +188,7 @@ impl Harness {
             running: IdMap::default(),
             job_domain: IdMap::default(),
             charges: Vec::new(),
+            dispatches: Vec::new(),
             admissions: Vec::new(),
             admitted: HashSet::default(),
             grant_buffer: Vec::new(),
@@ -289,6 +320,7 @@ impl Harness {
                 batch,
                 reserved: grant.reserved,
                 lease: grant.lease,
+                operations: grant.operations,
                 domain: grant.domain,
                 origin: grant.origin,
             });
@@ -308,10 +340,18 @@ impl Harness {
 
     fn begin_work(&mut self, spec: &JobSpec) {
         self.settle_work(spec.id);
+        let job = spec.id;
+        let path = spec.path.clone();
+        self.dispatches.push(match &spec.work {
+            Work::Listing(listing) => Dispatched::Listing { job, path, operations: listing.lease.operations },
+            Work::Enrichment { batch } => Dispatched::Enrichment { job, path, children: batch.children.len() },
+            Work::Metadata => Dispatched::Metadata { job, path },
+            Work::ResolveDomain { .. } => Dispatched::Domain { job, path },
+        });
         let cost = match &spec.work {
             Work::Listing(listing) => {
                 let skip = self.entries_seen.get(&spec.id).copied().unwrap_or(0);
-                self.fs.lease_cost(&spec.path, !listing.resume, skip, listing.lease.entries)
+                self.fs.lease_cost(&spec.path, !listing.resume, skip, listing.lease.entries, listing.lease.operations)
             }
             Work::Metadata => self.fs.cost_of(FakeOp::Metadata, &spec.path),
             Work::ResolveDomain { .. } => self.fs.domain_resolution_cost(&spec.path),
@@ -356,6 +396,10 @@ impl Harness {
 
     pub fn admissions(&self) -> Vec<Admission> {
         self.admissions.clone()
+    }
+
+    pub fn dispatches(&self) -> Vec<Dispatched> {
+        self.dispatches.clone()
     }
 
     pub fn charges(&self) -> Vec<Charge> {

@@ -107,21 +107,74 @@ impl Coordinator {
             path: path.clone(),
             reads: 1,
             registrations: u32::from(registration.is_some()),
+            operations: self.requested_operations(entry, need, &self.requested_scope(entry, need), 0, false),
+            ceiling: self.command_ceiling(barriers),
             lease: 0,
             domain,
             origin,
             listing: need == ReadNeed::Listing,
         };
         match self.governor.try_admit(reservation, now) {
-            Ok(cost) => {
+            Ok(admitted) => {
                 self.next_job_id = id.next();
-                Ok(JobGrant { id, registration, domain, origin, cost })
+                Ok(JobGrant { id, registration, domain, origin, cost: admitted.cost, operations: admitted.operations })
             }
             Err(_) => match self.governor.global_exhausted(domain, origin) {
                 true => Err(Denied::Globally),
                 false => Err(Denied::OnDomain(domain)),
             },
         }
+    }
+
+    fn requested_scope(&self, entry: Option<EntryId>, need: ReadNeed) -> EnrichmentScope {
+        match need {
+            ReadNeed::Enrichment(_) => entry
+                .and_then(|entry| self.pending_enrichment.get(&entry))
+                .map(|request| request.scope.clone())
+                .unwrap_or_default(),
+            ReadNeed::Listing | ReadNeed::Metadata | ReadNeed::Domain => EnrichmentScope::default(),
+        }
+    }
+
+    fn observation_costs_per_child(&self, entry: Option<EntryId>) -> bool {
+        let Some(probe) = entry.and_then(|entry| self.domain_probe(entry)) else {
+            return false;
+        };
+        probe.capabilities.kind_source != crate::domain::KindSource::Always
+            || probe.capabilities.identity_source == crate::domain::IdentitySource::PerChildRead
+    }
+
+    fn requested_operations(
+        &self,
+        entry: Option<EntryId>,
+        need: ReadNeed,
+        scope: &EnrichmentScope,
+        cursor: usize,
+        starved: bool,
+    ) -> u32 {
+        let maximum = u32::try_from(self.config.operations_per_lease).unwrap_or(u32::MAX).max(1);
+        match need {
+            ReadNeed::Listing => match starved || self.observation_costs_per_child(entry) {
+                true => maximum,
+                false => 0,
+            },
+            ReadNeed::Enrichment(_) => {
+                let total = entry.map(|entry| self.enrichment_targets(entry, scope).len()).unwrap_or(0);
+                let remaining = u32::try_from(total.saturating_sub(cursor)).unwrap_or(u32::MAX);
+                maximum.min(remaining.max(1))
+            }
+            ReadNeed::Metadata | ReadNeed::Domain => 0,
+        }
+    }
+
+    fn command_ceiling(&self, barriers: &[CommandId]) -> Option<Duration> {
+        let limit = self.config.foreground_ceiling_per_command;
+        barriers
+            .iter()
+            .filter_map(|id| self.commands.get(id))
+            .filter(|command| command.draws_on_foreground())
+            .map(|command| limit.saturating_sub(command.admitted))
+            .min()
     }
 
     pub(super) fn resume_sessions(&mut self) {
@@ -143,25 +196,30 @@ impl Coordinator {
             let now = self.now;
             let lease = job.leases;
             let domain = job.domain;
+            let cursor = job.enrichment.as_ref().map(|progress| progress.cursor).unwrap_or(0);
+            let scope = job.enrichment.as_ref().map(|progress| progress.scope.clone()).unwrap_or_default();
             let reservation = Reservation {
                 id: self.job_grant(id),
                 path: job.path.clone(),
                 reads: 1,
                 registrations: 0,
+                operations: self.requested_operations(job.entry(), job.need, &scope, cursor, job.starved),
+                ceiling: self.command_ceiling(&job.barriers),
                 lease,
                 domain,
                 origin: job.origin,
                 listing: job.need == ReadNeed::Listing,
             };
-            let cost = match self.governor.try_admit(reservation, now) {
-                Ok(cost) => cost,
+            let admitted = match self.governor.try_admit(reservation, now) {
+                Ok(admitted) => admitted,
                 Err(_) => continue,
             };
             let barriers = job.barriers.clone();
-            self.charge_commands(&barriers, cost);
+            self.charge_commands(&barriers, admitted.cost);
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.phase = JobPhase::Queued;
                 job.leases = job.leases.saturating_add(1);
+                job.permitted = admitted.operations;
             }
             self.queue_order.push_back(id);
         }
@@ -176,7 +234,10 @@ impl Coordinator {
     fn work_for(&self, job: &ActiveJob) -> Work {
         match job.need {
             ReadNeed::Listing => Work::Listing(ListingWork {
-                lease: Lease { entries: self.config.entries_per_lease, operations: self.config.operations_per_lease },
+                lease: Lease {
+                    entries: self.config.entries_per_lease,
+                    operations: usize::try_from(job.permitted).unwrap_or(usize::MAX),
+                },
                 ceilings: self.ceilings(),
                 cancel: job.cancel.clone(),
                 resume: job.session_open,
@@ -198,7 +259,7 @@ impl Coordinator {
             .unwrap_or_default()
             .into_iter()
             .skip(cursor)
-            .take(self.config.operations_per_lease.max(1))
+            .take(usize::try_from(job.permitted).unwrap_or(usize::MAX))
             .collect();
         let directory = cursor == 0 && scope == EnrichmentScope::Directory;
         crate::fs::EnrichmentBatch { fields, directory, children }
@@ -705,6 +766,8 @@ impl Coordinator {
             designated,
             cancel: CancellationToken::new(),
             leases: 1,
+            permitted: grant.operations,
+            starved: false,
             session_open: false,
             registration,
             enrichment: match request.need {
@@ -885,6 +948,12 @@ impl Coordinator {
             return;
         };
         let path = job.path.clone();
+        if let Work::Enrichment { batch } = &work {
+            let dispatched = batch.children.len();
+            if let Some(progress) = self.jobs.get_mut(&id).and_then(|job| job.enrichment.as_mut()) {
+                progress.dispatched = dispatched;
+            }
+        }
         let spec = JobSpec { id, path: path.clone(), work };
         let operation = spec.operation();
         self.blocking_slots.insert(super::SlotOwner::Job(id), Occupancy { path, operation, started });
@@ -963,6 +1032,7 @@ pub(super) struct JobGrant {
     pub domain: Option<StorageDomainId>,
     pub origin: WorkOrigin,
     pub cost: Duration,
+    pub operations: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

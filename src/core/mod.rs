@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use governor::{
-    AdmissionDecision, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor, HostGovernorError,
-    LatencySummary, Reservation, TreeNumber, host_governor,
+    AdmissionDecision, Admitted, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor,
+    HostGovernorError, LatencySummary, Reported, Reservation, TreeNumber, host_governor,
 };
 use types::*;
 pub use types::{Class, DegradedCause, MonotonicTime, WorkOrigin};
@@ -868,10 +868,17 @@ impl Coordinator {
                     let binding = self.bind_domain(site, &probe);
                     self.governor.attribute(self.job_grant(*job), binding.id, now);
                 }
-                if let JobResult::Listing(step) = result
-                    && let Some(blocking) = step.cost.blocking
-                {
-                    self.governor.report(self.job_grant(*job), blocking, now);
+                match result {
+                    JobResult::Listing(step) => {
+                        let operations = step.cost.listing_operations.saturating_add(step.cost.per_child_operations());
+                        let reported = Reported { blocking: step.cost.blocking, operations };
+                        self.governor.report(self.job_grant(*job), reported, now);
+                    }
+                    JobResult::Enrichment(Ok(read)) => {
+                        let reported = Reported { blocking: None, operations: read.metadata_operations };
+                        self.governor.report(self.job_grant(*job), reported, now);
+                    }
+                    JobResult::Metadata(_) | JobResult::Domain(_) | JobResult::Enrichment(Err(_)) => {}
                 }
                 let barriers = self.jobs.get(job).map(|job| job.barriers.clone()).unwrap_or_default();
                 if !barriers.is_empty() {
@@ -1774,6 +1781,8 @@ impl Coordinator {
             path: pending.path.clone(),
             reads: 1,
             registrations: 0,
+            operations: 0,
+            ceiling: None,
             lease: 0,
             domain,
             origin: WorkOrigin::Background,
