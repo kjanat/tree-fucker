@@ -50,6 +50,7 @@ counter_type!(CommandId);
 counter_type!(JobId);
 counter_type!(WatchId);
 counter_type!(WatchRequestId);
+counter_type!(WatchReleaseId);
 counter_type!(TimerId);
 
 #[derive(Clone, Copy, Debug, Default)]

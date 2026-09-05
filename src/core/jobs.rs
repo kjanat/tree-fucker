@@ -5,6 +5,7 @@ use crate::entry::{EntryKind, LoadState, Shape};
 use crate::error::Error;
 use crate::fs::{Enrichment, FsError, SessionOutcome, SessionState, SessionStep};
 use crate::ids::*;
+use crate::path::RelativePath;
 use crate::update::{ErrorCause, Operation, ResourceLimitEvent, ResourceLimited, WatcherHealth};
 
 impl Coordinator {
@@ -182,6 +183,7 @@ impl Coordinator {
         match loss {
             WorkerLoss::Job(id) => self.on_job_lost(id),
             WorkerLoss::WatchRegistration(request) => self.on_watch_registered(request, Err(ErrorCause::WorkerLost)),
+            WorkerLoss::WatchRelease(_) => self.lost_workers += 1,
         }
     }
 
@@ -804,47 +806,47 @@ impl Coordinator {
     }
 
     fn abandon_registration(&mut self, request: WatchRequestId) {
-        if let Some(target) = self.registrations.get_mut(&request) {
-            *target = target.abandon();
+        if let Some(held) = self.registrations.get_mut(&request) {
+            held.abandon();
         }
     }
 
-    pub(super) fn release_watch(&mut self, result: Result<WatchId, ErrorCause>) {
+    pub(super) fn release_watch(&mut self, result: Result<WatchId, ErrorCause>, path: RelativePath) {
         if let Ok(watch) = result {
-            self.emit_unwatch(watch, None);
+            self.emit_unwatch(watch, path, None);
         }
     }
 
     pub(super) fn on_watch_registered(&mut self, request: WatchRequestId, result: Result<WatchId, ErrorCause>) {
-        let Some(target) = self.registrations.remove(&request) else {
-            self.release_watch(result);
+        let Some(registration) = self.registrations.remove(&request) else {
             return;
         };
-        match target {
-            RegistrationTarget::AbandonedStandalone => self.release_watch(result),
+        let registered = registration.path;
+        match registration.target {
+            RegistrationTarget::AbandonedStandalone => self.release_watch(result, registered),
             RegistrationTarget::AbandonedJob(job_id) => {
                 self.release_registration_slot(job_id);
-                self.release_watch(result);
+                self.release_watch(result, registered);
             }
             RegistrationTarget::Job(job_id) => {
                 let Some(job) = self.jobs.get(&job_id).cloned() else {
                     self.release_registration_slot(job_id);
-                    self.release_watch(result);
+                    self.release_watch(result, registered);
                     return;
                 };
                 if !matches!(job.phase, JobPhase::Registering(held, _) if held == request) {
-                    self.release_watch(result);
+                    self.release_watch(result, registered);
                     return;
                 }
                 let Some(entry) = job.entry() else {
                     self.release_registration_slot(job_id);
-                    self.release_watch(result);
+                    self.release_watch(result, registered);
                     return;
                 };
                 let is_root = job.path.is_root();
                 match result {
                     Ok(watch) => {
-                        self.watches.push(watch);
+                        self.watches.insert(watch, registered.clone());
                         let domain = self.domain_of(entry);
                         self.entries.set_watch(entry, WatchState::Registered(watch), domain);
                         self.recover_domain_watcher(entry);
@@ -889,14 +891,14 @@ impl Coordinator {
                 Ok(watch) => {
                     if self.dir_state(entry).is_none() {
                         let domain = self.domain_of(entry);
-                        self.emit_unwatch(watch, domain);
+                        self.emit_unwatch(watch, registered, domain);
                         return;
                     }
                     let is_root = self.snapshot.get_by_id(entry).map(|e| e.path.is_root()).unwrap_or(false);
                     let domain = self.domain_of(entry);
                     self.entries.set_watch(entry, WatchState::Registered(watch), domain);
                     self.recover_domain_watcher(entry);
-                    self.watches.push(watch);
+                    self.watches.insert(watch, registered);
                     self.entries.advance_watch_phase(entry);
                     if is_root || self.watcher_of(entry).scope == crate::domain::WatcherScope::PerDirectory {
                         self.watcher_health = WatcherHealth::Healthy { backend: self.caps.watcher };

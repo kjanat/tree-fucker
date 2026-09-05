@@ -69,6 +69,7 @@ fn per_directory_watcher_registers_before_each_first_listing() {
     assert!(h.paths().contains(&"c/late".to_string()));
     let t = h.command(Command::Unload(path("a")));
     assert_eq!(h.result(t), Some(Ok(())));
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 2);
 }
 
@@ -866,6 +867,7 @@ fn a_registration_landing_after_job_cancellation_releases_the_watch() {
     let t = h.command(Command::Unload(path("c")));
     assert_eq!(h.result(t), Some(Ok(())));
     h.complete_registration(request, &watch_path, recursive);
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 1, "unwatched {:?}", h.unwatched());
 }
 
@@ -879,8 +881,9 @@ fn a_registration_landing_after_shutdown_releases_the_watch() {
     let (request, watch_path, recursive) = h.take_registration("c").expect("c registration");
     let t = h.command(Command::Shutdown);
     assert_eq!(h.result(t), Some(Ok(())));
-    assert_eq!(fs.watch_count(), 0);
+    h.complete_releases();
     h.complete_registration(request, &watch_path, recursive);
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 0, "unwatched {:?}", h.unwatched());
 }
 
@@ -892,6 +895,7 @@ fn a_registration_landing_after_root_loss_releases_the_watch() {
     h.auto_register = false;
     let unload = h.command(Command::Unload(path("c")));
     assert_eq!(h.result(unload), Some(Ok(())));
+    h.complete_releases();
     fs.remove_root();
     let refresh_a = h.command(Command::Refresh(vec![path("a")]));
     let load_c = h.command(Command::Load(path("c")));
@@ -899,13 +903,16 @@ fn a_registration_landing_after_root_loss_releases_the_watch() {
     let a_job = h.pending_job_for("a").expect("a listing");
     h.complete_job(a_job.id);
     assert_eq!(h.result(refresh_a), Some(Ok(())));
+    h.complete_releases();
     let (request, watch_path, recursive) = h.take_registration("c").expect("c registration");
     let root_job = h.pending_job_for("").expect("root listing");
     h.complete_job(root_job.id);
     assert_eq!(h.result(refresh_root), Some(Err(Error::RootUnavailable)));
     assert_eq!(h.result(load_c), Some(Err(Error::RootUnavailable)));
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 0);
     h.complete_registration(request, &watch_path, recursive);
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 0, "unwatched {:?}", h.unwatched());
 }
 
@@ -948,6 +955,7 @@ fn a_standalone_registration_landing_after_its_directory_vanishes_releases_the_w
     assert_eq!(fs.watch_count(), 4);
     h.auto_register = false;
     h.inject_watcher_event(tree_fucker::fs::WatcherEvent::Failed { message: "backend gone".into(), path: None });
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 0);
     for _ in 0..10 {
         if h.pending_registrations().iter().any(|(_, p, _)| *p == path("c")) {
@@ -965,6 +973,7 @@ fn a_standalone_registration_landing_after_its_directory_vanishes_releases_the_w
     let before = fs.watch_count();
     let released = h.unwatched().len();
     h.complete_registration(request, &watch_path, recursive);
+    h.complete_releases();
     assert_eq!(fs.watch_count(), before, "the landed watch on a vanished directory stayed registered");
     assert_eq!(h.unwatched().len(), released + 1);
     let t = h.command(Command::Shutdown);

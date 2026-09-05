@@ -6,7 +6,7 @@ use std::time::Instant;
 use super::types::{MonotonicTime, WorkOrigin};
 use crate::config::HostConfig;
 use crate::domain::{AccessTopology, DomainCapabilities, MediaHint, StorageDomainId};
-use crate::ids::{JobId, WatchRequestId};
+use crate::ids::{JobId, WatchReleaseId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::update::ThrottleCause;
 
@@ -30,6 +30,7 @@ impl TreeNumber {
 pub enum GrantId {
     Job(TreeNumber, JobId),
     WatchRegistration(TreeNumber, WatchRequestId),
+    WatchRelease(TreeNumber, WatchReleaseId),
     Bootstrap(u64),
 }
 
@@ -37,13 +38,20 @@ impl GrantId {
     pub fn job(self) -> Option<JobId> {
         match self {
             GrantId::Job(_, id) => Some(id),
-            GrantId::WatchRegistration(_, _) | GrantId::Bootstrap(_) => None,
+            GrantId::WatchRegistration(_, _) | GrantId::WatchRelease(_, _) | GrantId::Bootstrap(_) => None,
+        }
+    }
+
+    pub fn release(self) -> Option<WatchReleaseId> {
+        match self {
+            GrantId::WatchRelease(_, id) => Some(id),
+            GrantId::Job(_, _) | GrantId::WatchRegistration(_, _) | GrantId::Bootstrap(_) => None,
         }
     }
 
     pub fn tree(self) -> Option<TreeNumber> {
         match self {
-            GrantId::Job(tree, _) | GrantId::WatchRegistration(tree, _) => Some(tree),
+            GrantId::Job(tree, _) | GrantId::WatchRegistration(tree, _) | GrantId::WatchRelease(tree, _) => Some(tree),
             GrantId::Bootstrap(_) => None,
         }
     }
@@ -824,11 +832,13 @@ impl Governor {
             self.deny(ThrottleCause::StuckWorker, domain, Duration::ZERO, now);
             return Err(ThrottleCause::StuckWorker);
         }
+        let cleanup = id.release().is_some();
         let result_bytes = match listing {
             true => self.bytes_estimate(domain),
             false => 0,
         };
-        if self.memory_exceeded(result_bytes) || (listing && self.in_flight_bytes_exceeded(result_bytes)) {
+        if !cleanup && (self.memory_exceeded(result_bytes) || (listing && self.in_flight_bytes_exceeded(result_bytes)))
+        {
             self.deny(ThrottleCause::Memory, domain, Duration::ZERO, now);
             return Err(ThrottleCause::Memory);
         }
@@ -844,7 +854,7 @@ impl Governor {
             WorkOrigin::Background => self.global.affordable(nanos(cost)),
             WorkOrigin::Foreground => self.foreground.affordable(nanos(cost)),
         };
-        if !global || !local {
+        if !cleanup && (!global || !local) {
             let cause = match origin {
                 WorkOrigin::Background => ThrottleCause::DutyBudget,
                 WorkOrigin::Foreground => ThrottleCause::ForegroundCeiling,
@@ -852,7 +862,7 @@ impl Governor {
             self.deny(cause, domain, cost, now);
             return Err(cause);
         }
-        if domain.is_none() && self.bootstrap_outstanding + nanos(cost) > self.bootstrap_capacity {
+        if !cleanup && domain.is_none() && self.bootstrap_outstanding + nanos(cost) > self.bootstrap_capacity {
             self.deny(ThrottleCause::DutyBudget, domain, cost, now);
             return Err(ThrottleCause::DutyBudget);
         }
@@ -872,6 +882,9 @@ impl Governor {
             WorkOrigin::Foreground => self.denied_foreground = None,
         }
         self.watch_registration_grants += u64::from(registrations);
+        if cleanup {
+            self.watch_release_grants += 1;
+        }
         self.last_decision = Some(AdmissionDecision::Granted);
         if let Some(since) = self.throttled_since.take() {
             self.throttled_total += now.since(since);
@@ -957,25 +970,6 @@ impl Governor {
         duration(self.charged_by_tree.get(&tree).copied().unwrap_or(0))
     }
 
-    pub fn charge_release(
-        &mut self,
-        tree: TreeNumber,
-        domain: Option<StorageDomainId>,
-        now: MonotonicTime,
-    ) -> Duration {
-        self.account(now);
-        let cost = self.cost_of(domain, 1);
-        let amount = nanos(cost);
-        self.reserved_total += amount;
-        self.charged_total += amount;
-        self.charge_tree(Some(tree), amount);
-        self.granted += 1;
-        self.watch_release_grants += 1;
-        self.global.level -= amount;
-        self.credit(domain, WorkOrigin::Background, amount, amount, 0, now);
-        cost
-    }
-
     pub fn start(&mut self, id: GrantId, at: MonotonicTime) {
         let Some(grant) = self.grants.get_mut(&id) else {
             return;
@@ -1018,6 +1012,9 @@ impl Governor {
         let (Some(started), Some(domain)) = (grant.started, grant.domain) else {
             return;
         };
+        if grant.id.release().is_some() {
+            return;
+        }
         let state = self.domain_mut(domain, now);
         match (grant.dispatched, grant.registration) {
             (Some(dispatched), _) => state.record_latency(now.since(dispatched), grant.listing),
@@ -1442,10 +1439,6 @@ impl HostGovernor {
 
     pub fn charge_surcharge(&self, domain: Option<StorageDomainId>, now: MonotonicTime) {
         guard(&self.inner).charge_surcharge(domain, now)
-    }
-
-    pub fn charge_release(&self, tree: TreeNumber, domain: Option<StorageDomainId>, now: MonotonicTime) -> Duration {
-        guard(&self.inner).charge_release(tree, domain, now)
     }
 
     pub fn charged_by_tree(&self, tree: TreeNumber) -> Duration {

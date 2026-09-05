@@ -56,8 +56,7 @@ impl Coordinator {
                 continue;
             };
             let domain = self.domain_of(id);
-            self.emit_unwatch(watch, domain);
-            self.watches.retain(|held| *held != watch);
+            self.release_registered(watch, domain);
             self.entries.set_watch(id, WatchState::NotRegistered, domain);
         }
     }
@@ -178,7 +177,10 @@ impl Coordinator {
                             started: now,
                         },
                     );
-                    self.registrations.insert(request, RegistrationTarget::Standalone(id));
+                    self.registrations.insert(
+                        request,
+                        Registration { path: path.clone(), target: RegistrationTarget::Standalone(id) },
+                    );
                     self.outputs.push(Output::RegisterWatch { request, path, recursive: scope.is_recursive() });
                 }
             }

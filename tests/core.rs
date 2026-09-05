@@ -437,6 +437,7 @@ fn shutdown_publishes_terminal_and_rejects_later_commands() {
     assert_eq!(h.result(t), Some(Ok(())));
     assert!(h.stopped());
     assert!(matches!(h.events().last(), Some(UpdateEvent::Terminal { .. })));
+    h.complete_releases();
     assert_eq!(fs.watch_count(), 0);
     let t = h.command(Command::Refresh(vec![path("")]));
     assert_eq!(h.result(t), Some(Err(Error::Shutdown)));

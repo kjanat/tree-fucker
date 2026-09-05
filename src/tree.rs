@@ -17,7 +17,7 @@ use crate::core::{
 };
 use crate::error::{Error, Result};
 use crate::fs::{Continuation, FileSystem, FsError, ListingSession, SessionStep, WatcherEvent, WatcherSink};
-use crate::ids::{CommandId, JobId, WatchId, WatchRequestId};
+use crate::ids::{CommandId, JobId, WatchId, WatchReleaseId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
 use crate::runtime::{BoxTaskHandle, Runtime};
@@ -31,7 +31,7 @@ enum Message {
 
 enum RunPhase {
     Serving,
-    ReleasingRegistrations,
+    ReleasingWorkers,
 }
 
 #[derive(Clone, Copy)]
@@ -228,6 +228,7 @@ struct Actor {
     base: Instant,
     workers: HashMap<JobId, BoxTaskHandle>,
     registrations: HashSet<WatchRequestId>,
+    releases: HashSet<WatchReleaseId>,
     sessions: Arc<Mutex<HashMap<JobId, SessionSlot>>>,
 }
 
@@ -253,6 +254,9 @@ impl Actor {
             }
             Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
                 self.registrations.remove(request);
+            }
+            Input::WatchReleased { release } | Input::WorkerLost(WorkerLoss::WatchRelease(release)) => {
+                self.releases.remove(release);
             }
             Input::Command { .. } | Input::Watcher(_) | Input::Timer(_) => {}
         }
@@ -348,7 +352,7 @@ impl Actor {
                         }))
                         .detach();
                 }
-                Output::Unwatch(id) => self.unwatch(id),
+                Output::Unwatch { release, watch } => self.unwatch(release, watch),
                 Output::Publish(event) => {
                     let event = *event;
                     match &event {
@@ -398,9 +402,16 @@ impl Actor {
         }
     }
 
-    fn unwatch(&self, id: WatchId) {
+    fn unwatch(&mut self, release: WatchReleaseId, watch: WatchId) {
         let fs = self.fs.clone();
-        self.runtime.spawn_blocking(Box::new(move || fs.unwatch(id))).detach();
+        let guard = WorkerGuard::new(WorkerLoss::WatchRelease(release), self.shared.tx.clone());
+        self.releases.insert(release);
+        self.runtime
+            .spawn_blocking(Box::new(move || {
+                fs.unwatch(watch);
+                guard.finish(Input::WatchReleased { release });
+            }))
+            .detach();
     }
 
     fn close_stream_and_fail_pending(&self) {
@@ -423,11 +434,12 @@ impl Actor {
         let mut phase = RunPhase::Serving;
         while let Some(message) = self.rx.next().await {
             if self.dispatch(message).is_some() {
-                phase = RunPhase::ReleasingRegistrations;
+                phase = RunPhase::ReleasingWorkers;
                 self.close_stream_and_fail_pending();
             }
-            if matches!(phase, RunPhase::ReleasingRegistrations)
+            if matches!(phase, RunPhase::ReleasingWorkers)
                 && self.registrations.is_empty()
+                && self.releases.is_empty()
                 && self.workers.is_empty()
             {
                 break;
@@ -527,6 +539,7 @@ impl Tree {
             base,
             workers: HashMap::new(),
             registrations: HashSet::new(),
+            releases: HashSet::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         };
         let _ = actor.execute(initial);

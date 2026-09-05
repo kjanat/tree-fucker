@@ -11,7 +11,7 @@ use crate::core::{
 use crate::domain::StorageDomainId;
 use crate::error::Error;
 use crate::fs::{Continuation, FileSystem, HintKind, ListingSession, SessionStep, WatcherEvent};
-use crate::ids::{CommandId, IdMap, JobId, TimerId, WatchId, WatchRequestId};
+use crate::ids::{CommandId, IdMap, JobId, TimerId, WatchId, WatchReleaseId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::policy::ScanPolicy;
 use crate::snapshot::Snapshot;
@@ -90,6 +90,7 @@ pub struct Harness {
     cancelled: Vec<JobId>,
     outstanding: VecDeque<JobSpec>,
     unwatched: Vec<WatchId>,
+    releases: VecDeque<(WatchReleaseId, WatchId)>,
     stopped: bool,
     schedule: BTreeSet<(MonotonicTime, Scheduled)>,
     registration_due: IdMap<WatchRequestId, MonotonicTime>,
@@ -105,6 +106,7 @@ pub struct Harness {
     batch_members: BTreeSet<JobId>,
     waited_at: Option<MonotonicTime>,
     pub auto_register: bool,
+    pub auto_release: bool,
 }
 
 impl Harness {
@@ -149,6 +151,7 @@ impl Harness {
             cancelled: Vec::new(),
             outstanding: VecDeque::new(),
             unwatched: Vec::new(),
+            releases: VecDeque::new(),
             stopped: false,
             schedule: BTreeSet::new(),
             registration_due: IdMap::default(),
@@ -164,6 +167,7 @@ impl Harness {
             batch_members: BTreeSet::new(),
             waited_at: None,
             auto_register: true,
+            auto_release: true,
         };
         harness.record_grants();
         harness.process(outputs);
@@ -228,9 +232,9 @@ impl Harness {
                     }
                     self.registrations.push_back((request, path, recursive))
                 }
-                Output::Unwatch(id) => {
-                    self.unwatched.push(id);
-                    self.fs.unwatch(id);
+                Output::Unwatch { release, watch } => {
+                    self.unwatched.push(watch);
+                    self.releases.push_back((release, watch));
                 }
                 Output::Publish(event) => self.events.push(*event),
                 Output::CommandFinished { id, result } => {
@@ -582,6 +586,33 @@ impl Harness {
         self.feed(Input::WatchRegistered { request, result });
     }
 
+    pub fn pending_releases(&self) -> Vec<(WatchReleaseId, WatchId)> {
+        self.releases.iter().copied().collect()
+    }
+
+    pub fn complete_release(&mut self, release: WatchReleaseId) -> bool {
+        let Some(index) = self.releases.iter().position(|(held, _)| *held == release) else {
+            return false;
+        };
+        let Some((release, watch)) = self.releases.remove(index) else {
+            return false;
+        };
+        self.fs.unwatch(watch);
+        self.feed(Input::WatchReleased { release });
+        true
+    }
+
+    pub fn complete_releases(&mut self) -> usize {
+        let mut count = 0;
+        while let Some((release, _)) = self.releases.front().copied() {
+            if !self.complete_release(release) {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
     pub fn complete_registrations(&mut self) -> usize {
         let mut count = 0;
         loop {
@@ -656,6 +687,9 @@ impl Harness {
         if self.auto_register {
             self.complete_registrations();
         }
+        if self.auto_release {
+            self.complete_releases();
+        }
         self.deliver_watcher_events();
         let job = self.schedule.iter().next().map(|(due, _)| *due).filter(|due| *due <= target);
         let timer = self.timer.map(|(_, at)| at).filter(|at| *at <= target && Some(*at) != *fired);
@@ -685,6 +719,9 @@ impl Harness {
                 self.observe();
                 if self.auto_register {
                     self.complete_registrations();
+                }
+                if self.auto_release {
+                    self.complete_releases();
                 }
                 self.deliver_watcher_events();
                 return;
@@ -717,6 +754,9 @@ impl Harness {
             let mut progress = 0;
             if self.auto_register {
                 progress += self.complete_registrations();
+            }
+            if self.auto_release {
+                progress += self.complete_releases();
             }
             progress += self.complete_all_jobs();
             progress += self.release_outstanding();

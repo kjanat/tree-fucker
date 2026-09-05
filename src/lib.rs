@@ -36,7 +36,7 @@ pub use fs::{
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,
-    WatchId,
+    WatchId, WatchReleaseId, WatchRequestId,
 };
 pub use path::{CaseSensitivity, PathError, PathKey, RelativePath};
 pub use policy::{LoadAll, LoadDepth, PathPredicate, PolicyContext, ScanDecision, ScanPolicy};

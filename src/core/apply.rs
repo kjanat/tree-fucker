@@ -1068,8 +1068,7 @@ impl Coordinator {
             && self.watcher_of(id).scope == crate::domain::WatcherScope::PerDirectory
         {
             let domain = self.domain_of(id);
-            self.emit_unwatch(watch, domain);
-            self.watches.retain(|w| *w != watch);
+            self.release_registered(watch, domain);
             self.entries.set_watch(id, WatchState::NotRegistered, domain);
         }
     }
@@ -1095,8 +1094,7 @@ impl Coordinator {
             None => None,
         };
         if let Some(watch) = released {
-            self.emit_unwatch(watch, domain);
-            self.watches.retain(|w| *w != watch);
+            self.release_registered(watch, domain);
         }
         self.set_obligation(id, ObligationState::Removed);
         self.initial_scan.resolve_removed(id);

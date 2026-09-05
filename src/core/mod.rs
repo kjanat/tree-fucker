@@ -199,6 +199,7 @@ pub enum JobOperation {
     DomainResolution,
     Enrichment { fields: MetadataFields },
     WatchRegistration,
+    WatchRelease,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +248,7 @@ pub enum JobResult {
 pub enum WorkerLoss {
     Job(JobId),
     WatchRegistration(WatchRequestId),
+    WatchRelease(WatchReleaseId),
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +257,7 @@ pub enum Input {
     Watcher(WatcherEvent),
     JobCompleted { job: JobId, result: JobResult },
     WatchRegistered { request: WatchRequestId, result: Result<WatchId, FsError> },
+    WatchReleased { release: WatchReleaseId },
     WorkerLost(WorkerLoss),
     Timer(TimerId),
 }
@@ -270,7 +273,7 @@ pub enum Output {
     StartJob(JobSpec),
     CancelJob(JobId),
     RegisterWatch { request: WatchRequestId, path: RelativePath, recursive: bool },
-    Unwatch(WatchId),
+    Unwatch { release: WatchReleaseId, watch: WatchId },
     Publish(Box<UpdateEvent>),
     CommandFinished { id: CommandId, result: Result<(), Error> },
     SetTimer { id: TimerId, at: MonotonicTime },
@@ -281,15 +284,30 @@ pub enum Output {
 pub enum SlotOwner {
     Job(JobId),
     WatchRegistration(WatchRequestId),
+    WatchRelease(WatchReleaseId),
 }
 
 impl SlotOwner {
     pub fn job(self) -> Option<JobId> {
         match self {
             SlotOwner::Job(id) => Some(id),
-            SlotOwner::WatchRegistration(_) => None,
+            SlotOwner::WatchRegistration(_) | SlotOwner::WatchRelease(_) => None,
         }
     }
+
+    pub fn release(self) -> Option<WatchReleaseId> {
+        match self {
+            SlotOwner::WatchRelease(id) => Some(id),
+            SlotOwner::Job(_) | SlotOwner::WatchRegistration(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRelease {
+    watch: WatchId,
+    path: RelativePath,
+    domain: Option<StorageDomainId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,6 +411,7 @@ pub struct Coordinator {
     next_entry_id: EntryId,
     next_job_id: JobId,
     next_watch_request: WatchRequestId,
+    next_watch_release: WatchReleaseId,
     snapshot: Snapshot,
     parent_cache: std::cell::RefCell<(SnapshotVersion, IdMap<EntryId, Option<EntryId>>)>,
     published_version: SnapshotVersion,
@@ -415,7 +434,7 @@ pub struct Coordinator {
     blocking_slots: BTreeMap<SlotOwner, Occupancy>,
     active_by_entry: IdMap<EntryId, JobId>,
     probe_job: Option<JobId>,
-    registrations: IdMap<WatchRequestId, RegistrationTarget>,
+    registrations: IdMap<WatchRequestId, Registration>,
     queue_order: VecDeque<JobId>,
     batch: Option<Batch>,
     round: Option<Round>,
@@ -432,7 +451,8 @@ pub struct Coordinator {
     watcher_degraded: BTreeMap<StorageDomainId, String>,
     watcher_restart_due: Option<MonotonicTime>,
     watcher_restart_attempts: u32,
-    watches: Vec<WatchId>,
+    watches: IdMap<WatchId, RelativePath>,
+    pending_releases: VecDeque<PendingRelease>,
     open_gate: OpenGate,
     outputs: Vec<Output>,
     baseline_due: bool,
@@ -478,11 +498,14 @@ impl Drop for Coordinator {
         for id in self.blocking_slots.keys().filter_map(|owner| owner.job()) {
             self.governor.release(self.job_grant(id), now);
         }
-        for (request, target) in self.registrations.iter() {
+        for (request, held) in self.registrations.iter() {
             self.governor.release(self.registration_grant(*request), now);
-            if let Some(job) = target.job() {
+            if let Some(job) = held.target.job() {
                 self.governor.release(self.job_grant(job), now);
             }
+        }
+        for release in self.blocking_slots.keys().filter_map(|owner| owner.release()) {
+            self.governor.release(self.release_grant(release), now);
         }
         self.governor.forget_tree(self.tree);
     }
@@ -524,6 +547,7 @@ impl Coordinator {
             next_entry_id: EntryId::new(1),
             next_job_id: JobId::new(1),
             next_watch_request: WatchRequestId::new(1),
+            next_watch_release: WatchReleaseId::new(1),
             snapshot,
             parent_cache: std::cell::RefCell::new((SnapshotVersion::new(0), IdMap::default())),
             published_version: SnapshotVersion::new(0),
@@ -567,7 +591,8 @@ impl Coordinator {
             watcher_degraded: BTreeMap::new(),
             watcher_restart_due: None,
             watcher_restart_attempts: 0,
-            watches: Vec::new(),
+            watches: IdMap::default(),
+            pending_releases: VecDeque::new(),
             open_gate: OpenGate::Pending,
             outputs: Vec::new(),
             baseline_due: false,
@@ -724,6 +749,10 @@ impl Coordinator {
         GrantId::WatchRegistration(self.tree, request)
     }
 
+    pub(super) fn release_grant(&self, release: WatchReleaseId) -> GrantId {
+        GrantId::WatchRelease(self.tree, release)
+    }
+
     pub fn grants(&self) -> Vec<Grant> {
         self.governor.grants()
     }
@@ -784,9 +813,6 @@ impl Coordinator {
 
     pub fn observe(&mut self, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
-        if self.is_stopped() {
-            return self.take_outputs();
-        }
         self.after_input();
         self.take_outputs()
     }
@@ -821,21 +847,21 @@ impl Coordinator {
             Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
                 let now = self.now;
                 self.governor.release(self.registration_grant(*request), now);
-                match self.registrations.get(request).copied() {
+                match self.registrations.get(request).map(|held| held.target) {
                     Some(RegistrationTarget::AbandonedJob(job)) => {
-                        self.registrations.remove(request);
                         self.blocking_slots.remove(&SlotOwner::Job(job));
                         self.governor.release(self.job_grant(job), now);
                     }
-                    Some(RegistrationTarget::AbandonedStandalone) => {
-                        self.registrations.remove(request);
-                        self.blocking_slots.remove(&SlotOwner::WatchRegistration(*request));
-                    }
-                    Some(RegistrationTarget::Standalone(_)) => {
+                    Some(RegistrationTarget::AbandonedStandalone | RegistrationTarget::Standalone(_)) => {
                         self.blocking_slots.remove(&SlotOwner::WatchRegistration(*request));
                     }
                     Some(RegistrationTarget::Job(_)) | None => {}
                 }
+            }
+            Input::WatchReleased { release } | Input::WorkerLost(WorkerLoss::WatchRelease(release)) => {
+                let now = self.now;
+                self.blocking_slots.remove(&SlotOwner::WatchRelease(*release));
+                self.governor.release(self.release_grant(*release), now);
             }
             Input::Command { .. } | Input::Watcher(_) | Input::Timer(_) => {}
         }
@@ -848,9 +874,18 @@ impl Coordinator {
                     };
                     self.outputs.push(Output::CommandFinished { id, result: Err(err) });
                 }
-                Input::WatchRegistered { result, .. } => self.release_watch(result.map_err(ErrorCause::Fs)),
-                Input::Watcher(_) | Input::JobCompleted { .. } | Input::WorkerLost(_) | Input::Timer(_) => {}
+                Input::WatchRegistered { request, result } => {
+                    if let Some(held) = self.registrations.remove(&request) {
+                        self.release_watch(result.map_err(ErrorCause::Fs), held.path);
+                    }
+                }
+                Input::Watcher(_)
+                | Input::JobCompleted { .. }
+                | Input::WatchReleased { .. }
+                | Input::WorkerLost(_)
+                | Input::Timer(_) => {}
             }
+            self.after_input();
             return self.take_outputs();
         }
         match input {
@@ -860,6 +895,7 @@ impl Coordinator {
             Input::WatchRegistered { request, result } => {
                 self.on_watch_registered(request, result.map_err(ErrorCause::Fs))
             }
+            Input::WatchReleased { .. } => {}
             Input::WorkerLost(loss) => self.on_worker_lost(loss),
             Input::Timer(id) => self.on_timer(id),
         }
@@ -915,6 +951,7 @@ impl Coordinator {
                     let owner = match grant.id {
                         GrantId::Job(_, job) => SlotOwner::Job(job),
                         GrantId::WatchRegistration(_, request) => SlotOwner::WatchRegistration(request),
+                        GrantId::WatchRelease(_, release) => SlotOwner::WatchRelease(release),
                         GrantId::Bootstrap(_) => return None,
                     };
                     let held = self.blocking_slots.get(&owner)?;
@@ -1216,13 +1253,14 @@ impl Coordinator {
     }
 
     fn after_input(&mut self) {
+        let now = self.now;
+        self.governor.account(now);
+        self.declare_stuck_workers();
+        self.start_releases();
         if self.is_stopped() {
             return;
         }
-        let now = self.now;
         self.report_memory();
-        self.governor.account(now);
-        self.declare_stuck_workers();
         self.enforce_command_ceilings();
         self.check_round_end();
         self.check_initial_scan();
@@ -1635,31 +1673,73 @@ impl Coordinator {
         self.probe_job = None;
         self.queue_order.clear();
         self.batch = None;
-        for target in self.registrations.values_mut() {
-            *target = target.abandon();
+        for held in self.registrations.values_mut() {
+            held.abandon();
         }
     }
 
-    pub(super) fn emit_unwatch(&mut self, watch: WatchId, domain: Option<StorageDomainId>) {
+    pub(super) fn emit_unwatch(&mut self, watch: WatchId, path: RelativePath, domain: Option<StorageDomainId>) {
+        self.pending_releases.push_back(PendingRelease { watch, path, domain });
+    }
+
+    pub(super) fn release_registered(&mut self, watch: WatchId, domain: Option<StorageDomainId>) {
+        if let Some(path) = self.watches.remove(&watch) {
+            self.emit_unwatch(watch, path, domain);
+        }
+    }
+
+    fn start_releases(&mut self) {
+        let queued: Vec<PendingRelease> = self.pending_releases.drain(..).collect();
+        let mut deferred: VecDeque<PendingRelease> = VecDeque::new();
+        for pending in queued {
+            let blocked = deferred.iter().any(|held| held.domain == pending.domain);
+            if blocked || !self.start_release(&pending) {
+                deferred.push_back(pending);
+            }
+        }
+        self.pending_releases = deferred;
+    }
+
+    fn start_release(&mut self, pending: &PendingRelease) -> bool {
+        let domain = pending.domain;
+        if self.governor.may_start(domain).is_err() {
+            return false;
+        }
+        let release = self.next_watch_release;
         let now = self.now;
-        self.governor.charge_release(self.tree, domain, now);
-        self.outputs.push(Output::Unwatch(watch));
+        let reservation = Reservation {
+            id: self.release_grant(release),
+            path: pending.path.clone(),
+            reads: 1,
+            registrations: 0,
+            lease: 0,
+            domain,
+            origin: WorkOrigin::Background,
+            listing: false,
+        };
+        if self.governor.try_admit(reservation, now).is_err() {
+            return false;
+        }
+        self.next_watch_release = release.next();
+        self.governor.start(self.release_grant(release), now);
+        self.blocking_slots.insert(
+            SlotOwner::WatchRelease(release),
+            Occupancy { path: pending.path.clone(), operation: JobOperation::WatchRelease, started: now },
+        );
+        self.outputs.push(Output::Unwatch { release, watch: pending.watch });
+        true
     }
 
     fn unwatch_all(&mut self) {
-        let mut charged: std::collections::HashSet<WatchId> = std::collections::HashSet::new();
         let watched: Vec<crate::ids::EntryId> = self.entries.watched_ids().collect();
         for id in watched {
             if let Some(WatchState::Registered(watch)) = self.dir_state(id).map(|d| d.watch()) {
                 let domain = self.domain_of(id);
-                self.emit_unwatch(watch, domain);
-                charged.insert(watch);
+                self.release_registered(watch, domain);
             }
         }
-        for watch in std::mem::take(&mut self.watches) {
-            if !charged.contains(&watch) {
-                self.emit_unwatch(watch, None);
-            }
+        for (watch, path) in std::mem::take(&mut self.watches) {
+            self.emit_unwatch(watch, path, None);
         }
         self.entries.reset_watches();
     }
@@ -1709,6 +1789,9 @@ impl Coordinator {
         }
         if let Some(t) = self.watcher_restart_due {
             consider(t);
+        }
+        if !self.pending_releases.is_empty() {
+            consider(self.now + self.config.minimum_period);
         }
         if wake != self.timer_wake {
             self.timer_wake = wake;

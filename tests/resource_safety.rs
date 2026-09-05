@@ -2537,6 +2537,216 @@ fn a_standalone_watch_registration_that_never_returns_is_reported_stuck_and_rele
     );
 }
 
+fn release_charge(h: &Harness) -> Duration {
+    h.stats().grants.iter().filter(|grant| grant.id.release().is_some()).map(|grant| grant.charged).sum()
+}
+
+fn two_domain_watched_tree() -> Arc<FakeFileSystem> {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    for dir in ["fast", "media"] {
+        fs.mkdir(dir);
+        fs.create_file(&format!("{dir}/f"), 1);
+    }
+    fs.set_domain("", HOME);
+    fs.set_domain("media", MEDIA);
+    fs.set_capabilities(MEDIA, remote_network());
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs
+}
+
+#[test]
+fn an_unwatch_that_never_returns_is_a_stuck_worker_that_quarantines_its_domain() {
+    let fs = two_domain_watched_tree();
+    let mut h = scanned(fs.clone(), follow());
+    assert!(h.stats().paths_watched > 0, "the tree registered no watch, so no removal can be exercised");
+    h.auto_release = false;
+
+    h.command(Command::Unload(path("media")));
+    h.run_until_idle();
+    let held = h
+        .stats()
+        .blocking_slots
+        .into_iter()
+        .find(|slot| slot.operation == JobOperation::WatchRelease)
+        .expect("RFC 15.1 item 1: a watch removal is a governed physical operation and occupies a worker slot");
+    assert_eq!(held.path, path("media"), "the removal reports the path whose watch it drops");
+    let estimate = release_charge(&h);
+
+    h.run_jobs_until(h.now() + STUCK_THRESHOLD + Duration::from_secs(1));
+    assert!(
+        h.stats().stuck_workers.iter().any(|slot| slot.operation == JobOperation::WatchRelease),
+        "RFC 13.5: a removal whose call never returns is reported as a stuck worker; {:?}",
+        h.stats().stuck_workers
+    );
+    let media = domain_stat(&h, MEDIA);
+    assert_eq!(
+        media.in_flight, 1,
+        "RFC 13.5: the stuck removal keeps its in-flight slot; the domain reports {media:?}"
+    );
+    assert_eq!(
+        h.health().resource_domains.get(&media.id).copied(),
+        Some(ResourceHealth::Throttled { cause: ThrottleCause::StuckWorker, resume: None }),
+        "RFC 13.5: one stuck worker quarantines its storage domain"
+    );
+    let hung = release_charge(&h);
+    assert!(
+        hung > estimate && hung >= STUCK_THRESHOLD,
+        "RFC 15.2: an operation that has not completed is charged its occupancy so far; it went from {estimate:?} to \
+         {hung:?}"
+    );
+
+    h.auto_release = true;
+    h.complete_releases();
+    h.run_until_idle();
+    assert!(h.stats().stuck_workers.is_empty(), "RFC 13.5: the returned removal is no longer stuck");
+    assert_eq!(domain_stat(&h, MEDIA).stuck, 0, "RFC 13.5: the quarantine lifts when the stuck call returns");
+    assert!(
+        !h.stats().blocking_slots.iter().any(|slot| slot.operation == JobOperation::WatchRelease),
+        "the returned removal released its slot; {:?}",
+        h.stats().blocking_slots
+    );
+}
+
+#[test]
+fn a_watch_removal_is_admitted_with_an_empty_domain_bucket() {
+    let fs = two_domain_watched_tree();
+    fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(10));
+    let mut h = scanned(fs.clone(), follow());
+    let drained = domain_stat(&h, MEDIA);
+    assert!(
+        drained.level.is_zero() && drained.debt > Duration::ZERO,
+        "the media bucket was never emptied, so the removal is not tested against an empty bucket; {drained:?}"
+    );
+    assert!(
+        matches!(drained.resource, ResourceHealth::Throttled { cause: ThrottleCause::DutyBudget, .. }),
+        "an ordinary read on this domain would be denied; the domain reports {:?}",
+        drained.resource
+    );
+
+    let before = h.governor().watch_release_grants;
+    h.command(Command::Unload(path("media")));
+    assert!(
+        h.governor().watch_release_grants > before,
+        "RFC 15.1 item 1: a removal releases resources and is admitted with an empty domain bucket; grants stayed at \
+         {before}"
+    );
+    assert!(
+        h.stats().blocking_slots.iter().any(|slot| slot.operation == JobOperation::WatchRelease),
+        "the admitted removal holds a physical slot; {:?}",
+        h.stats().blocking_slots
+    );
+    h.complete_releases();
+    assert!(!h.unwatched().is_empty(), "the removal never reached the adapter");
+}
+
+#[test]
+fn a_removal_on_a_healthy_domain_never_waits_behind_a_quarantined_one() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+    for dir in ["fast", "media", "media/inner"] {
+        fs.mkdir(dir);
+        fs.create_file(&format!("{dir}/f"), 1);
+    }
+    fs.set_domain("", HOME);
+    fs.set_domain("media", MEDIA);
+    fs.set_capabilities(MEDIA, remote_network());
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs.set_cost(CostScope::path("media/inner"), FakeOp::ReadDir, Duration::from_secs(36_000));
+    let mut h = scanned(fs.clone(), follow());
+    let held = domain_stat(&h, MEDIA);
+    assert_eq!(
+        h.health().resource_domains.get(&held.id).copied(),
+        Some(ResourceHealth::Throttled { cause: ThrottleCause::StuckWorker, resume: None }),
+        "the media domain was never quarantined, so nothing blocks the removal queued on it"
+    );
+    let stuck = h.pending_job_for("media/inner").expect("the hung listing is still outstanding");
+    h.auto_release = false;
+
+    h.command(Command::Unload(path("media")));
+    h.command(Command::Unload(path("fast")));
+    let releasing: Vec<RelativePath> = h
+        .stats()
+        .blocking_slots
+        .into_iter()
+        .filter(|slot| slot.operation == JobOperation::WatchRelease)
+        .map(|slot| slot.path)
+        .collect();
+    assert_eq!(
+        releasing,
+        vec![path("fast")],
+        "RFC 13.5: a quarantined domain holds back only its own removals; the tree is releasing {releasing:?}"
+    );
+    assert_eq!(h.pending_releases().len(), 1, "the healthy domain's removal reached the adapter alone");
+
+    assert!(h.complete_job(stuck.id), "the hung listing never returned");
+    h.run_until_idle();
+    assert!(
+        h.stats().blocking_slots.iter().any(|slot| slot.operation == JobOperation::WatchRelease),
+        "RFC 13.5: the removals queued on the domain start once the quarantine lifts; {:?}",
+        h.stats().blocking_slots
+    );
+    h.auto_release = true;
+    h.complete_releases();
+    assert!(h.pending_releases().is_empty() && !h.unwatched().is_empty(), "every queued removal reached the adapter");
+}
+
+#[test]
+fn a_watch_removal_waits_for_the_in_flight_ceiling() {
+    let fs = two_domain_watched_tree();
+    let mut h = scanned_under(fs.clone(), one_worker(), follow());
+    h.command(Command::Refresh(vec![path("fast")]));
+    let listing = h.pending_job_for("fast").expect("the refresh dispatched a listing");
+    assert_eq!(h.governor().in_flight, 1, "the one physical slot of the host is occupied");
+
+    let occupied = h.governor().watch_release_grants;
+    h.command(Command::Unload(path("media")));
+    assert!(
+        !h.stats().blocking_slots.iter().any(|slot| slot.operation == JobOperation::WatchRelease),
+        "RFC 15.3: a removal never bypasses the process-wide in-flight ceiling; {:?}",
+        h.stats().blocking_slots
+    );
+    assert_eq!(
+        h.governor().watch_release_grants,
+        occupied,
+        "RFC 15.3: the removal waited for a free physical slot rather than taking one"
+    );
+
+    assert!(h.complete_job(listing.id), "the held listing never completed");
+    assert!(
+        h.governor().watch_release_grants > occupied,
+        "RFC 15.3: the removal is admitted once the ceiling has a free slot"
+    );
+    h.complete_releases();
+    assert!(!h.unwatched().is_empty(), "the removal never reached the adapter");
+}
+
+#[test]
+fn shutdown_keeps_reporting_a_hung_unwatch_until_it_returns() {
+    let fs = two_domain_watched_tree();
+    let mut h = scanned(fs.clone(), follow());
+    assert!(h.stats().paths_watched > 0, "the tree registered no watch, so no removal can be exercised");
+    h.auto_release = false;
+
+    h.command(Command::Shutdown);
+    assert!(h.stopped(), "the tree accepted the shutdown");
+    assert!(!h.pending_releases().is_empty(), "RFC 9: shutdown removes the watches it holds");
+
+    h.run_jobs_until(h.now() + STUCK_THRESHOLD + Duration::from_secs(1));
+    let stuck = h.stats().stuck_workers;
+    assert!(
+        stuck.iter().any(|slot| slot.operation == JobOperation::WatchRelease),
+        "RFC 9 and 13.5: a shut-down tree keeps reporting a removal whose call has not returned; {stuck:?}"
+    );
+
+    h.auto_release = true;
+    h.complete_releases();
+    assert!(h.stats().stuck_workers.is_empty(), "RFC 13.5: the returned removal is no longer reported stuck");
+    assert!(
+        h.stats().blocking_slots.is_empty(),
+        "the returned removal released its slot; {:?}",
+        h.stats().blocking_slots
+    );
+}
+
 #[test]
 fn registration_latency_is_recorded_apart_from_the_listing_it_precedes() {
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));

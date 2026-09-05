@@ -1183,6 +1183,18 @@ pub enum RegistrationTarget {
     AbandonedStandalone,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registration {
+    pub path: RelativePath,
+    pub target: RegistrationTarget,
+}
+
+impl Registration {
+    pub fn abandon(&mut self) {
+        self.target = self.target.abandon();
+    }
+}
+
 impl RegistrationTarget {
     pub fn abandon(self) -> RegistrationTarget {
         match self {

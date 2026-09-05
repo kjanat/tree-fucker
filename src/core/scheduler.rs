@@ -846,7 +846,7 @@ impl Coordinator {
             return;
         };
         let request = self.next_watch_request();
-        self.registrations.insert(request, RegistrationTarget::Job(id));
+        self.registrations.insert(request, Registration { path: path.clone(), target: RegistrationTarget::Job(id) });
         if let Some(job) = self.jobs.get_mut(&id) {
             job.phase = JobPhase::Registering(request, now);
         }
