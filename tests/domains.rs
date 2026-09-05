@@ -5,11 +5,12 @@ use tree_fucker::core::{Command, JobOperation};
 use tree_fucker::fs::FsCapabilities;
 use tree_fucker::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use tree_fucker::testing::{CostScope, DomainId, FakeFileSystem, FakeOp, Harness};
-use tree_fucker::update::UpdateEvent;
+use tree_fucker::update::{ResourceHealth, ThrottleCause, UpdateEvent};
 use tree_fucker::{
-    AccessTopology, CaseSensitivity, Config, DeclarationSource, DirectoryListing, DomainCapabilities,
-    DomainCaseSensitivity, DomainCrossing, DomainIdentity, EntryInfo, IdentityReliability, LoadAll, LoadState,
-    PolicyRevision, RelativePath, WatcherKind,
+    AccessTopology, Answer, CaseSensitivity, Config, DeclarationSource, DirectoryListing, DomainCapabilities,
+    DomainCaseSensitivity, DomainCrossing, DomainIdentity, EntryInfo, FilesystemSemantics, IdentityReliability,
+    LoadAll, LoadState, MediaHint, PolicyRevision, RelativePath, TransportHint, WatcherAvailability,
+    WatcherCapabilities, WatcherKind, WatcherScope,
 };
 
 const MEDIA: DomainId = DomainId::new(2);
@@ -556,46 +557,158 @@ fn a_watch_registration_is_charged_to_the_domain_of_the_directory_it_watches() {
     );
 }
 
-#[test]
-fn two_domains_of_unknown_identity_share_one_record_that_declares_nothing() {
+fn two_unidentified_mounts() -> Arc<FakeFileSystem> {
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
-    fs.mkdir("near");
-    fs.create_file("near/f", 1);
-    fs.mkdir("far");
-    fs.create_file("far/f", 1);
+    for dir in ["near", "near/inner", "far", "far/inner"] {
+        fs.mkdir(dir);
+        fs.create_file(&format!("{dir}/f"), 1);
+    }
     fs.set_domain("near", MEDIA);
     fs.set_domain("far", BIND);
     fs.report_unknown_domain_identity(MEDIA);
     fs.report_unknown_domain_identity(BIND);
     fs.set_capabilities(MEDIA, DomainCapabilities { topology: AccessTopology::Local, ..DomainCapabilities::inline() });
-    fs.set_capabilities(BIND, DomainCapabilities { topology: AccessTopology::Remote, ..DomainCapabilities::inline() });
-    let mut h = Harness::open(fs.clone(), Arc::new(FollowNamed("near")), Config::default()).expect("open");
+    fs.set_capabilities(BIND, DomainCapabilities { media: MediaHint::Rotational, ..DomainCapabilities::inline() });
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    fs
+}
+
+#[test]
+fn two_mounts_without_identity_are_two_storage_domains() {
+    let fs = two_unidentified_mounts();
+    fs.set_cost(CostScope::path("near/inner"), FakeOp::ReadDir, Duration::from_secs(36_000));
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
     h.run_until_idle();
 
     let unknown: Vec<_> =
         h.stats().domains.into_iter().filter(|domain| domain.identity == DomainIdentity::Unknown).collect();
     assert_eq!(
         unknown.len(),
-        1,
-        "RFC 15.9: a domain whose identity is Unknown is accounted as its own domain per tree; the tree entered \
-         {unknown:?}"
+        2,
+        "RFC 2 and 15.9: Unknown means the identity is unavailable, so two unidentified mounts are two storage \
+         domains; the tree entered {unknown:?}"
     );
+    let near = unknown
+        .iter()
+        .find(|domain| domain.path == Some(path("near")))
+        .unwrap_or_else(|| panic!("the near mount was never entered; the tree holds {unknown:?}"));
+    let far = unknown
+        .iter()
+        .find(|domain| domain.path == Some(path("far")))
+        .unwrap_or_else(|| panic!("the far mount was never entered; the tree holds {unknown:?}"));
+    assert_ne!(near.id, far.id, "two mounts without identity must not collapse onto one domain id");
+
+    h.run_jobs_until(h.now() + Duration::from_secs(120));
+    let health = h.health().resource_domains;
     assert_eq!(
-        unknown[0].capabilities,
-        DomainCapabilities::default(),
-        "RFC 10.3: Unknown is the required value for anything the adapter cannot establish, so one record shared \
-         by several unidentified mounts declares nothing about either"
+        health.get(&near.id).copied(),
+        Some(ResourceHealth::Throttled { cause: ThrottleCause::StuckWorker, resume: None }),
+        "the near mount never went stuck, so the quarantine is untested; it reports {health:?}"
     );
+    assert!(
+        health.get(&far.id).copied().is_some_and(|health| health.cause() != Some(ThrottleCause::StuckWorker)),
+        "RFC 13.5: one stuck worker quarantines its storage domain and no other; the tree reports {health:?}"
+    );
+    assert!(
+        h.paths().contains(&"far/inner/f".to_string()),
+        "the second unidentified mount stopped being read; the tree holds {:?}",
+        h.paths()
+    );
+    let after: Vec<_> =
+        h.stats().domains.into_iter().filter(|domain| domain.identity == DomainIdentity::Unknown).collect();
+    assert_eq!(
+        after.len(),
+        2,
+        "RFC 15.7: coordinator state per represented entry is bounded, so relisting an unidentified mount binds the \
+         domain it already holds instead of minting another; the tree entered {after:?}"
+    );
+}
+
+#[test]
+fn each_unidentified_mount_gets_its_own_crossing_decision() {
+    let fs = two_unidentified_mounts();
+    let mut h = Harness::open(fs.clone(), Arc::new(FollowNamed("near")), Config::default()).expect("open");
+    h.run_until_idle();
 
     assert_eq!(
         h.entry("near").and_then(|e| e.load_state()),
         Some(LoadState::Loaded),
-        "RFC 14.3: the crossing decision uses the child domain's own declared capabilities, not the shared record"
+        "RFC 14.3: policy receives the child domain's own capabilities and refines the mode per crossing"
     );
     assert_eq!(
         h.entry("far").and_then(|e| e.load_state()),
         Some(LoadState::Unloaded),
         "RFC 14.3: the second unidentified mount's own declared capabilities decide its crossing separately"
+    );
+
+    let unknown: Vec<_> =
+        h.stats().domains.into_iter().filter(|domain| domain.identity == DomainIdentity::Unknown).collect();
+    assert_eq!(
+        unknown.len(),
+        2,
+        "RFC 2: each mount is its own storage domain, whichever crossing decision it received; the tree entered \
+         {unknown:?}"
+    );
+    let followed = unknown
+        .iter()
+        .find(|domain| domain.path == Some(path("near")))
+        .unwrap_or_else(|| panic!("the followed mount was never entered; the tree holds {unknown:?}"));
+    let held = unknown
+        .iter()
+        .find(|domain| domain.path == Some(path("far")))
+        .unwrap_or_else(|| panic!("the unloaded mount was never entered; the tree holds {unknown:?}"));
+    assert_ne!(
+        followed.id, held.id,
+        "RFC 14.3: crossing policy operates on the mount instance, so a followed mount and an unloaded one are two \
+         domains"
+    );
+}
+
+#[test]
+fn an_unidentified_mount_keeps_the_capabilities_it_declares() {
+    let watcher = WatcherCapabilities {
+        availability: WatcherAvailability::Available,
+        scope: WatcherScope::PerDirectory,
+        observes_external_writers: Answer::No,
+        can_lose_events: Answer::Yes,
+        signals_overflow: Answer::No,
+        registration_gaps: Answer::Yes,
+        polling_fallback_required: Answer::Yes,
+    };
+    let declared = DomainCapabilities {
+        semantics: FilesystemSemantics::Smb,
+        transport: TransportHint::Network,
+        watcher,
+        ..DomainCapabilities::inline()
+    };
+    let fs = mounted();
+    fs.set_capabilities(MEDIA, declared.clone());
+    fs.report_unknown_domain_identity(MEDIA);
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), crossing(DomainCrossing::Follow)).expect("open");
+    h.run_until_idle();
+
+    let stats = h.stats();
+    let media = stats
+        .domains
+        .iter()
+        .find(|domain| domain.identity == DomainIdentity::Unknown)
+        .unwrap_or_else(|| panic!("the unidentified mount was never entered; the tree holds {:?}", stats.domains));
+    assert_eq!(
+        (media.capabilities.semantics.clone(), media.capabilities.transport),
+        (FilesystemSemantics::Smb, TransportHint::Network),
+        "RFC 10.3: capabilities are declared per storage domain, and an unavailable identity establishes nothing \
+         about them; the domain reports {:?}",
+        media.capabilities
+    );
+    assert_eq!(
+        media.capabilities.watcher, watcher,
+        "RFC 10.4: the watcher capabilities the adapter declared for the mount survive an unknown identity"
+    );
+    assert_eq!(
+        media.watcher.registration_gaps,
+        Answer::Yes,
+        "RFC 10.4: a watcher with known registration gaps is reported as one; the domain reports {:?}",
+        media.watcher
     );
 }
 

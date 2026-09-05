@@ -3,8 +3,8 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use super::types::*;
-use super::{Coordinator, CrossingEvent, Output};
-use crate::domain::{Crossing, DomainCapabilities, DomainCrossing, ProbeResult};
+use super::{Coordinator, CrossingEvent, DomainSite, Output};
+use crate::domain::{Crossing, DomainCapabilities, DomainCrossing, ProbeResult, StorageDomainId};
 use crate::entry::{Entry, EntryKind, LoadState, Metadata, MetadataFields, Shape};
 use crate::error::Error;
 use crate::fs::{DirEntry, DirectoryListing, Enrichment, EntryInfo, Observation};
@@ -30,7 +30,7 @@ pub(super) struct Classification<'a> {
     pub ctx: &'a PolicyContext,
     pub inherit: Reasons,
     pub fields: MetadataFields,
-    pub parent_domain: Option<&'a ProbeResult>,
+    pub parent_domain: Option<(StorageDomainId, &'a ProbeResult)>,
 }
 
 fn crossed(parent: Option<&ProbeResult>, child: &ProbeResult) -> Crossing {
@@ -38,7 +38,7 @@ fn crossed(parent: Option<&ProbeResult>, child: &ProbeResult) -> Crossing {
     child.crossed.stronger(Crossing::between(parent, &child.identity)).stronger(mount_root)
 }
 
-fn requires_crossing_decision(parent: Option<&ProbeResult>, child: &ProbeResult) -> bool {
+pub(super) fn requires_crossing_decision(parent: Option<&ProbeResult>, child: &ProbeResult) -> bool {
     match crossed(parent, child) {
         Crossing::Proven => true,
         Crossing::NotCrossed => false,
@@ -170,7 +170,7 @@ impl Coordinator {
             .collect();
         let previous_domain =
             self.dir_state(dir_id).and_then(|d| d.domain.as_ref()).map(|b| b.probe.capabilities.clone());
-        let binding = self.bind_domain(&listing.domain);
+        let binding = self.bind_domain(DomainSite::Represented(dir_id), &listing.domain);
         let own_id = binding.id;
         effects.domains.push((dir_id, binding));
         let own_domain = listing.domain.as_ref();
@@ -201,7 +201,7 @@ impl Coordinator {
         }
         let inherit = Reasons { initial_scan: job.reasons.initial_scan, ..Default::default() };
         let classification =
-            Classification { ctx: &ctx, inherit, fields: observed_fields, parent_domain: Some(own_domain) };
+            Classification { ctx: &ctx, inherit, fields: observed_fields, parent_domain: Some((own_id, own_domain)) };
         let existing: BTreeMap<PathKey, Arc<Entry>> = builder
             .children(dir_id)
             .into_iter()
@@ -227,7 +227,7 @@ impl Coordinator {
                     old.id,
                     &path,
                     child_domain.as_deref(),
-                    own_domain,
+                    (own_id, own_domain),
                 );
                 let observed = Observed { path: &path, info };
                 self.reconcile_existing(&mut builder, &mut effects, old, observed, &classification);
@@ -449,8 +449,9 @@ impl Coordinator {
         let Candidate { key, path, info, domain } = candidate;
         let Classification { ctx, inherit, fields, parent_domain } = *classification;
         let decision = self.policy.classify(ctx, &path, &info);
+        let parent_probe = parent_domain.map(|(_, probe)| probe);
         let crossing = match (info.kind, domain) {
-            (EntryKind::Directory, Some(probe)) => requires_crossing_decision(parent_domain, probe)
+            (EntryKind::Directory, Some(probe)) => requires_crossing_decision(parent_probe, probe)
                 .then(|| self.policy.crossing(ctx, &path, &probe.capabilities, self.config.domain_crossing)),
             _ => None,
         };
@@ -479,11 +480,15 @@ impl Coordinator {
         }
         if let (EntryKind::Directory, Some(probe)) = (info.kind, domain) {
             effects.removed.extend(builder.set_child_case(id, probe.case()));
-            let binding = self.bind_domain(probe);
+            let site = match parent_domain {
+                Some((domain, probe)) => DomainSite::Child { domain, probe },
+                None => DomainSite::Detached,
+            };
+            let binding = self.bind_domain(site, probe);
             let child = binding.id;
             effects.domains.push((id, binding));
             if let Some(mode) = crossing {
-                let parent = parent_domain.map(|probe| self.bind_domain(probe).id);
+                let parent = parent_domain.map(|(domain, _)| domain);
                 effects.crossings.push((id, Some(CrossingEvent { path: path.clone(), parent, child, mode })));
             }
         }
@@ -963,11 +968,12 @@ impl Coordinator {
         child: EntryId,
         path: &RelativePath,
         domain: Option<&ProbeResult>,
-        parent: &ProbeResult,
+        parent: (StorageDomainId, &ProbeResult),
     ) {
         let Some(probe) = domain else {
             return;
         };
+        let (parent_domain, parent_probe) = parent;
         let unchanged = self
             .dir_state(child)
             .and_then(|d| d.domain.as_ref())
@@ -977,12 +983,11 @@ impl Coordinator {
             return;
         }
         effects.removed.extend(builder.set_child_case(child, probe.case()));
-        let binding = self.bind_domain(probe);
+        let binding = self.bind_domain(DomainSite::Represented(child), probe);
         let id = binding.id;
         effects.domains.push((child, binding));
-        if requires_crossing_decision(Some(parent), probe) {
+        if requires_crossing_decision(Some(parent_probe), probe) {
             let mode = self.crossing_mode(child, path, &probe.capabilities);
-            let parent_domain = self.bind_domain(parent).id;
             effects.crossings.push((
                 child,
                 Some(CrossingEvent { path: path.clone(), parent: Some(parent_domain), child: id, mode }),
@@ -1016,7 +1021,7 @@ impl Coordinator {
         let parent_probe = self.parent_domain_probe(id);
         let parent_domain = self.parent_of(id).and_then(|parent| self.domain_of(parent));
         let proven = requires_crossing_decision(parent_probe.as_ref(), &probe);
-        let binding = self.bind_domain(&probe);
+        let binding = self.bind_domain(DomainSite::Represented(id), &probe);
         let child = binding.id;
         let override_load = self.dir_state(id).and_then(|d| d.override_load);
         let mut builder = self.snapshot.builder();

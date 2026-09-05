@@ -162,6 +162,13 @@ fn watcher_backend(capabilities: WatcherCapabilities) -> WatcherKind {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DomainSite<'a> {
+    Represented(EntryId),
+    Child { domain: StorageDomainId, probe: &'a ProbeResult },
+    Detached,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WatchScope {
     Recursive,
@@ -423,7 +430,6 @@ pub struct Coordinator {
     pending_enrichment: IdMap<EntryId, EnrichmentRequest>,
     pending_domain: IdMap<EntryId, DomainRequest>,
     domain_records: BTreeMap<StorageDomainId, DomainRecord>,
-    unknown_domain: Option<StorageDomainId>,
     crossing_events: VecDeque<CrossingEvent>,
     domain_ops: BTreeMap<StorageDomainId, DomainOps>,
     domain_paths: BTreeMap<StorageDomainId, RelativePath>,
@@ -559,7 +565,6 @@ impl Coordinator {
             pending_enrichment: IdMap::default(),
             pending_domain: IdMap::default(),
             domain_records: BTreeMap::new(),
-            unknown_domain: None,
             crossing_events: VecDeque::new(),
             domain_ops: BTreeMap::new(),
             domain_paths: BTreeMap::new(),
@@ -824,7 +829,11 @@ impl Coordinator {
                 self.blocking_slots.remove(&SlotOwner::Job(*job));
                 let now = self.now;
                 if let Some(probe) = reported_domain(result) {
-                    let binding = self.bind_domain(&probe);
+                    let site = match self.jobs.get(job).and_then(|job| job.entry()) {
+                        Some(entry) => DomainSite::Represented(entry),
+                        None => DomainSite::Detached,
+                    };
+                    let binding = self.bind_domain(site, &probe);
                     self.governor.attribute(self.job_grant(*job), binding.id, now);
                 }
                 if let JobResult::Listing(step) = result
@@ -1074,21 +1083,13 @@ impl Coordinator {
             .collect()
     }
 
-    pub(super) fn bind_domain(&mut self, probe: &ProbeResult) -> DomainBinding {
-        let (id, identity, capabilities) = match probe.identity.key() {
-            Some(key) => (StorageDomainId::of(key), probe.identity.clone(), probe.capabilities.clone()),
-            None => {
-                let id = match self.unknown_domain {
-                    Some(id) => id,
-                    None => {
-                        let id = StorageDomainId::fresh();
-                        self.unknown_domain = Some(id);
-                        id
-                    }
-                };
-                (id, DomainIdentity::Unknown, DomainCapabilities::default())
-            }
+    pub(super) fn bind_domain(&mut self, site: DomainSite<'_>, probe: &ProbeResult) -> DomainBinding {
+        let id = match probe.identity.key() {
+            Some(key) => StorageDomainId::of(key),
+            None => self.unresolved_domain(site, probe),
         };
+        let identity = probe.identity.clone();
+        let capabilities = probe.capabilities.clone();
         let watcher = resolve_watcher(capabilities.watcher, self.caps.watcher);
         let now = self.now;
         let known = self.domain_records.get(&id).is_some_and(|held| {
@@ -1099,6 +1100,34 @@ impl Coordinator {
             self.domain_records.insert(id, DomainRecord { identity, capabilities, watcher });
         }
         DomainBinding { id, probe: probe.clone() }
+    }
+
+    fn unresolved_domain(&self, site: DomainSite<'_>, probe: &ProbeResult) -> StorageDomainId {
+        let held = match site {
+            DomainSite::Represented(entry) => self.dir_state(entry).and_then(|dir| dir.domain.as_ref()),
+            DomainSite::Child { .. } | DomainSite::Detached => None,
+        };
+        if let Some(binding) = held
+            && !binding.probe.identity.is_known()
+            && binding.probe.capabilities == probe.capabilities
+        {
+            return binding.id;
+        }
+        let parent = match site {
+            DomainSite::Represented(entry) => self
+                .parent_of(entry)
+                .and_then(|parent| self.dir_state(parent))
+                .and_then(|dir| dir.domain.as_ref())
+                .map(|binding| (binding.id, &binding.probe)),
+            DomainSite::Child { domain, probe } => Some((domain, probe)),
+            DomainSite::Detached => None,
+        };
+        if let Some((domain, parent)) = parent
+            && !apply::requires_crossing_decision(Some(parent), probe)
+        {
+            return domain;
+        }
+        StorageDomainId::fresh()
     }
 
     pub(super) fn domain_of(&self, entry: EntryId) -> Option<StorageDomainId> {
