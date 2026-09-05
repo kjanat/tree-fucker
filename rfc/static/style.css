@@ -19,7 +19,9 @@
 	--narrow-width: 54rem;
 	--layout-gap-min: 2.5rem;
 	--layout-gap-max: 6rem;
-	--page-width: calc(var(--rail-width) + var(--layout-gap-max) + var(--document-width));
+	--page-width: calc(
+		var(--rail-width) + var(--layout-gap-max) + var(--document-width)
+	);
 	--page-margin: 2rem;
 	--gutter: max(var(--page-margin), (100vw - var(--page-width)) / 2);
 	--edge-inset: 3.5rem;
