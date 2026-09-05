@@ -590,11 +590,11 @@ fn two_mounts_without_identity_are_two_storage_domains() {
     );
     let near = unknown
         .iter()
-        .find(|domain| domain.path == Some(path("near")))
+        .find(|domain| domain.entry_path == Some(path("near")))
         .unwrap_or_else(|| panic!("the near mount was never entered; the tree holds {unknown:?}"));
     let far = unknown
         .iter()
-        .find(|domain| domain.path == Some(path("far")))
+        .find(|domain| domain.entry_path == Some(path("far")))
         .unwrap_or_else(|| panic!("the far mount was never entered; the tree holds {unknown:?}"));
     assert_ne!(near.id, far.id, "two mounts without identity must not collapse onto one domain id");
 
@@ -651,11 +651,11 @@ fn each_unidentified_mount_gets_its_own_crossing_decision() {
     );
     let followed = unknown
         .iter()
-        .find(|domain| domain.path == Some(path("near")))
+        .find(|domain| domain.entry_path == Some(path("near")))
         .unwrap_or_else(|| panic!("the followed mount was never entered; the tree holds {unknown:?}"));
     let held = unknown
         .iter()
-        .find(|domain| domain.path == Some(path("far")))
+        .find(|domain| domain.entry_path == Some(path("far")))
         .unwrap_or_else(|| panic!("the unloaded mount was never entered; the tree holds {unknown:?}"));
     assert_ne!(
         followed.id, held.id,

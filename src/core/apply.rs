@@ -862,7 +862,7 @@ impl Coordinator {
             self.entries.set_directory(id, true);
             let domain = binding.id;
             if let Some(path) = self.snapshot.get_by_id(id).map(|e| e.path.clone()) {
-                self.domain_paths.entry(domain).or_insert(path);
+                self.domain_entry_paths.entry(domain).or_insert(path);
             }
             if let Some(dir) = self.dir_state_mut(id) {
                 dir.domain = Some(binding);

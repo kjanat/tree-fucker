@@ -57,8 +57,7 @@ impl Coordinator {
                 SessionState::Suspended => self.suspend_job(id),
                 SessionState::Finished(SessionOutcome::Complete(listing)) => {
                     self.listings += 1;
-                    self.last_listing_children = Some(listing.entries.len());
-                    self.record_directory_size(&job.path, listing.entries.len());
+                    self.record_complete_listing(&job.path, listing.entries.len());
                     match self.commit_listing(&job, listing) {
                         Ok(()) => self.finish_job(id, JobOutcome::Accepted),
                         Err(rejection) => {
@@ -74,7 +73,7 @@ impl Coordinator {
                 SessionState::Finished(SessionOutcome::ResourceLimited(reported)) => {
                     self.listing_failures += 1;
                     let limited = ResourceLimited { domain: self.domain_of(entry), ..reported };
-                    self.record_directory_size(&job.path, usize::try_from(limited.observed).unwrap_or(usize::MAX));
+                    self.record_limited_listing(&job.path, limited);
                     self.record_resource_limit(ResourceLimitEvent { path: job.path.clone(), limited });
                     self.finish_job(id, JobOutcome::Rejected(ListingRejection::ResourceLimited(limited)));
                 }

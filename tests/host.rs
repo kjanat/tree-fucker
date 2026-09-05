@@ -331,6 +331,52 @@ fn a_listing_over_the_in_flight_byte_ceiling_ends_the_session_resource_limited()
 }
 
 #[test]
+fn a_listing_cut_off_by_the_byte_ceiling_never_becomes_the_last_listing_size() {
+    let fs = wide(20);
+    let child = entry_bytes(std::ffi::OsStr::new("f0"));
+    let ceiling = child * 4;
+    let host = HostConfig { in_flight_listing_bytes: ceiling, ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, Config::default());
+    let before = h.stats().last_listing_children;
+    assert_eq!(before, Some(1), "the narrow directory was never listed completely, so nothing is being preserved");
+
+    h.command(Command::Refresh(vec![path("aaa")]));
+    for _ in 0..64 {
+        let Some(job) = h.pending_job_for("aaa") else {
+            break;
+        };
+        assert!(h.complete_job(job.id), "the wide listing never completed");
+    }
+
+    let stats = h.stats();
+    let limited = stats.last_limited_listing.expect("the wide listing never hit the byte ceiling");
+    assert_eq!(
+        (limited.limit, limited.configured),
+        (ResourceLimit::ListingBytes, ceiling),
+        "RFC 16: the rejection reports which configured limit stopped it; it reports {limited:?}"
+    );
+    assert!(limited.observed > ceiling, "the reported observation is the byte count that crossed the ceiling");
+    assert_eq!(
+        stats.last_listing_children, before,
+        "RFC 10.2 and 16: only a Complete session carries children, so a listing cut off by the byte ceiling \
+         leaves the last listing size where it was; it went from {before:?} to {:?}",
+        stats.last_listing_children
+    );
+    assert!(
+        !stats.largest_directories.iter().any(|entry| entry.path == path("aaa")),
+        "RFC 16: the largest directories are counted in children, and a byte ceiling observes bytes; the tree \
+         reports {:?}",
+        stats.largest_directories
+    );
+    let domain = stats.domains.into_iter().next().expect("the root domain was never entered");
+    assert_eq!(
+        (domain.last_listing_children, domain.last_limited_listing),
+        (before, Some(limited)),
+        "RFC 16: the same two figures are reported per storage domain; the domain reports {domain:?}"
+    );
+}
+
+#[test]
 fn every_unwatch_correlates_with_a_governor_grant() {
     let fs = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
     for dir in ["a", "b"] {
@@ -833,7 +879,7 @@ fn two_trees_reaching_one_domain_debit_one_domain_account() {
 }
 
 #[test]
-fn each_tree_under_one_host_governor_reports_its_own_charged_worker_time() {
+fn each_tree_under_one_host_governor_reports_its_own_charged_worker_time_after_open() {
     let shared = HostGovernor::independent(&HostConfig::default());
     let mut one = Harness::open_under(costed(&["a", "b", "c"]), Arc::new(LoadAll), Config::default(), shared.clone())
         .expect("open");
@@ -845,11 +891,12 @@ fn each_tree_under_one_host_governor_reports_its_own_charged_worker_time() {
         one.run_jobs_until(target);
         two.run_jobs_until(target);
     }
-    let first = one.stats().charged_worker_time;
-    let second = two.stats().charged_worker_time;
+    let first = one.stats().charged_worker_time_after_open;
+    let second = two.stats().charged_worker_time_after_open;
     assert!(
         first > Duration::ZERO && second > Duration::ZERO,
-        "line 1004: each tree reports the worker time charged for its own work; {first:?} and {second:?}"
+        "line 1004: each tree reports the worker time its own work was charged after open; {first:?} and \
+         {second:?}"
     );
     let total = shared.view(target).charged;
     assert!(

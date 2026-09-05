@@ -3010,10 +3010,10 @@ fn production_observability_locates_a_stuck_smb_domain_from_the_public_api() {
 
     let media = domain_stat(&h, MEDIA);
     assert_eq!(
-        media.path,
+        media.entry_path,
         Some(path("media")),
         "RFC 16 and line 1027: a domain is observable at the path it was entered; the stat reports {:?}",
-        media.path
+        media.entry_path
     );
     assert_eq!(media.capabilities.semantics, FilesystemSemantics::Smb, "line 1027: the domain names itself SMB");
     assert!(

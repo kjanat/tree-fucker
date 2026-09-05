@@ -106,8 +106,9 @@ pub struct DomainStat {
     pub identity_reads: u64,
     pub entries_per_second: f64,
     pub per_child_lookups_per_second: f64,
-    pub path: Option<RelativePath>,
+    pub entry_path: Option<RelativePath>,
     pub last_listing_children: Option<usize>,
+    pub last_limited_listing: Option<ResourceLimited>,
     pub suspended_sessions: usize,
 }
 
@@ -120,6 +121,7 @@ pub struct DomainOps {
     pub kind_resolutions: u64,
     pub identity_reads: u64,
     pub last_listing_children: Option<usize>,
+    pub last_limited_listing: Option<ResourceLimited>,
 }
 
 fn to_f64(count: u64) -> f64 {
@@ -340,7 +342,7 @@ pub struct BatchView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stats {
     pub observed_at: MonotonicTime,
-    pub charged_worker_time: Duration,
+    pub charged_worker_time_after_open: Duration,
     pub version: SnapshotVersion,
     pub initial_scan: InitialScanState,
     pub reconciliation_generation: ReconciliationGeneration,
@@ -376,6 +378,7 @@ pub struct Stats {
     pub lost_workers: u64,
     pub last_listing_duration: Option<Duration>,
     pub last_listing_children: Option<usize>,
+    pub last_limited_listing: Option<ResourceLimited>,
     pub largest_directories: Vec<DirectorySize>,
     pub degraded_paths: BTreeSet<RelativePath>,
     pub degraded_path_causes: BTreeMap<RelativePath, DegradedCause>,
@@ -432,7 +435,7 @@ pub struct Coordinator {
     domain_records: BTreeMap<StorageDomainId, DomainRecord>,
     crossing_events: VecDeque<CrossingEvent>,
     domain_ops: BTreeMap<StorageDomainId, DomainOps>,
-    domain_paths: BTreeMap<StorageDomainId, RelativePath>,
+    domain_entry_paths: BTreeMap<StorageDomainId, RelativePath>,
     domain_resolutions: u64,
     root_probe: Option<RootProbe>,
     probe_attempts: u32,
@@ -492,6 +495,7 @@ pub struct Coordinator {
     enrichment_failures: u64,
     last_listing_duration: Option<Duration>,
     last_listing_children: Option<usize>,
+    last_limited_listing: Option<ResourceLimited>,
     largest_directories: Vec<DirectorySize>,
 }
 
@@ -567,7 +571,7 @@ impl Coordinator {
             domain_records: BTreeMap::new(),
             crossing_events: VecDeque::new(),
             domain_ops: BTreeMap::new(),
-            domain_paths: BTreeMap::new(),
+            domain_entry_paths: BTreeMap::new(),
             domain_resolutions: 0,
             root_probe: None,
             probe_attempts: 0,
@@ -631,6 +635,7 @@ impl Coordinator {
             enrichment_failures: 0,
             last_listing_duration: None,
             last_listing_children: None,
+            last_limited_listing: None,
             largest_directories: Vec::new(),
         };
         coordinator.install_root(root_info);
@@ -766,10 +771,29 @@ impl Coordinator {
         self.governor.new_grants_into(into, seen)
     }
 
-    pub(super) fn record_directory_size(&mut self, path: &RelativePath, children: usize) {
-        if let Some(domain) = self.snapshot.get(path).map(|e| e.id).and_then(|id| self.domain_of(id)) {
+    pub(super) fn record_complete_listing(&mut self, path: &RelativePath, children: usize) {
+        self.last_listing_children = Some(children);
+        if let Some(domain) = self.listed_domain(path) {
             self.domain_ops.entry(domain).or_default().last_listing_children = Some(children);
         }
+        self.record_directory_size(path, children);
+    }
+
+    pub(super) fn record_limited_listing(&mut self, path: &RelativePath, limited: ResourceLimited) {
+        self.last_limited_listing = Some(limited);
+        if let Some(domain) = self.listed_domain(path) {
+            self.domain_ops.entry(domain).or_default().last_limited_listing = Some(limited);
+        }
+        if limited.limit == ResourceLimit::EntriesPerDirectory {
+            self.record_directory_size(path, usize::try_from(limited.observed).unwrap_or(usize::MAX));
+        }
+    }
+
+    fn listed_domain(&self, path: &RelativePath) -> Option<StorageDomainId> {
+        self.snapshot.get(path).map(|e| e.id).and_then(|id| self.domain_of(id))
+    }
+
+    fn record_directory_size(&mut self, path: &RelativePath, children: usize) {
         match self.largest_directories.iter().position(|entry| entry.path == *path) {
             Some(at) if self.largest_directories[at].children == children => return,
             Some(at) => self.largest_directories[at].children = children,
@@ -933,7 +957,7 @@ impl Coordinator {
         let domains = self.domain_stats(&view.domains, &resource);
         Stats {
             observed_at: self.now,
-            charged_worker_time: self.governor.charged_by_tree(self.tree),
+            charged_worker_time_after_open: self.governor.charged_by_tree(self.tree),
             version: self.snapshot.version(),
             initial_scan: self.initial_scan_state(),
             reconciliation_generation: self.round.as_ref().map(|r| r.generation).unwrap_or(self.recon_seq),
@@ -993,6 +1017,7 @@ impl Coordinator {
             lost_workers: self.lost_workers,
             last_listing_duration: self.last_listing_duration,
             last_listing_children: self.last_listing_children,
+            last_limited_listing: self.last_limited_listing,
             largest_directories: self.largest_directories.clone(),
             degraded_paths: self.degraded_paths(),
             degraded_path_causes: self.degraded_path_causes(),
@@ -1075,8 +1100,9 @@ impl Coordinator {
                     identity_reads: ops.identity_reads,
                     entries_per_second: rate(ops.entries_enumerated, elapsed),
                     per_child_lookups_per_second: rate(ops.per_child_lookups, elapsed),
-                    path: self.domain_paths.get(id).cloned(),
+                    entry_path: self.domain_entry_paths.get(id).cloned(),
                     last_listing_children: ops.last_listing_children,
+                    last_limited_listing: ops.last_limited_listing,
                     suspended_sessions: suspended.get(id).copied().unwrap_or(0),
                 }
             })
