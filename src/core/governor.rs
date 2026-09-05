@@ -970,6 +970,16 @@ impl Governor {
         duration(self.charged_by_tree.get(&tree).copied().unwrap_or(0))
     }
 
+    pub fn try_start(&mut self, id: GrantId, at: MonotonicTime) -> Result<(), ThrottleCause> {
+        let Some(grant) = self.grants.get(&id) else {
+            return Ok(());
+        };
+        let domain = grant.domain;
+        self.may_start(domain)?;
+        self.start(id, at);
+        Ok(())
+    }
+
     pub fn start(&mut self, id: GrantId, at: MonotonicTime) {
         let Some(grant) = self.grants.get_mut(&id) else {
             return;
@@ -1443,6 +1453,10 @@ impl HostGovernor {
 
     pub fn charged_by_tree(&self, tree: TreeNumber) -> Duration {
         guard(&self.inner).charged_by_tree(tree)
+    }
+
+    pub fn try_start(&self, id: GrantId, at: MonotonicTime) -> Result<(), ThrottleCause> {
+        guard(&self.inner).try_start(id, at)
     }
 
     pub fn start(&self, id: GrantId, at: MonotonicTime) {

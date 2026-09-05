@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
@@ -587,16 +587,25 @@ async fn bootstrap<T: Send + 'static>(
         if governor.try_admit(reservation, now).is_ok() {
             break;
         }
-        let delay = match governor.resume_at(now) {
-            Some(at) => at.0.saturating_sub(now.0).max(config.minimum_period),
-            None => config.minimum_period,
-        };
-        runtime.sleep(delay).await;
+        runtime.sleep(bootstrap_delay(governor, config, now)).await;
     }
-    governor.start(id, MonotonicTime(runtime.now().saturating_duration_since(base)));
+    loop {
+        let now = MonotonicTime(runtime.now().saturating_duration_since(base));
+        if governor.try_start(id, now).is_ok() {
+            break;
+        }
+        runtime.sleep(bootstrap_delay(governor, config, now)).await;
+    }
     let outcome = blocking(runtime, work).await;
     governor.release(id, MonotonicTime(runtime.now().saturating_duration_since(base)));
     outcome
+}
+
+fn bootstrap_delay(governor: &HostGovernor, config: &Config, now: MonotonicTime) -> Duration {
+    match governor.resume_at(now) {
+        Some(at) => at.0.saturating_sub(now.0).max(config.minimum_period),
+        None => config.minimum_period,
+    }
 }
 
 async fn blocking<T: Send + 'static>(

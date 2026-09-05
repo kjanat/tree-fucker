@@ -692,6 +692,69 @@ fn the_host_governor_counts_in_flight_workers_across_trees_against_one_ceiling()
 }
 
 #[test]
+fn concurrent_opens_never_exceed_the_host_in_flight_ceiling_while_bootstrapping() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let inner = Arc::new(tree_fucker::testing::DeterministicRuntime::new());
+    let runtime = Arc::new(tree_fucker::testing::HoldingRuntime::new(inner.clone()));
+    runtime.hold();
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let host = HostConfig { maximum_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
+    let governor = HostGovernor::independent(&host);
+    let opened = Arc::new(AtomicUsize::new(0));
+    for _ in 0..20 {
+        let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+        let root = fs.root().to_path_buf();
+        let count = opened.clone();
+        let spawn_rt = rt.clone();
+        let own = governor.clone();
+        tree_fucker::runtime::Runtime::spawn(
+            runtime.as_ref(),
+            Box::pin(async move {
+                let tree =
+                    Tree::open_outside_host_governor(fs, root, Arc::new(LoadAll), Config::default(), spawn_rt, own)
+                        .await;
+                assert!(tree.is_ok(), "every open completes once the blocked calls return");
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+    }
+    inner.run_until_stalled();
+
+    let mut peak = 0;
+    for _ in 0..500 {
+        let held = runtime.held();
+        peak = peak.max(held);
+        assert!(
+            held <= 2,
+            "RFC 15.1 item 1 and 15.3: root canonicalization and validation share the process-wide in-flight \
+             ceiling; {held} bootstrap workers were dispatched at once"
+        );
+        assert!(
+            governor.view(MonotonicTime::ZERO).in_flight <= 2,
+            "RFC 15.9: one set of physical ceilings covers every tree in the process; the governor holds {} started \
+             workers",
+            governor.view(MonotonicTime::ZERO).in_flight
+        );
+        if opened.load(Ordering::SeqCst) == 20 {
+            break;
+        }
+        runtime.release();
+        inner.run_until_stalled();
+        if runtime.held() == 0 {
+            inner.advance(Duration::from_secs(1));
+        }
+    }
+    assert_eq!(
+        opened.load(Ordering::SeqCst),
+        20,
+        "RFC 5.2: every open completes once the blocked root reads return; {} of twenty finished",
+        opened.load(Ordering::SeqCst)
+    );
+    assert_eq!(peak, 2, "the ceiling was never contended, so nothing was fenced; the peak was {peak}");
+}
+
+#[test]
 fn a_stuck_domain_resolution_in_one_tree_never_freezes_the_shared_bootstrap_scope() {
     let shared = HostGovernor::independent(&HostConfig::default());
     let stuck = tree(&["local", "mnt"]);
