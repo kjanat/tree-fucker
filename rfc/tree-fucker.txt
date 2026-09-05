@@ -1101,9 +1101,15 @@ Abstract
    entries and per-child operations. The entry bound is the configured
    entries per lease. The per-child operations the lease permits are
    derived by the governor under Section 15.3 from the budget that is
-   affordable at admission, at least one and at most the configured
-   maximum per lease, and the reservation covers every operation the
-   lease permits. Before each chunk, and before each batch of
+   affordable at admission, at most the configured maximum per lease,
+   and the reservation covers every operation the lease permits. A
+   session on a domain that declares under Section 10.1 that observing
+   a child costs an operation asks for the maximum and is permitted at
+   least one. A session on a domain that declares kind and identity
+   inline asks for none. A session that yields without enumerating an
+   entry asks for the maximum on its next lease, so a declaration the
+   adapter fails to honour delays the listing by one lease and never
+   stalls it. Before each chunk, and before each batch of
    kind-resolution or enrichment reads, the session MUST hold remaining
    lease; when it does not, it MUST yield and continue only after the
    governor grants a further lease. A lease that is not granted leaves
@@ -2276,6 +2282,9 @@ Abstract
    interrupted. The reservation of the smallest admissible grant is
    capped at the smaller applicable bucket capacity, so a full bucket
    always affords one grant and a slow domain keeps making progress.
+   Work not yet attributed to a storage domain is bounded by the
+   configured per-domain capacity rather than the global one, so the
+   first listing of a tree cannot reserve the whole global burst.
 
    Completion, and every accounting point before it, reconciles actual
    occupancy against both the domain bucket and the global bucket in
