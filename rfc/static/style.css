@@ -27,8 +27,8 @@
 	--edge-inset: 3.5rem;
 	--edge-clearance: 1.25rem;
 	--edge: min(var(--edge-inset), var(--gutter) - var(--edge-clearance));
-	--sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
-	--mono: "IBM Plex Mono", ui-monospace, monospace;
+	--text: "Newsreader", "Iowan Old Style", Georgia, serif;
+	--mono: "Recursive", ui-monospace, "Cascadia Mono", monospace;
 	--ease: 140ms ease;
 	--underline-offset: 0.18em;
 	color-scheme: light;
@@ -70,9 +70,9 @@ body {
 		),
 		var(--ground);
 	color: var(--ink);
-	font-family: var(--sans);
-	font-size: 16px;
-	line-height: 1.65;
+	font-family: var(--text);
+	font-size: 17px;
+	line-height: 1.6;
 }
 
 a {
@@ -224,7 +224,7 @@ h1 {
 	font-family: var(--mono);
 	font-size: clamp(2.35rem, 7vw, 5.25rem);
 	font-weight: 500;
-	letter-spacing: -0.075em;
+	letter-spacing: -0.06em;
 	line-height: 0.93;
 	overflow-wrap: anywhere;
 }
@@ -498,14 +498,32 @@ dd {
 	.mobile-toc ol {
 		columns: 2 12rem;
 		margin: 0;
-		padding: 0 1rem 1rem 2.5rem;
+		padding: 0 1rem 1rem;
+		list-style: none;
 	}
 	.mobile-toc li {
 		break-inside: avoid;
-		margin: 0.25rem 0;
+		margin: 0;
 	}
 	.mobile-toc a {
+		display: grid;
+		grid-template-columns: 2rem minmax(0, 1fr);
+		gap: 0.35rem;
+		padding: 0.3rem 0;
+		color: var(--ink);
 		font-size: 0.82rem;
+		line-height: 1.3;
+		text-decoration: none;
+	}
+	.mobile-toc a span {
+		color: var(--oxide);
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		font-weight: 600;
+		line-height: inherit;
+	}
+	.mobile-toc a[aria-current="true"] {
+		color: var(--moss);
 	}
 	article {
 		padding-inline: 0;
