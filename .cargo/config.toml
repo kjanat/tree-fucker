@@ -28,7 +28,7 @@ max-git-co-age = "1 month"
 max-git-db-age = "3 months"
 
 [profile.release]
-trim-paths = true
+trim-paths = "all"
 
 [registry]
 global-min-publish-age = "7 days"
