@@ -106,6 +106,7 @@ fn declare(mut result: ProbeResult) -> ProbeResult {
     result
 }
 
+#[cfg(unix)]
 fn anchored_parent<'a>(beneath: Option<&'a Anchor>, full: &Path) -> Option<&'a DirectoryAnchor> {
     let parent = beneath?.get::<DirectoryAnchor>()?;
     (full.parent().map(Path::as_os_str) == Some(parent.path().as_os_str())).then_some(parent)
