@@ -18,6 +18,7 @@ pub mod ids;
 pub mod path;
 pub mod policy;
 pub mod runtime;
+pub mod scan;
 pub mod snapshot;
 pub mod std_fs;
 pub mod testing;
@@ -37,9 +38,10 @@ pub use domain::{
 pub use entry::{Entry, EntryKind, FileIdentity, LoadState, Metadata, MetadataFields, Shape};
 pub use error::{Error, Result};
 pub use fs::{
-    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EnrichmentBatch, EntryInfo,
-    FileSystem, FsCapabilities, FsError, HintKind, Lease, ListingSession, Observation, ObservedKind, SessionCost,
-    SessionOutcome, SessionState, SessionStep, WatcherEvent, WatcherKind, WatcherSink, entry_bytes, list_directory,
+    Anchor, CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EnrichmentBatch,
+    EntryInfo, FileSystem, FsCapabilities, FsError, HintKind, Lease, ListingAt, ListingSession, Observation,
+    ObservedKind, SessionCost, SessionOutcome, SessionState, SessionStep, WatcherEvent, WatcherKind, WatcherSink,
+    entry_bytes, list_directory,
 };
 pub use ids::{
     CommandId, EntryId, JobId, PolicyRevision, ReconciliationGeneration, RootIncarnation, Sequence, SnapshotVersion,
@@ -48,6 +50,9 @@ pub use ids::{
 pub use path::{CaseSensitivity, PathError, PathKey, RelativePath};
 pub use policy::{LoadAll, LoadDepth, PathPredicate, PolicyContext, ScanDecision, ScanPolicy};
 pub use runtime::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle};
+pub use scan::{
+    Clock, Descent, Scan, ScanEntry, ScanEvent, ScanFailure, ScanOptions, ScanPath, ScanStats, SystemClock,
+};
 pub use snapshot::Snapshot;
 pub use tree::{Tree, TreeHandle, UpdateStream};
 pub use update::{

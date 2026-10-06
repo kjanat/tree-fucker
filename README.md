@@ -72,6 +72,31 @@ async fn main() -> tree_fucker::Result<()> {
 
 `TreeHandle` also exposes explicit `refresh`, `load`, `unload`, `invalidate_policy`, `set_priority`, and `shutdown` operations.
 
+### One-shot scans
+
+A consumer that walks a tree once, such as a query tool, opens a `Scan` instead of a `Tree`. It is a synchronous iterator with no runtime, snapshot, watcher, or reconciliation. Every operation still goes through the process-wide governor and draws on the foreground allowance.
+
+```rust
+use std::{path::PathBuf, sync::Arc};
+
+use tree_fucker::{DomainCrossing, LoadAll, Scan, ScanEvent, ScanOptions, std_fs::StdFileSystem};
+
+fn main() -> tree_fucker::Result<()> {
+    let options = ScanOptions { crossing: DomainCrossing::Exclude, ..ScanOptions::default() };
+    let scan = Scan::open(Arc::new(StdFileSystem::new()), PathBuf::from("."), Arc::new(LoadAll), options)?;
+    for event in scan {
+        match event? {
+            ScanEvent::Entry(entry) => println!("{}", entry.path),
+            ScanEvent::Boundary { path, mode, .. } => println!("{path}: mount not followed ({mode})"),
+            ScanEvent::Unlisted { path, failure } => eprintln!("{path}: {failure}"),
+        }
+    }
+    Ok(())
+}
+```
+
+A scan yields each listing's children as soon as that listing completes, and it keeps only the listings on the current path. Use `LoadDepth` to limit depth. With `ScanOptions::anchors` set, `StdFileSystem` attaches an anchor to each entry, holding the descriptor of the directory it was listed from, so follow-up reads can use `*at` calls. The scan also opens and probes each child directory through its parent's anchor instead of resolving the path again. The number of live anchors is capped.
+
 The bundled `StdFileSystem` performs real platform-specific storage-domain probing on Linux, macOS, Windows, FreeBSD, illumos, and Solaris. Its current watcher capability is `None`, so it converges through direct reconciliation; custom `FileSystem` adapters can provide watcher events as low-latency hints.
 
 ## Storage domains

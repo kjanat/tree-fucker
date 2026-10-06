@@ -38,7 +38,7 @@ fn crossed(parent: Option<&ProbeResult>, child: &ProbeResult) -> Crossing {
     child.crossed.stronger(Crossing::between(parent, &child.identity)).stronger(mount_root)
 }
 
-pub(super) fn requires_crossing_decision(parent: Option<&ProbeResult>, child: &ProbeResult) -> bool {
+pub(crate) fn requires_crossing_decision(parent: Option<&ProbeResult>, child: &ProbeResult) -> bool {
     match crossed(parent, child) {
         Crossing::Proven => true,
         Crossing::NotCrossed => false,
@@ -656,6 +656,7 @@ impl Coordinator {
             entries,
             supplied_fields,
             domain: Box::new(domain),
+            anchor: None,
         }
     }
 

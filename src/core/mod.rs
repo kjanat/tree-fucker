@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) use apply::requires_crossing_decision;
 pub use governor::{
     AdmissionDecision, Admitted, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor,
     HostGovernorError, LatencySummary, Reported, Reservation, TreeNumber, host_governor,

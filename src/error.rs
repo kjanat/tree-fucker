@@ -26,6 +26,7 @@ pub enum Error {
     UnresolvedKind,
     AncestorNotDirectory,
     InitialScanDegraded(BTreeSet<RelativePath>),
+    Cancelled,
     Io(FsError),
 }
 
@@ -53,6 +54,7 @@ impl fmt::Display for Error {
             Error::InitialScanDegraded(paths) => {
                 write!(f, "initial scan degraded for {} paths", paths.len())
             }
+            Error::Cancelled => f.write_str("cancelled"),
             Error::Io(e) => write!(f, "filesystem error: {e}"),
         }
     }

@@ -83,9 +83,13 @@ impl RelativePath {
 
     pub fn join(&self, name: &OsStr) -> Result<RelativePath, PathError> {
         validate_name(name)?;
+        Ok(self.joined(name))
+    }
+
+    pub(crate) fn joined(&self, name: &OsStr) -> RelativePath {
         let mut components = self.components.to_vec();
         components.push(name.to_os_string());
-        Ok(RelativePath { components: Arc::from(components) })
+        RelativePath { components: Arc::from(components) }
     }
 
     pub fn starts_with(&self, prefix: &RelativePath) -> bool {

@@ -1254,6 +1254,7 @@ impl FakeSession {
             entries: std::mem::take(&mut self.entries),
             supplied_fields: opened.supplied_fields,
             domain: Box::new(opened.domain.clone()),
+            anchor: None,
         })
     }
 }
