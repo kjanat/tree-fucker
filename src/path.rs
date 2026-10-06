@@ -173,10 +173,10 @@ impl fmt::Debug for RelativePath {
     }
 }
 
-impl TryFrom<&str> for RelativePath {
-    type Error = PathError;
+impl std::str::FromStr for RelativePath {
+    type Err = PathError;
 
-    fn try_from(value: &str) -> Result<Self, PathError> {
+    fn from_str(value: &str) -> Result<Self, PathError> {
         RelativePath::parse(value)
     }
 }
