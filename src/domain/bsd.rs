@@ -1,9 +1,11 @@
+use std::ffi::OsStr;
+use std::fs::File;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::unix::{at_mount_point, c_string, fsid_pair, open_directory};
+use super::unix::{at_mount_point, c_string, duplicate, fsid_pair, open_beneath, open_directory};
 use super::{
     AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
     DomainIdentity, DomainKey, DomainProbe, FilesystemInstance, FilesystemInstanceKey, FilesystemSemantics,
@@ -23,31 +25,53 @@ impl FreeBsdProbe {
 
 impl DomainProbe for FreeBsdProbe {
     fn probe(&self, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError> {
-        let file = open_directory(directory)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir() {
-            return Err(ProbeError::NotDirectory);
-        }
-
-        let mut buffer = MaybeUninit::<libc::statfs>::uninit();
-        let status = unsafe { libc::fstatfs(file.as_raw_fd(), buffer.as_mut_ptr()) };
-        if status != 0 {
-            return Err(ProbeError::from(std::io::Error::last_os_error()));
-        }
-        let stat = unsafe { buffer.assume_init() };
-        let (first, second) = fsid_pair(stat.f_fsid);
-
-        let identity = DomainIdentity::Known(DomainKey::fsid(first, second));
-        let device = metadata.dev();
-        let space = IdentitySpaceKey::unix_device(freebsd_major(device), freebsd_minor(device));
-        let mount_point = c_string(&stat.f_mntonname);
-        let local = stat.f_flags & libc::MNT_LOCAL != 0;
-        let capabilities = capabilities_of(&c_string(&stat.f_fstypename), local, first, second, space);
-        let crossed = crossing(parent, &identity, &capabilities.identity_space);
-        let is_domain_root = at_mount_point(directory, &mount_point);
-
-        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case: None })
+        probe_file(&open_directory(directory)?, directory, parent)
     }
+
+    fn probe_opened(
+        &self,
+        opened: BorrowedFd<'_>,
+        directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        probe_file(&duplicate(opened)?, directory, parent)
+    }
+
+    fn probe_beneath(
+        &self,
+        beneath: BorrowedFd<'_>,
+        name: &OsStr,
+        directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        probe_file(&open_beneath(beneath, name)?, directory, parent)
+    }
+}
+
+fn probe_file(file: &File, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(ProbeError::NotDirectory);
+    }
+
+    let mut buffer = MaybeUninit::<libc::statfs>::uninit();
+    let status = unsafe { libc::fstatfs(file.as_raw_fd(), buffer.as_mut_ptr()) };
+    if status != 0 {
+        return Err(ProbeError::from(std::io::Error::last_os_error()));
+    }
+    let stat = unsafe { buffer.assume_init() };
+    let (first, second) = fsid_pair(stat.f_fsid);
+
+    let identity = DomainIdentity::Known(DomainKey::fsid(first, second));
+    let device = metadata.dev();
+    let space = IdentitySpaceKey::unix_device(freebsd_major(device), freebsd_minor(device));
+    let mount_point = c_string(&stat.f_mntonname);
+    let local = stat.f_flags & libc::MNT_LOCAL != 0;
+    let capabilities = capabilities_of(&c_string(&stat.f_fstypename), local, first, second, space);
+    let crossed = crossing(parent, &identity, &capabilities.identity_space);
+    let is_domain_root = at_mount_point(directory, &mount_point);
+
+    Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case: None })
 }
 
 fn freebsd_major(device: u64) -> u64 {

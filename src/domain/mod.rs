@@ -693,4 +693,25 @@ impl From<std::io::Error> for ProbeError {
 
 pub trait DomainProbe: Send + Sync {
     fn probe(&self, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError>;
+
+    #[cfg(unix)]
+    fn probe_opened(
+        &self,
+        _opened: std::os::fd::BorrowedFd<'_>,
+        directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        self.probe(directory, parent)
+    }
+
+    #[cfg(unix)]
+    fn probe_beneath(
+        &self,
+        _beneath: std::os::fd::BorrowedFd<'_>,
+        _name: &std::ffi::OsStr,
+        directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        self.probe(directory, parent)
+    }
 }

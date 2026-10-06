@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -82,13 +84,48 @@ impl LinuxProbe {
 impl DomainProbe for LinuxProbe {
     fn probe(&self, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError> {
         let stat = statx(CWD, directory, PROBE_FLAGS, PROBE_MASK).map_err(probe_error)?;
+        self.assess(&stat, parent, || directory_case(directory))
+    }
+
+    fn probe_opened(
+        &self,
+        opened: BorrowedFd<'_>,
+        _directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        let stat = statx(opened, c"", PROBE_FLAGS | AtFlags::EMPTY_PATH, PROBE_MASK).map_err(probe_error)?;
+        self.assess(&stat, parent, || handle_case(opened))
+    }
+
+    fn probe_beneath(
+        &self,
+        beneath: BorrowedFd<'_>,
+        name: &OsStr,
+        _directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        let stat = statx(beneath, name, PROBE_FLAGS, PROBE_MASK).map_err(probe_error)?;
+        self.assess(&stat, parent, || {
+            let handle = rustix::fs::openat(beneath, name, CASE_FLAGS, Mode::empty()).ok()?;
+            handle_case(handle.as_fd())
+        })
+    }
+}
+
+impl LinuxProbe {
+    fn assess(
+        &self,
+        stat: &Statx,
+        parent: Option<&ProbeResult>,
+        case: impl FnOnce() -> Option<CaseSensitivity>,
+    ) -> Result<ProbeResult, ProbeError> {
         if FileType::from_raw_mode(u32::from(stat.stx_mode)) != FileType::Directory {
             return Err(ProbeError::NotDirectory);
         }
 
         let mount = mount_id(stat.stx_mask, stat.stx_mnt_id);
         let device = Device { major: stat.stx_dev_major, minor: stat.stx_dev_minor };
-        let at_mount_root = mount_root(&stat);
+        let at_mount_root = mount_root(stat);
         let identity = identity_of(mount, device);
         let crossed = crossing(parent, &identity, mount, at_mount_root);
         let is_domain_root = at_mount_root.unwrap_or(matches!(crossed, Crossing::Proven));
@@ -103,7 +140,7 @@ impl DomainProbe for LinuxProbe {
         }
 
         let directory_case = match capabilities.case {
-            DomainCaseSensitivity::PerDirectory { .. } => directory_case(directory),
+            DomainCaseSensitivity::PerDirectory { .. } => case(),
             _ => None,
         };
 
@@ -111,10 +148,15 @@ impl DomainProbe for LinuxProbe {
     }
 }
 
+const CASE_FLAGS: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+
 fn directory_case(directory: &Path) -> Option<CaseSensitivity> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let handle = rustix::fs::open(directory, flags, Mode::empty()).ok()?;
-    let flags = ioctl_getflags(&handle).ok()?;
+    let handle = rustix::fs::open(directory, CASE_FLAGS, Mode::empty()).ok()?;
+    handle_case(handle.as_fd())
+}
+
+fn handle_case(handle: BorrowedFd<'_>) -> Option<CaseSensitivity> {
+    let flags = ioctl_getflags(handle).ok()?;
     Some(if flags.contains(FS_CASEFOLD_FL) { CaseSensitivity::Insensitive } else { CaseSensitivity::Sensitive })
 }
 
@@ -277,6 +319,14 @@ fn granularity_of(fs_type: &str) -> TimestampGranularity {
     }
 }
 
+fn kind_source_of(fs_type: &str) -> KindSource {
+    match fs_type {
+        "ext4" | "btrfs" | "f2fs" | "bcachefs" | "zfs" | "tmpfs" | "ramfs" | "devtmpfs" | "proc" | "sysfs"
+        | "cgroup2" => KindSource::Always,
+        _ => KindSource::Sometimes,
+    }
+}
+
 fn reliability_of(fs_type: &str, backing: Backing) -> IdentityReliability {
     match fs_type {
         "ext2" | "ext3" | "ext4" | "btrfs" | "xfs" | "f2fs" | "zfs" | "ntfs3" | "ntfs" | "tmpfs" | "ramfs"
@@ -383,7 +433,7 @@ fn capabilities_of(instance: Option<&Instance>, declarations: &Declarations) -> 
         timestamp_granularity: granularity,
         identity_space: IdentitySpace::Unknown,
         identity_reliability: reliability,
-        kind_source: KindSource::Sometimes,
+        kind_source: kind_source_of(fs_type),
         identity_source: IdentitySource::Inline,
         metadata_sources: MetadataSources::PER_CHILD_READ,
         watcher,
@@ -714,6 +764,21 @@ mod tests {
         assert_eq!(backing_of("btrfs"), Backing::MultiDevice);
         assert_eq!(backing_of("fuse.sshfs"), Backing::Userspace);
         assert_eq!(backing_of("wobble"), Backing::Unknown);
+    }
+
+    #[test]
+    fn a_filesystem_that_always_fills_the_directory_entry_type_declares_inline_kinds() {
+        assert_eq!(table("ext4").kind_source, KindSource::Always);
+        assert_eq!(table("btrfs").kind_source, KindSource::Always);
+        assert_eq!(table("tmpfs").kind_source, KindSource::Always);
+        assert_eq!(
+            table("xfs").kind_source,
+            KindSource::Sometimes,
+            "RFC 10.1: an xfs formatted without ftype reports DT_UNKNOWN, so the table does not promise inline kinds"
+        );
+        assert_eq!(table("nfs4").kind_source, KindSource::Sometimes);
+        assert_eq!(table("fuse.sshfs").kind_source, KindSource::Sometimes);
+        assert_eq!(capabilities_of(None, &Declarations::default()).kind_source, KindSource::Sometimes);
     }
 
     #[test]

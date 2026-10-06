@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -210,6 +210,7 @@ pub struct GovernorView {
     pub next_admissible: Option<MonotonicTime>,
     pub last_decision: Option<AdmissionDecision>,
     pub bootstrap: DomainAccount,
+    pub bootstrap_estimate: Duration,
     pub domains: BTreeMap<StorageDomainId, DomainView>,
 }
 
@@ -511,6 +512,7 @@ pub struct Governor {
     denied_foreground: Option<(Option<StorageDomainId>, Duration)>,
     last_decision: Option<AdmissionDecision>,
     bootstrap: Account,
+    bootstrap_latency: LatencyWindow,
     domains: BTreeMap<StorageDomainId, DomainState>,
 }
 
@@ -551,6 +553,7 @@ impl Governor {
             denied_foreground: None,
             last_decision: None,
             bootstrap: Account::default(),
+            bootstrap_latency: LatencyWindow::new(),
             domains: BTreeMap::new(),
         }
     }
@@ -1072,13 +1075,20 @@ impl Governor {
             let withheld = nanos(grant.charged.saturating_sub(grant.reserved));
             self.global_bucket(grant.origin).level -= withheld;
         }
-        let (Some(started), Some(domain)) = (grant.started, grant.domain) else {
+        let Some(started) = grant.started else {
             return;
         };
         if grant.id.release().is_some() {
             return;
         }
         let performed = grant.performed.unwrap_or(grant.required).max(1);
+        let Some(domain) = grant.domain else {
+            self.bootstrap_latency.record(now.since(started) / performed);
+            let summary = self.bootstrap_latency.summary;
+            let ceiling = duration(self.bootstrap_capacity);
+            self.estimate = summary.median.max(summary.minimum).min(ceiling).max(Duration::from_nanos(1));
+            return;
+        };
         let state = self.domain_mut(domain, now);
         match (grant.dispatched, grant.registration) {
             (Some(dispatched), _) => state.record_latency(now.since(dispatched) / performed, grant.listing),
@@ -1337,6 +1347,7 @@ impl Governor {
             },
             last_decision: self.last_decision,
             bootstrap: self.bootstrap.view(),
+            bootstrap_estimate: self.estimate,
             domains: {
                 let occupancy = self.occupancy();
                 self.domains
@@ -1354,7 +1365,14 @@ impl Governor {
 pub struct HostGovernor {
     inner: Arc<Mutex<Governor>>,
     base: Arc<Mutex<Option<Instant>>>,
-    limits: HostConfig,
+    changes: Arc<(Mutex<Changes>, Condvar)>,
+    limits: Arc<HostConfig>,
+}
+
+#[derive(Default)]
+struct Changes {
+    generation: u64,
+    waiters: usize,
 }
 
 static PROCESS_GOVERNOR: OnceLock<HostGovernor> = OnceLock::new();
@@ -1387,6 +1405,13 @@ fn guard(inner: &Mutex<Governor>) -> MutexGuard<'_, Governor> {
     }
 }
 
+fn guard_changes(changes: &Mutex<Changes>) -> MutexGuard<'_, Changes> {
+    match changes.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl HostGovernor {
     pub fn install(config: HostConfig) -> Result<HostGovernor, HostGovernorError> {
         config.validate().map_err(HostGovernorError::InvalidConfig)?;
@@ -1401,7 +1426,33 @@ impl HostGovernor {
         HostGovernor {
             inner: Arc::new(Mutex::new(Governor::new(config, MonotonicTime::ZERO))),
             base: Arc::new(Mutex::new(None)),
-            limits: *config,
+            changes: Arc::new((Mutex::new(Changes::default()), Condvar::new())),
+            limits: Arc::new(*config),
+        }
+    }
+
+    pub fn changes(&self) -> u64 {
+        guard_changes(&self.changes.0).generation
+    }
+
+    pub fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
+        let (lock, signal) = &*self.changes;
+        let mut held = guard_changes(lock);
+        held.waiters += 1;
+        let mut held = match signal.wait_timeout_while(held, timeout, |current| current.generation == seen) {
+            Ok((held, _)) => held,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+        held.waiters -= 1;
+        held.generation
+    }
+
+    fn changed(&self) {
+        let (lock, signal) = &*self.changes;
+        let mut held = guard_changes(lock);
+        held.generation = held.generation.wrapping_add(1);
+        if held.waiters > 0 {
+            signal.notify_all();
         }
     }
 
@@ -1430,11 +1481,13 @@ impl HostGovernor {
     }
 
     pub fn report_memory(&self, tree: TreeNumber, snapshot_bytes: u64, in_flight_bytes: u64) {
-        guard(&self.inner).report_memory(tree, snapshot_bytes, in_flight_bytes)
+        guard(&self.inner).report_memory(tree, snapshot_bytes, in_flight_bytes);
+        self.changed();
     }
 
     pub fn forget_tree(&self, tree: TreeNumber) {
-        guard(&self.inner).forget_tree(tree)
+        guard(&self.inner).forget_tree(tree);
+        self.changed();
     }
 
     pub fn accounted_memory_excluding(&self, tree: TreeNumber) -> u64 {
@@ -1522,7 +1575,8 @@ impl HostGovernor {
     }
 
     pub fn release(&self, id: GrantId, now: MonotonicTime) {
-        guard(&self.inner).release(id, now)
+        guard(&self.inner).release(id, now);
+        self.changed();
     }
 
     pub fn record_outcome(&self, domain: Option<StorageDomainId>, error: bool, now: MonotonicTime) {

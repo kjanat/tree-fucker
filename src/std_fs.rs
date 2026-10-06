@@ -8,9 +8,9 @@ use crate::domain::{
 };
 use crate::entry::{EntryKind, FileIdentity, Metadata};
 use crate::fs::{
-    CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EnrichmentBatch, EntryInfo,
-    FileSystem, FsCapabilities, FsError, Lease, ListingSession, Observation, ObservedKind, SessionCost, SessionOutcome,
-    WatcherKind, WatcherSink, entry_bytes,
+    Anchor, CancellationToken, Ceilings, Continuation, DirEntry, DirectoryListing, Enrichment, EnrichmentBatch,
+    EntryInfo, FileSystem, FsCapabilities, FsError, Lease, ListingAt, ListingSession, Observation, ObservedKind,
+    SessionCost, SessionOutcome, WatcherKind, WatcherSink, entry_bytes,
 };
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
@@ -89,8 +89,13 @@ impl StdFileSystem {
 }
 
 fn probe_at(probe: &dyn DomainProbe, full: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, FsError> {
-    let mut result = probe.probe(full, parent)?;
-    result.capabilities.kind_source = KindSource::Sometimes;
+    Ok(declare(probe.probe(full, parent)?))
+}
+
+fn declare(mut result: ProbeResult) -> ProbeResult {
+    if result.capabilities.kind_source == KindSource::Unknown {
+        result.capabilities.kind_source = KindSource::Sometimes;
+    }
     if cfg!(unix) {
         result.capabilities.identity_source = IdentitySource::Inline;
     } else if !cfg!(windows) {
@@ -98,7 +103,51 @@ fn probe_at(probe: &dyn DomainProbe, full: &Path, parent: Option<&ProbeResult>) 
     }
     result.capabilities.metadata_sources = inline_metadata_sources();
     result.capabilities.sources.observation = DeclarationSource::Declared;
-    Ok(result)
+    result
+}
+
+#[cfg(unix)]
+fn anchored_parent<'a>(beneath: Option<&'a Anchor>, full: &Path) -> Option<&'a DirectoryAnchor> {
+    let parent = beneath?.get::<DirectoryAnchor>()?;
+    (full.parent().map(Path::as_os_str) == Some(parent.path().as_os_str())).then_some(parent)
+}
+
+impl StdFileSystem {
+    fn session(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        ceilings: Ceilings,
+        cancel: CancellationToken,
+        beneath: Option<Anchor>,
+    ) -> StdSession<PlatformSource> {
+        let full = path.under(root);
+        let probe = self.probe.clone();
+        let opener = {
+            let full = full.clone();
+            move || open_platform(probe.as_ref(), &full, beneath.as_ref())
+        };
+        StdSession::new(full, ceilings, cancel, opener)
+    }
+}
+
+pub struct DirectoryAnchor {
+    path: PathBuf,
+    #[cfg(unix)]
+    fd: rustix::fd::OwnedFd,
+}
+
+impl DirectoryAnchor {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl rustix::fd::AsFd for DirectoryAnchor {
+    fn as_fd(&self) -> rustix::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 impl Default for StdFileSystem {
@@ -185,13 +234,38 @@ impl FileSystem for StdFileSystem {
         ceilings: Ceilings,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession> {
+        Box::new(self.session(root, path, ceilings, cancel, None))
+    }
+
+    fn open_listing_at(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        at: ListingAt<'_>,
+        ceilings: Ceilings,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        let session = self.session(root, path, ceilings, cancel, at.beneath.cloned());
+        match at.anchored {
+            true => Box::new(session.anchored()),
+            false => Box::new(session),
+        }
+    }
+
+    #[cfg(unix)]
+    fn resolve_domain_beneath(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        beneath: Option<&Anchor>,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, FsError> {
+        use rustix::fd::AsFd;
         let full = path.under(root);
-        let probe = self.probe.clone();
-        let opener = {
-            let full = full.clone();
-            move || open_platform(probe.as_ref(), &full)
-        };
-        Box::new(StdSession::new(full, ceilings, cancel, opener))
+        match (anchored_parent(beneath, &full), full.file_name()) {
+            (Some(anchor), Some(name)) => Ok(declare(self.probe.probe_beneath(anchor.as_fd(), name, &full, parent)?)),
+            _ => self.resolve_domain(root, path, parent),
+        }
     }
 
     fn enrich(&self, root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError> {
@@ -244,6 +318,10 @@ pub trait EntrySource: Send {
     fn resolve_kind(&mut self, name: &OsStr) -> Result<EntryKind, FsError>;
     fn resolve_identity(&mut self, name: &OsStr) -> Result<Option<FileIdentity>, FsError>;
     fn resolves_by_descriptor(&self) -> bool;
+
+    fn anchor(&self, _path: &Path) -> Option<Anchor> {
+        None
+    }
 }
 
 pub struct Opened<S> {
@@ -252,7 +330,46 @@ pub struct Opened<S> {
     pub source: S,
 }
 
-fn open_platform(probe: &dyn DomainProbe, full: &Path) -> Result<Opened<PlatformSource>, FsError> {
+#[cfg(unix)]
+fn open_platform(
+    probe: &dyn DomainProbe,
+    full: &Path,
+    beneath: Option<&Anchor>,
+) -> Result<Opened<PlatformSource>, FsError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fd::AsFd;
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let opened = match (anchored_parent(beneath, full), full.file_name()) {
+        (Some(parent), Some(name)) => rustix::fs::openat(parent, name, flags, Mode::empty()),
+        _ => rustix::fs::open(full, flags, Mode::empty()),
+    };
+    let handle = std::fs::File::from(opened.map_err(directory_error)?);
+    let own = handle.metadata()?;
+    let directory = info_from(&own);
+    if directory.kind != EntryKind::Directory {
+        return Err(FsError::NotDirectory);
+    }
+    let domain = declare(probe.probe_opened(handle.as_fd(), full, None)?);
+    let entries = rustix::fs::Dir::new(rustix::fd::OwnedFd::from(handle)).map_err(std::io::Error::from)?;
+    Ok(Opened { directory, domain, source: PlatformSource { device: own.dev(), entries } })
+}
+
+#[cfg(unix)]
+fn directory_error(errno: rustix::io::Errno) -> FsError {
+    match errno {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => FsError::NotDirectory,
+        other => std::io::Error::from(other).into(),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_platform(
+    probe: &dyn DomainProbe,
+    full: &Path,
+    _beneath: Option<&Anchor>,
+) -> Result<Opened<PlatformSource>, FsError> {
     let own = std::fs::symlink_metadata(full)?;
     let directory = info_from(&own);
     if directory.kind != EntryKind::Directory {
@@ -275,17 +392,6 @@ pub struct PlatformSource {
 }
 
 impl PlatformSource {
-    #[cfg(unix)]
-    fn open(full: &Path, own: &std::fs::Metadata) -> Result<PlatformSource, FsError> {
-        use std::os::unix::fs::MetadataExt;
-
-        use rustix::fs::{Mode, OFlags};
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        let fd = rustix::fs::open(full, flags, Mode::empty()).map_err(std::io::Error::from)?;
-        let entries = rustix::fs::Dir::new(fd).map_err(std::io::Error::from)?;
-        Ok(PlatformSource { device: own.dev(), entries })
-    }
-
     #[cfg(not(unix))]
     fn open(full: &Path, _own: &std::fs::Metadata) -> Result<PlatformSource, FsError> {
         Ok(PlatformSource { full: full.to_path_buf(), entries: std::fs::read_dir(full)? })
@@ -394,6 +500,18 @@ impl EntrySource for PlatformSource {
     fn resolves_by_descriptor(&self) -> bool {
         cfg!(unix)
     }
+
+    #[cfg(unix)]
+    fn anchor(&self, path: &Path) -> Option<Anchor> {
+        let directory = self.entries.fd().ok()?;
+        let fd = rustix::io::fcntl_dupfd_cloexec(directory, 0).ok()?;
+        Some(Anchor::new(DirectoryAnchor { path: path.to_path_buf(), fd }))
+    }
+
+    #[cfg(not(unix))]
+    fn anchor(&self, path: &Path) -> Option<Anchor> {
+        Some(Anchor::new(DirectoryAnchor { path: path.to_path_buf() }))
+    }
 }
 
 enum Stream<S> {
@@ -417,6 +535,7 @@ pub struct StdSession<S> {
     stashed: Option<RawEntry>,
     entries: Vec<DirEntry>,
     bytes: u64,
+    anchored: bool,
 }
 
 impl<S: EntrySource + 'static> StdSession<S> {
@@ -434,7 +553,13 @@ impl<S: EntrySource + 'static> StdSession<S> {
             stashed: None,
             entries: Vec::new(),
             bytes: 0,
+            anchored: false,
         }
+    }
+
+    pub fn anchored(mut self) -> StdSession<S> {
+        self.anchored = true;
+        self
     }
 
     fn open(&mut self, cost: &mut SessionCost) -> Result<(), FsError> {
@@ -568,6 +693,7 @@ impl<S: EntrySource + 'static> StdSession<S> {
             entries: std::mem::take(&mut self.entries),
             supplied_fields: inline_metadata_sources().inline(),
             domain: Box::new(opened.domain.clone()),
+            anchor: if self.anchored { opened.source.anchor(&self.full) } else { None },
         })
     }
 
@@ -869,7 +995,7 @@ mod tests {
         let moved = dir.with_file_name(format!("tree-fucker-std-fs-{}-renamed-target", std::process::id()));
         let _ = std::fs::remove_dir_all(&moved);
 
-        let mut opened = open_platform(&crate::domain::UnknownProbe, &dir).expect("open");
+        let mut opened = open_platform(&crate::domain::UnknownProbe, &dir, None).expect("open");
         std::fs::rename(&dir, &moved).expect("rename");
         assert!(
             std::fs::symlink_metadata(dir.join("file")).is_err(),
@@ -896,6 +1022,92 @@ mod tests {
         assert_eq!(names, ["file", "sub"], "RFC 10.2: continuation state is the held descriptor, never the path");
         assert!(listing.entries.iter().all(|entry| entry.info.kind.resolved().is_some()));
         let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn anchored_listing(
+        fs: &StdFileSystem,
+        root: &Path,
+        path: &RelativePath,
+        beneath: Option<&Anchor>,
+    ) -> SessionOutcome {
+        let at = ListingAt { beneath, anchored: true };
+        let mut session = fs.open_listing_at(root, path, at, Ceilings::UNBOUNDED, CancellationToken::new());
+        loop {
+            match session.resume(Lease::UNBOUNDED).0 {
+                Continuation::Suspended(next) => session = next,
+                Continuation::Finished(outcome) => return outcome,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_beneath_an_anchor_follows_the_parent_descriptor_across_a_rename() {
+        let dir = temp_directory("beneath");
+        std::fs::create_dir(dir.join("sub")).expect("dir");
+        std::fs::write(dir.join("sub/file"), b"abc").expect("file");
+        let moved = dir.with_file_name(format!("tree-fucker-std-fs-{}-beneath-moved", std::process::id()));
+        let _ = std::fs::remove_dir_all(&moved);
+        let fs = StdFileSystem::new();
+        let SessionOutcome::Complete(parent) = anchored_listing(&fs, &dir, &RelativePath::root(), None) else {
+            panic!("the parent listing did not complete");
+        };
+        let anchor = parent.anchor.expect("an anchored listing carries its anchor");
+        std::fs::rename(&dir, &moved).expect("rename");
+        let sub = RelativePath::parse("sub").expect("path");
+        let SessionOutcome::Complete(child) = anchored_listing(&fs, &dir, &sub, Some(&anchor)) else {
+            panic!("RFC 20: a listing beneath an anchor opens relative to the held descriptor, never the old path");
+        };
+        let names: Vec<&OsStr> = child.entries.iter().map(|entry| entry.name.as_os_str()).collect();
+        assert_eq!(names, ["file"]);
+        assert!(fs.resolve_domain_beneath(&dir, &sub, Some(&anchor), Some(&parent.domain)).is_ok());
+        assert!(fs.resolve_domain(&dir, &sub, Some(&parent.domain)).is_err(), "the path no longer resolves");
+        let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_anchor_for_another_directory_is_ignored_and_the_path_decides() {
+        let dir = temp_directory("foreign-anchor");
+        for side in ["left", "right"] {
+            std::fs::create_dir_all(dir.join(side).join("sub")).expect("dir");
+            std::fs::write(dir.join(side).join("sub").join(side), b"x").expect("file");
+        }
+        let fs = StdFileSystem::new();
+        let SessionOutcome::Complete(left) = anchored_listing(&fs, &dir.join("left"), &RelativePath::root(), None)
+        else {
+            panic!("the left listing did not complete");
+        };
+        let foreign = left.anchor.expect("anchor");
+        let sub = RelativePath::parse("sub").expect("path");
+        let SessionOutcome::Complete(right) = anchored_listing(&fs, &dir.join("right"), &sub, Some(&foreign)) else {
+            panic!("the right listing did not complete");
+        };
+        let names: Vec<&OsStr> = right.entries.iter().map(|entry| entry.name.as_os_str()).collect();
+        assert_eq!(names, ["right"], "an anchor whose directory is not the parent is never used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_never_listed_as_the_directory_it_names() {
+        let dir = temp_directory("listed-link");
+        std::fs::create_dir(dir.join("target")).expect("dir");
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("link")).expect("symlink");
+        let fs = StdFileSystem::new();
+        let SessionOutcome::Complete(parent) = anchored_listing(&fs, &dir, &RelativePath::root(), None) else {
+            panic!("the parent listing did not complete");
+        };
+        let link = RelativePath::parse("link").expect("path");
+        for beneath in [None, parent.anchor.as_ref()] {
+            assert_eq!(
+                anchored_listing(&fs, &dir, &link, beneath),
+                SessionOutcome::Failed(FsError::NotDirectory),
+                "RFC 14.2: symbolic links are represented and never traversed"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

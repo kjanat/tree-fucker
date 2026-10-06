@@ -1,9 +1,11 @@
+use std::ffi::OsStr;
+use std::fs::File;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::unix::{c_string, open_directory};
+use super::unix::{c_string, duplicate, open_beneath, open_directory};
 use super::{
     AccessTopology, Answer, Crossing, DeclarationSource, DeclarationSources, DomainCapabilities, DomainCaseSensitivity,
     DomainIdentity, DomainKey, DomainProbe, FilesystemInstance, FilesystemInstanceKey, FilesystemSemantics,
@@ -23,29 +25,51 @@ impl IllumosProbe {
 
 impl DomainProbe for IllumosProbe {
     fn probe(&self, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError> {
-        let file = open_directory(directory)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir() {
-            return Err(ProbeError::NotDirectory);
-        }
-
-        let mut buffer = MaybeUninit::<libc::statvfs>::uninit();
-        let status = unsafe { libc::fstatvfs(file.as_raw_fd(), buffer.as_mut_ptr()) };
-        if status != 0 {
-            return Err(ProbeError::from(std::io::Error::last_os_error()));
-        }
-        let stat = unsafe { buffer.assume_init() };
-        let fsid = stat.f_fsid;
-
-        let identity = DomainIdentity::Known(DomainKey::statvfs_fsid(fsid));
-        let device = metadata.dev();
-        let space = IdentitySpaceKey::unix_device(device >> 32, device & 0xffff_ffff);
-        let capabilities = capabilities_of(&c_string(&stat.f_basetype), fsid, space);
-        let crossed = crossing(parent, &identity);
-        let is_domain_root = mount_root(directory, fsid);
-
-        Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case: None })
+        probe_file(&open_directory(directory)?, directory, parent)
     }
+
+    fn probe_opened(
+        &self,
+        opened: BorrowedFd<'_>,
+        directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        probe_file(&duplicate(opened)?, directory, parent)
+    }
+
+    fn probe_beneath(
+        &self,
+        beneath: BorrowedFd<'_>,
+        name: &OsStr,
+        directory: &Path,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, ProbeError> {
+        probe_file(&open_beneath(beneath, name)?, directory, parent)
+    }
+}
+
+fn probe_file(file: &File, directory: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, ProbeError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(ProbeError::NotDirectory);
+    }
+
+    let mut buffer = MaybeUninit::<libc::statvfs>::uninit();
+    let status = unsafe { libc::fstatvfs(file.as_raw_fd(), buffer.as_mut_ptr()) };
+    if status != 0 {
+        return Err(ProbeError::from(std::io::Error::last_os_error()));
+    }
+    let stat = unsafe { buffer.assume_init() };
+    let fsid = stat.f_fsid;
+
+    let identity = DomainIdentity::Known(DomainKey::statvfs_fsid(fsid));
+    let device = metadata.dev();
+    let space = IdentitySpaceKey::unix_device(device >> 32, device & 0xffff_ffff);
+    let capabilities = capabilities_of(&c_string(&stat.f_basetype), fsid, space);
+    let crossed = crossing(parent, &identity);
+    let is_domain_root = mount_root(directory, fsid);
+
+    Ok(ProbeResult { identity, capabilities, is_domain_root, crossed, directory_case: None })
 }
 
 fn parent_fsid(directory: &Path) -> Option<u64> {

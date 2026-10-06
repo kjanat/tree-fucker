@@ -1,6 +1,11 @@
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use super::ProbeError;
 
@@ -12,6 +17,19 @@ pub(super) fn open_directory(directory: &Path) -> Result<File, ProbeError> {
         }
         Err(err) => Err(ProbeError::from(err)),
     }
+}
+
+pub(super) fn open_beneath(beneath: BorrowedFd<'_>, name: &OsStr) -> Result<File, ProbeError> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::openat(beneath, name, flags, Mode::empty()) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(Errno::LOOP | Errno::MLINK | Errno::NOTDIR) => Err(ProbeError::NotDirectory),
+        Err(errno) => Err(ProbeError::from(std::io::Error::from(errno))),
+    }
+}
+
+pub(super) fn duplicate(opened: BorrowedFd<'_>) -> Result<File, ProbeError> {
+    Ok(File::from(opened.try_clone_to_owned()?))
 }
 
 pub(super) fn c_string<const N: usize>(raw: &[libc::c_char; N]) -> String {

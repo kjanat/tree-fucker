@@ -7,16 +7,6 @@ lint = "clippy --workspace --all-targets --all-features -- -D warnings -D clippy
 tw   = "test --workspace"
 twa  = "test --workspace --all-targets --all-features"
 
-[unstable]
-gc                = true
-cargo-lints       = true
-trim-paths        = true
-profile-rustflags = true
-sbom              = true
-build-analysis    = true
-hint-msrv         = true
-min-publish-age   = true
-
 [build.analysis]
 enabled = true
 
@@ -32,3 +22,12 @@ trim-paths = "all"
 
 [registry]
 global-min-publish-age = "7 days"
+
+[unstable]
+gc                = true
+cargo-lints       = true
+trim-paths        = true
+profile-rustflags = true
+sbom              = true
+build-analysis    = true
+min-publish-age   = true

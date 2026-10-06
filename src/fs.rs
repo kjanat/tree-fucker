@@ -1,8 +1,9 @@
+use std::any::Any;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::domain::{ProbeError, ProbeResult};
@@ -113,12 +114,65 @@ impl DirEntry {
     }
 }
 
+#[derive(Clone)]
+pub struct Anchor(Arc<Anchored>);
+
+struct Anchored {
+    value: Box<dyn Any + Send + Sync>,
+    live: OnceLock<Arc<AtomicUsize>>,
+}
+
+impl Drop for Anchored {
+    fn drop(&mut self) {
+        if let Some(live) = self.live.get() {
+            live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Anchor {
+    pub fn new<T: Any + Send + Sync>(value: T) -> Anchor {
+        Anchor(Arc::new(Anchored { value: Box::new(value), live: OnceLock::new() }))
+    }
+
+    pub fn get<T: Any>(&self) -> Option<&T> {
+        self.0.value.downcast_ref::<T>()
+    }
+
+    pub(crate) fn count_in(&self, live: &Arc<AtomicUsize>) {
+        if self.0.live.set(live.clone()).is_ok() {
+            live.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl PartialEq for Anchor {
+    fn eq(&self, other: &Anchor) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Anchor {}
+
+impl fmt::Debug for Anchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Anchor")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListingAt<'a> {
+    pub beneath: Option<&'a Anchor>,
+    pub anchored: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryListing {
     pub directory: EntryInfo,
     pub entries: Vec<DirEntry>,
     pub supplied_fields: MetadataFields,
     pub domain: Box<ProbeResult>,
+    pub anchor: Option<Anchor>,
 }
 
 #[derive(Clone, Default)]
@@ -368,6 +422,25 @@ pub trait FileSystem: Send + Sync {
         ceilings: Ceilings,
         cancel: CancellationToken,
     ) -> Box<dyn ListingSession>;
+    fn open_listing_at(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        _at: ListingAt<'_>,
+        ceilings: Ceilings,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        self.open_listing(root, path, ceilings, cancel)
+    }
+    fn resolve_domain_beneath(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        _beneath: Option<&Anchor>,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, FsError> {
+        self.resolve_domain(root, path, parent)
+    }
     fn enrich(&self, root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError>;
     fn watch(
         &self,

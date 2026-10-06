@@ -1003,6 +1003,140 @@ Abstract
    minimum reconciliation period to the configured maximum delay.
 
 
+9.3.  One-Shot Scans
+
+   A one-shot scan observes a tree once and reports each observation as
+   it is made. It keeps no snapshot, registers no watcher, runs no
+   reconciliation round, and accepts no command. It serves consumers
+   that walk a tree to answer one question and then stop, and it applies
+   the observation, domain, and resource rules of this document to that
+   walk.
+
+   The logical interface is:
+
+      pub struct Scan { .. }
+
+      impl Scan {
+          pub fn open(
+              filesystem: Arc<dyn FileSystem>,
+              root: PathBuf,
+              policy: Arc<dyn ScanPolicy>,
+              options: ScanOptions,
+          ) -> Result<Scan>;
+          pub fn cancellation(&self) -> CancellationToken;
+          pub fn stats(&self) -> ScanStats;
+      }
+
+      impl Iterator for Scan {
+          type Item = Result<ScanEvent>;
+      }
+
+   A scan is synchronous. Each filesystem operation runs on the calling
+   thread after the host governor grants it, so a scan needs no runtime
+   adapter and occupies at most one worker slot at a time. A scan
+   waiting for admission sleeps until the earliest admissible time the
+   governor reports, or until the governor releases capacity when no
+   such time is computable. It does not poll.
+
+   `open` canonicalizes the root, reads its metadata, and resolves its
+   storage domain under bootstrap grants, then makes the root the first
+   event. Initial NotFound or NotDirectory fails `open`.
+
+   Every later operation is admitted under Section 15.3: domain
+   resolution, each listing lease, kind resolution within a lease, and
+   each enrichment batch. A scan draws on the foreground allowance of
+   Section 15.4, because a consumer waits for it, and the whole scan is
+   one command for the per-command worker-time ceiling, which the scan
+   options carry. A scan whose admitted cost reaches the ceiling while
+   work remains terminates with ResourceLimited naming CommandWorkerTime.
+   Throttling delays a scan. It never truncates one.
+
+   Traversal is depth first. The scan lists a directory in full under
+   Section 10.2, yields its children in enumeration order, and lists a
+   child directory before it yields that directory's next sibling.
+   Complete is the only session outcome whose children are yielded. A
+   scan therefore holds at most one complete listing for each directory
+   on the current path, each bounded by the entries-per-directory limit,
+   and reports what it holds to the host governor as accounted memory.
+
+   The policy of Section 8 decides descent. The scan classifies the root
+   and every child directory. An Eligible directory with
+   `initially_loaded` set is listed; any other directory is yielded and
+   not listed. A scan holds no state that a policy revision could
+   invalidate, so it ignores revisions.
+
+   Before the scan lists a child directory, it resolves the child's
+   storage domain unless the parent listing reported that domain inline.
+   The resolution is admitted together with the child's first listing
+   lease, as one grant that names both reads. When the scan holds the
+   anchor of the parent listing, both run beneath it under Section
+   10.2.
+   When the child is a domain crossing under Section 14.3, the crossing
+   mode in the options, refined by the policy, decides. Follow lists the
+   child under the child domain's buckets and window. Exclude and
+   LoadOnDemand both leave the child unlisted, because a scan accepts no
+   later `load`. Symbolic links are yielded and never traversed. A child
+   whose kind is still unresolved when its listing completes is yielded
+   as unresolved and is not traversed.
+
+   A scan yields three kinds of event:
+
+      Entry
+         an observed entry: its path, its observed kind, its identity
+         where the domain supplies one, the requested metadata fields
+         that were obtained, an enrichment failure when one occurred,
+         the storage domain of the directory that listed it, its
+         descent (leaf, descending, withheld by policy, or unresolved),
+         and the anchor of its listing when one was retained;
+
+      Boundary
+         a domain crossing the scan did not follow, with the crossing
+         mode and the child domain; and
+
+      Unlisted
+         a directory whose domain resolution or listing did not
+         complete, with a classified filesystem error, a
+         ResourceLimited outcome naming the limit, the quarantined
+         domain, or the child name that cannot be represented safely.
+
+   A directory's Entry precedes its Boundary or Unlisted event and
+   every event for its descendants. An Unlisted directory does not end
+   the scan, and its siblings continue. A listing on a domain
+   quarantined under Section 13.5 is reported as Unlisted at once, so a
+   dead mount cannot stall a scan of healthy domains.
+
+   Metadata fields that the options request and the listing does not
+   supply inline are read by enrichment under Section 10.1. An
+   enrichment failure marks the affected entries and no other.
+
+   A scan terminates on a Fatal adapter failure, on cancellation, on
+   reaching its ceiling, or when the listings it holds alone would
+   exceed the accounted-memory ceiling. A terminated scan yields one
+   error and then no further event. Events already yielded stand. A
+   scan holds no grant between events, so a consumer may stop iterating
+   and drop the scan at any point between events, and dropping it
+   releases its accounted memory. Cancellation from another thread sets
+   the token every listing session polls between chunks. A filesystem
+   call already inside the kernel runs to completion under Section 4.
+
+   An anchor is an opaque, adapter-owned handle to the directory that a
+   listing enumerated. A scan retains one only when its options allow
+   anchors and the adapter offers an anchored session under Section
+   10.2. An anchor lets the consumer, or an adapter-specific extension,
+   read further relative to the observed directory instead of resolving
+   its path again. Every Entry from one listing shares that listing's
+   anchor, and the anchor lives until the scan and every such Entry have
+   released it. Live anchors count against the anchor limit in the
+   options. A listing that starts while the limit is reached runs
+   without an anchor, and the scan counts the withheld anchor in its
+   statistics. A core type never carries a raw descriptor or handle.
+
+   Every scan opened in one process shares the host governor of Section
+   15.9, as every tree does. An API that opens a scan under an
+   independently constructed governor is the opt-out that Section 9
+   requires to be named as one.
+
+
 10.  Filesystem Abstraction
 
    The filesystem interface supplies, at minimum:
@@ -1134,6 +1268,15 @@ Abstract
 
    The adapter reports, with every session outcome, the cost defined in
    Section 15.2.
+
+   An adapter MAY offer an anchored listing session, whose Complete
+   outcome also carries the anchor of Section 9.3. An adapter MAY also
+   open a listing session, or resolve a storage domain, beneath the
+   anchor of the parent directory, in which case it reaches the child
+   through that handle instead of resolving the child's path again. An
+   adapter MUST NOT use an anchor that does not name the parent of the
+   requested directory. An adapter without these capabilities answers
+   either request as it answers an ordinary one.
 
 10.3.  Storage Domains and Capabilities
 
@@ -2059,7 +2202,10 @@ Abstract
    network filesystems [INOTIFY] [FANOTIFY]. Case sensitivity on ext4 and
    f2fs is a per-directory attribute and cannot be read per mount;
    timestamp granularity is not queryable and is table-driven per
-   filesystem type with a declared override.
+   filesystem type with a declared override. The kind source is
+   table-driven in the same way: a filesystem whose directory entries
+   always carry a file type declares kinds as always inline, and any
+   other declares them as sometimes inline.
 
    On macOS a domain is keyed by the `f_fsid` that `fstatfs` returns and
    a crossing is detected from a changed `st_dev` during traversal, never
@@ -2212,10 +2358,11 @@ Abstract
       represented entries and snapshot bytes
       error, cancellation, and stale-result counts
 
-   The governor keeps, per storage domain, an estimate of worker time
-   per filesystem operation. It starts at the configured initial cost
-   estimate. Every released grant updates it with the grant's charged
-   worker time divided by the operations the grant performed, where the
+   The governor keeps, per storage domain and for the bootstrap scope
+   of Section 10.3, an estimate of worker time per filesystem
+   operation. It starts at the configured initial cost estimate. Every
+   released grant updates it with the grant's charged worker time
+   divided by the operations the grant performed, where the
    operations are those the adapter reported for it and otherwise the
    reads the grant was admitted for. The estimate is the moving median
    of that per-operation measure over a short history, never below its
@@ -2330,8 +2477,9 @@ Abstract
 
 15.4.  Foreground Allowance
 
-   Reads dispatched to satisfy an accepted `refresh` or `load` command
-   draw on the foreground buckets. The foreground buckets have their own
+   Reads dispatched to satisfy an accepted `refresh` or `load` command,
+   and every operation of a one-shot scan under Section 9.3, draw on
+   the foreground buckets. The foreground buckets have their own
    rate and capacity. They are reservations within the shared physical
    ceilings: a foreground read still needs a free slot in its domain
    window and in the global in-flight limit and still counts against the
