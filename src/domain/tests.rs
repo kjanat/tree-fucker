@@ -187,7 +187,11 @@ mod linux {
         assert_eq!(root.capabilities.watcher.can_lose_events, Answer::Yes);
         assert_eq!(root.capabilities.watcher.signals_overflow, Answer::Yes);
         assert_eq!(root.capabilities.sources.watcher, DeclarationSource::Declared);
-        assert_eq!(root.capabilities.kind_source, KindSource::Sometimes);
+        assert!(
+            matches!(root.capabilities.kind_source, KindSource::Always | KindSource::Sometimes),
+            "RFC 10.3: every Linux domain declares its kind source from the filesystem table: {:?}",
+            root.capabilities.kind_source
+        );
     }
 
     #[test]

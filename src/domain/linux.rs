@@ -277,6 +277,14 @@ fn granularity_of(fs_type: &str) -> TimestampGranularity {
     }
 }
 
+fn kind_source_of(fs_type: &str) -> KindSource {
+    match fs_type {
+        "ext4" | "btrfs" | "f2fs" | "bcachefs" | "zfs" | "tmpfs" | "ramfs" | "devtmpfs" | "proc" | "sysfs"
+        | "cgroup2" => KindSource::Always,
+        _ => KindSource::Sometimes,
+    }
+}
+
 fn reliability_of(fs_type: &str, backing: Backing) -> IdentityReliability {
     match fs_type {
         "ext2" | "ext3" | "ext4" | "btrfs" | "xfs" | "f2fs" | "zfs" | "ntfs3" | "ntfs" | "tmpfs" | "ramfs"
@@ -383,7 +391,7 @@ fn capabilities_of(instance: Option<&Instance>, declarations: &Declarations) -> 
         timestamp_granularity: granularity,
         identity_space: IdentitySpace::Unknown,
         identity_reliability: reliability,
-        kind_source: KindSource::Sometimes,
+        kind_source: kind_source_of(fs_type),
         identity_source: IdentitySource::Inline,
         metadata_sources: MetadataSources::PER_CHILD_READ,
         watcher,
@@ -714,6 +722,21 @@ mod tests {
         assert_eq!(backing_of("btrfs"), Backing::MultiDevice);
         assert_eq!(backing_of("fuse.sshfs"), Backing::Userspace);
         assert_eq!(backing_of("wobble"), Backing::Unknown);
+    }
+
+    #[test]
+    fn a_filesystem_that_always_fills_the_directory_entry_type_declares_inline_kinds() {
+        assert_eq!(table("ext4").kind_source, KindSource::Always);
+        assert_eq!(table("btrfs").kind_source, KindSource::Always);
+        assert_eq!(table("tmpfs").kind_source, KindSource::Always);
+        assert_eq!(
+            table("xfs").kind_source,
+            KindSource::Sometimes,
+            "RFC 10.1: an xfs formatted without ftype reports DT_UNKNOWN, so the table does not promise inline kinds"
+        );
+        assert_eq!(table("nfs4").kind_source, KindSource::Sometimes);
+        assert_eq!(table("fuse.sshfs").kind_source, KindSource::Sometimes);
+        assert_eq!(capabilities_of(None, &Declarations::default()).kind_source, KindSource::Sometimes);
     }
 
     #[test]

@@ -90,7 +90,9 @@ impl StdFileSystem {
 
 fn probe_at(probe: &dyn DomainProbe, full: &Path, parent: Option<&ProbeResult>) -> Result<ProbeResult, FsError> {
     let mut result = probe.probe(full, parent)?;
-    result.capabilities.kind_source = KindSource::Sometimes;
+    if result.capabilities.kind_source == KindSource::Unknown {
+        result.capabilities.kind_source = KindSource::Sometimes;
+    }
     if cfg!(unix) {
         result.capabilities.identity_source = IdentitySource::Inline;
     } else if !cfg!(windows) {

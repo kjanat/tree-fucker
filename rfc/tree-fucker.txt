@@ -2059,7 +2059,10 @@ Abstract
    network filesystems [INOTIFY] [FANOTIFY]. Case sensitivity on ext4 and
    f2fs is a per-directory attribute and cannot be read per mount;
    timestamp granularity is not queryable and is table-driven per
-   filesystem type with a declared override.
+   filesystem type with a declared override. The kind source is
+   table-driven in the same way: a filesystem whose directory entries
+   always carry a file type declares kinds as always inline, and any
+   other declares them as sometimes inline.
 
    On macOS a domain is keyed by the `f_fsid` that `fstatfs` returns and
    a crossing is detected from a changed `st_dev` during traversal, never
