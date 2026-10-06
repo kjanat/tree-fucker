@@ -210,6 +210,7 @@ pub struct GovernorView {
     pub next_admissible: Option<MonotonicTime>,
     pub last_decision: Option<AdmissionDecision>,
     pub bootstrap: DomainAccount,
+    pub bootstrap_estimate: Duration,
     pub domains: BTreeMap<StorageDomainId, DomainView>,
 }
 
@@ -511,6 +512,7 @@ pub struct Governor {
     denied_foreground: Option<(Option<StorageDomainId>, Duration)>,
     last_decision: Option<AdmissionDecision>,
     bootstrap: Account,
+    bootstrap_latency: LatencyWindow,
     domains: BTreeMap<StorageDomainId, DomainState>,
 }
 
@@ -551,6 +553,7 @@ impl Governor {
             denied_foreground: None,
             last_decision: None,
             bootstrap: Account::default(),
+            bootstrap_latency: LatencyWindow::new(),
             domains: BTreeMap::new(),
         }
     }
@@ -1072,13 +1075,20 @@ impl Governor {
             let withheld = nanos(grant.charged.saturating_sub(grant.reserved));
             self.global_bucket(grant.origin).level -= withheld;
         }
-        let (Some(started), Some(domain)) = (grant.started, grant.domain) else {
+        let Some(started) = grant.started else {
             return;
         };
         if grant.id.release().is_some() {
             return;
         }
         let performed = grant.performed.unwrap_or(grant.required).max(1);
+        let Some(domain) = grant.domain else {
+            self.bootstrap_latency.record(now.since(started) / performed);
+            let summary = self.bootstrap_latency.summary;
+            let ceiling = duration(self.bootstrap_capacity);
+            self.estimate = summary.median.max(summary.minimum).min(ceiling).max(Duration::from_nanos(1));
+            return;
+        };
         let state = self.domain_mut(domain, now);
         match (grant.dispatched, grant.registration) {
             (Some(dispatched), _) => state.record_latency(now.since(dispatched) / performed, grant.listing),
@@ -1337,6 +1347,7 @@ impl Governor {
             },
             last_decision: self.last_decision,
             bootstrap: self.bootstrap.view(),
+            bootstrap_estimate: self.estimate,
             domains: {
                 let occupancy = self.occupancy();
                 self.domains

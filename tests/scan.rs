@@ -700,6 +700,20 @@ fn anchors_are_bounded_and_resolve_children_against_the_listed_directory() {
 }
 
 #[test]
+fn the_bootstrap_estimate_learns_from_the_operations_it_admitted() {
+    let fs = fixture();
+    fs.set_cost(CostScope::Everything, FakeOp::Metadata, Duration::from_micros(40));
+    let host = HostConfig::default();
+    let Opened { mut scan, governor, clock } = open(fs.clone(), follow());
+    let _ = drain(&mut scan);
+    let learned = governor.view(now(&governor, &clock)).bootstrap_estimate;
+    assert!(
+        learned < host.initial_cost_estimate,
+        "RFC 15.2: every released grant updates the estimate, the bootstrap scope's included: {learned:?}"
+    );
+}
+
+#[test]
 fn a_large_directory_progresses_lease_by_lease_under_its_ceiling() {
     let fs = fixture();
     fs.mkdir("wide");

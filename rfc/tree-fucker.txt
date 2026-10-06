@@ -2358,10 +2358,11 @@ Abstract
       represented entries and snapshot bytes
       error, cancellation, and stale-result counts
 
-   The governor keeps, per storage domain, an estimate of worker time
-   per filesystem operation. It starts at the configured initial cost
-   estimate. Every released grant updates it with the grant's charged
-   worker time divided by the operations the grant performed, where the
+   The governor keeps, per storage domain and for the bootstrap scope
+   of Section 10.3, an estimate of worker time per filesystem
+   operation. It starts at the configured initial cost estimate. Every
+   released grant updates it with the grant's charged worker time
+   divided by the operations the grant performed, where the
    operations are those the adapter reported for it and otherwise the
    reads the grant was admitted for. The estimate is the moving median
    of that per-operation measure over a short history, never below its
