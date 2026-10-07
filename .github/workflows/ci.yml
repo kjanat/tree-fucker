@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
-      matrix: { target: [x86_64-pc-solaris, aarch64-unknown-freebsd] }
+      matrix: { target: [x86_64-pc-solaris, aarch64-unknown-freebsd, loongarch64-unknown-linux-musl] }
     env: { TARGET: "${{ matrix.target }}" }
     steps:
       - uses: actions/checkout@v7

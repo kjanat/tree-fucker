@@ -21,10 +21,13 @@ use super::{
 use crate::path::CaseSensitivity;
 
 const STATX_MNT_ID_UNIQUE: StatxFlags = StatxFlags::from_bits_retain(0x4000);
+// `AT_STATX_DONT_SYNC`, which rustix's libc backend doesn't define on every
+// target (ex. loongarch64 musl). The kernel uses the same value on all of them.
+const STATX_DONT_SYNC: AtFlags = AtFlags::from_bits_retain(0x4000);
 const FS_CASEFOLD_FL: IFlags = IFlags::from_bits_retain(0x4000_0000);
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 const PROBE_MASK: StatxFlags = StatxFlags::TYPE.union(STATX_MNT_ID_UNIQUE).union(StatxFlags::MNT_ID);
-const PROBE_FLAGS: AtFlags = AtFlags::NO_AUTOMOUNT.union(AtFlags::SYMLINK_NOFOLLOW).union(AtFlags::STATX_DONT_SYNC);
+const PROBE_FLAGS: AtFlags = AtFlags::NO_AUTOMOUNT.union(AtFlags::SYMLINK_NOFOLLOW).union(STATX_DONT_SYNC);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Declarations {
@@ -611,16 +614,19 @@ fn statmount_instance(_mount: u64) -> Option<Instance> {
     None
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn read_u32(buffer: &[u8], offset: usize) -> Option<u32> {
     let bytes = buffer.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_ne_bytes(bytes.try_into().ok()?))
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn read_u64(buffer: &[u8], offset: usize) -> Option<u64> {
     let bytes = buffer.get(offset..offset.checked_add(8)?)?;
     Some(u64::from_ne_bytes(bytes.try_into().ok()?))
 }
 
+#[cfg(any(test, target_arch = "x86_64", target_arch = "aarch64"))]
 fn string_at(strings: &[u8], offset: u32) -> Option<String> {
     let rest = strings.get(usize::try_from(offset).ok()?..)?;
     let end = rest.iter().position(|byte| *byte == 0)?;
@@ -952,10 +958,10 @@ mod tests {
 
     #[test]
     fn the_probe_asks_statx_for_kernel_local_facts_without_forcing_a_server_round_trip() {
-        assert!(PROBE_FLAGS.contains(AtFlags::STATX_DONT_SYNC));
+        assert!(PROBE_FLAGS.contains(STATX_DONT_SYNC));
         assert!(PROBE_FLAGS.contains(AtFlags::NO_AUTOMOUNT));
         assert!(PROBE_FLAGS.contains(AtFlags::SYMLINK_NOFOLLOW));
-        assert!(!PROBE_FLAGS.contains(AtFlags::STATX_FORCE_SYNC));
+        assert_eq!(PROBE_FLAGS.bits() & 0x6000, 0x4000, "AT_STATX_SYNC_TYPE must select AT_STATX_DONT_SYNC");
         assert_eq!(PROBE_MASK, StatxFlags::TYPE | STATX_MNT_ID_UNIQUE | StatxFlags::MNT_ID);
     }
 
