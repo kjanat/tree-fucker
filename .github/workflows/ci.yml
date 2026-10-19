@@ -32,6 +32,9 @@ jobs:
         run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --no-fail-fast
+      - name: Layer probe correctness
+        run: cargo bench:layers --test;
+          cargo bench:alloc --test
       - run: cargo doc --no-deps --all-features
 
   freebsd:

@@ -3,6 +3,9 @@
 # See: https://doc.rust-lang.org/cargo/reference/config.html
 
 [alias]
+"bench:alloc"  = "bench --bench layers_alloc --locked --"
+"bench:layers" = "bench --bench layers --locked --"
+
 lint = "clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all"
 tw   = "test --workspace"
 twa  = "test --workspace --all-targets --all-features"
