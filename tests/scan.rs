@@ -16,6 +16,329 @@ use tree_fucker::{
 
 const MEDIA: DomainId = DomainId::new(7);
 
+#[test]
+fn required_anchors_fail_explicitly_when_disabled_or_unsupported() {
+    for budget in [0, 2] {
+        let Opened { mut scan, .. } = open(
+            fixture(),
+            ScanOptions { anchors: budget, anchor_policy: tree_fucker::AnchorPolicy::Required, ..follow() },
+        );
+        let events = drain(&mut scan);
+        assert_eq!(entries(&events).len(), 1, "only the bootstrap root may lack an anchor");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ScanEvent::Unlisted { failure: ScanFailure::ResourceLimited(limited), .. }
+                if limited.limit == ResourceLimit::Anchors && limited.configured == 0 && limited.observed == 1
+        )));
+    }
+}
+
+fn disk_scan(root: &Path, options: ScanOptions) -> Scan {
+    Scan::open_outside_host_governor(
+        Arc::new(tree_fucker::std_fs::StdFileSystem::new()),
+        root.to_path_buf(),
+        Arc::new(LoadAll),
+        options,
+        HostGovernor::independent(&HostConfig {
+            foreground_duty: 1.0,
+            domain_foreground_duty: 1.0,
+            ..Default::default()
+        }),
+        Arc::new(SystemClock),
+    )
+    .unwrap()
+}
+
+#[test]
+fn streaming_yields_the_first_lease_and_bounds_wide_directory_buffering() {
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..1000 {
+        std::fs::write(root.path().join(format!("f{i:04}")), b"").unwrap();
+    }
+    for bounded in [false, true] {
+        let mut scan = disk_scan(
+            root.path(),
+            ScanOptions { streaming: true, entries_per_lease: 7, ceiling: Duration::MAX, ..follow() },
+        );
+        if bounded {
+            scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap());
+        }
+        assert!(matches!(scan.next().unwrap().unwrap(), ScanEvent::Entry(entry) if entry.path.is_root()));
+        let first = scan.next().unwrap().unwrap();
+        assert!(matches!(first, ScanEvent::Entry(_)));
+        assert_eq!(scan.stats().entries_enumerated, 7, "first result precedes directory completion");
+        let remaining = drain(&mut scan);
+        assert_eq!(entries(&remaining).len(), 999);
+        assert_eq!(scan.stats().entries_enumerated, 1000);
+        assert!(scan.stats().peak_buffered_bytes <= 7 * tree_fucker::entry_bytes(std::ffi::OsStr::new("f0000")));
+        assert_eq!(scan.stats().buffered_bytes, 0);
+    }
+}
+
+#[test]
+fn streaming_preserves_total_directory_entry_limits_and_prior_observations() {
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..20 {
+        std::fs::write(root.path().join(format!("f{i}")), b"").unwrap();
+    }
+    let mut scan = disk_scan(
+        root.path(),
+        ScanOptions { streaming: true, entries_per_lease: 2, entries_per_directory: 5, ..follow() },
+    );
+    let events = drain(&mut scan);
+    assert_eq!(entries(&events).len(), 5, "root plus two completed chunks survive the later limit");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ScanEvent::Unlisted { failure: ScanFailure::ResourceLimited(limited), .. }
+            if limited.limit == ResourceLimit::EntriesPerDirectory
+    )));
+}
+
+#[test]
+fn deep_streaming_retention_respects_the_host_memory_limit_and_cleans_up() {
+    let root = tempfile::tempdir().unwrap();
+    let mut path = root.path().to_path_buf();
+    for _ in 0..40 {
+        path.push("nested");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sibling"), b"").unwrap();
+    }
+    let ceiling = 1024;
+    let governor = HostGovernor::independent(&HostConfig {
+        accounted_memory_ceiling: ceiling,
+        in_flight_listing_bytes: ceiling,
+        foreground_duty: 1.0,
+        domain_foreground_duty: 1.0,
+        ..Default::default()
+    });
+    let mut scan = Scan::open_outside_host_governor(
+        Arc::new(tree_fucker::std_fs::StdFileSystem::new()),
+        root.path().to_path_buf(),
+        Arc::new(LoadAll),
+        ScanOptions { streaming: true, entries_per_lease: 1, ceiling: Duration::MAX, ..follow() },
+        governor.clone(),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    let mut seen = 0;
+    let mut limited = false;
+    for result in scan.by_ref() {
+        match result {
+            Ok(ScanEvent::Entry(_)) => seen += 1,
+            Err(Error::ResourceLimited(limit)) => {
+                assert_eq!(limit.limit, ResourceLimit::AccountedMemory);
+                limited = true;
+            }
+            Ok(ScanEvent::Unlisted { failure: ScanFailure::ResourceLimited(limit), .. }) => {
+                assert_eq!(limit.limit, ResourceLimit::ListingBytes);
+                limited = true;
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+    assert!(seen > 1 && seen < 81);
+    assert!(limited, "a deep active descent must terminate at the explicit host bound");
+    assert!(scan.stats().peak_buffered_bytes <= ceiling);
+    assert!(governor.grants().is_empty());
+    assert_eq!(governor.view(MonotonicTime(Duration::from_secs(1))).accounted_memory, 0);
+}
+
+#[test]
+fn dropping_between_streaming_chunks_discards_the_session_and_memory() {
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..100 {
+        std::fs::write(root.path().join(i.to_string()), b"").unwrap();
+    }
+    let governor = HostGovernor::independent(&HostConfig::default());
+    let mut scan = Scan::open_outside_host_governor(
+        Arc::new(tree_fucker::std_fs::StdFileSystem::new()),
+        root.path().to_path_buf(),
+        Arc::new(LoadAll),
+        ScanOptions { streaming: true, entries_per_lease: 1, anchors: 1, ..follow() },
+        governor.clone(),
+        Arc::new(SystemClock),
+    )
+    .unwrap()
+    .with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap());
+    scan.next().unwrap().unwrap();
+    let ScanEvent::Entry(entry) = scan.next().unwrap().unwrap() else { panic!("entry") };
+    assert_eq!(scan.stats().entries_enumerated, 1);
+    assert!(scan.stats().buffered_bytes > 0);
+    let cancellation = scan.cancellation();
+    drop(scan);
+    // The consumer owns its observation independently of the discarded cursor.
+    assert_eq!(entry.path.depth(), 1);
+    assert!(cancellation.is_cancelled());
+    assert!(governor.grants().is_empty());
+    assert_eq!(governor.view(MonotonicTime(Duration::from_secs(1))).accounted_memory, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn required_streaming_anchors_survive_rename_and_share_one_budget_slot() {
+    use rustix::fs::{AtFlags, statat};
+    use tree_fucker::std_fs::DirectoryAnchor;
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..20 {
+        std::fs::write(root.join(format!("f{i}")), b"").unwrap();
+    }
+    let mut scan = disk_scan(
+        &root,
+        ScanOptions {
+            streaming: true,
+            entries_per_lease: 1,
+            anchors: 1,
+            anchor_policy: tree_fucker::AnchorPolicy::Required,
+            ..follow()
+        },
+    );
+    scan.next().unwrap().unwrap();
+    let ScanEvent::Entry(first) = scan.next().unwrap().unwrap() else { panic!("entry") };
+    std::fs::rename(&root, parent.path().join("moved")).unwrap();
+    let mut held = vec![first];
+    for event in scan.by_ref() {
+        let ScanEvent::Entry(entry) = event.unwrap() else { panic!("no fallback") };
+        held.push(entry);
+    }
+    assert_eq!(held.len(), 20);
+    assert_eq!(scan.stats().anchors_peak, 1);
+    for entry in &held {
+        let anchor = entry.anchor.as_ref().unwrap().get::<DirectoryAnchor>().unwrap();
+        statat(anchor, entry.path.name().unwrap(), AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    }
+    drop(held);
+    assert_eq!(scan.stats().anchors_live, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn required_anchor_exhaustion_reports_the_subtree_without_unanchored_children() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("child")).unwrap();
+    std::fs::write(root.path().join("child/file"), b"").unwrap();
+    let mut scan = disk_scan(
+        root.path(),
+        ScanOptions { anchors: 1, anchor_policy: tree_fucker::AnchorPolicy::Required, ..follow() },
+    );
+    let events = drain(&mut scan);
+    assert_eq!(entries(&events).len(), 2);
+    assert!(events.iter().any(|event| matches!(event,
+        ScanEvent::Unlisted { failure: ScanFailure::ResourceLimited(limited), .. }
+            if limited.limit == ResourceLimit::Anchors && limited.configured == 1 && limited.observed == 2
+    )));
+}
+
+#[test]
+fn lazy_reads_are_admitted_on_demand_and_release_on_panic_or_cancellation() {
+    let Opened { mut scan, governor, clock } = open(fixture(), follow());
+    let ScanEvent::Entry(entry) = scan.next().unwrap().unwrap() else { panic!("root") };
+    let before = scan.stats().metadata_operations;
+    let result = scan
+        .read(&entry, |_| {
+            assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+            Ok(42)
+        })
+        .unwrap();
+    assert_eq!(result, 42);
+    assert_eq!(scan.stats().metadata_operations, before + 1);
+    assert!(governor.grants().is_empty());
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(), Error> = scan.read(&entry, |_| {
+            clock.advance(Duration::from_secs(60));
+            panic!("adapter read");
+        });
+    }));
+    assert!(panicked.is_err());
+    assert!(governor.grants().is_empty());
+    assert!(scan.stats().admitted >= Duration::from_secs(60), "unwinding cannot erase physical cost");
+    scan.cancellation().cancel();
+    assert_eq!(
+        scan.read(&entry, |_| -> Result<(), FsError> { panic!("cancelled before admission") }),
+        Err(Error::Cancelled)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_query_can_read_only_selected_metadata_through_the_original_anchor() {
+    use rustix::fs::{AtFlags, statat};
+    use tree_fucker::std_fs::DirectoryAnchor;
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("selected"), b"abc").unwrap();
+    let mut scan = disk_scan(
+        &root,
+        ScanOptions {
+            streaming: true,
+            anchors: 1,
+            anchor_policy: tree_fucker::AnchorPolicy::Required,
+            fields: MetadataFields::NONE,
+            ..follow()
+        },
+    );
+    scan.next().unwrap().unwrap();
+    let ScanEvent::Entry(entry) = scan.next().unwrap().unwrap() else { panic!("file") };
+    assert_eq!(scan.stats().metadata_operations, 0, "a path-only row performs no lazy read");
+    std::fs::rename(&root, parent.path().join("moved")).unwrap();
+    let size = scan
+        .read(&entry, |entry| {
+            let anchor = entry.anchor.as_ref().unwrap().get::<DirectoryAnchor>().unwrap();
+            statat(anchor, entry.path.name().unwrap(), AtFlags::SYMLINK_NOFOLLOW)
+                .map(|stat| stat.st_size)
+                .map_err(|error| FsError::from(std::io::Error::from(error)))
+        })
+        .unwrap();
+    assert_eq!(size, 3);
+    assert_eq!(scan.stats().metadata_operations, 1);
+    assert!(scan.next().is_none());
+}
+
+#[test]
+fn bounded_command_cost_matches_the_governor_without_double_reservations() {
+    let Opened { scan, governor, clock } = open(fixture(), ScanOptions { ceiling: Duration::MAX, ..follow() });
+    let mut scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap());
+    drain(&mut scan);
+    assert_eq!(scan.stats().admitted, governor.view(now(&governor, &clock)).charged);
+}
+
+#[test]
+fn bounded_resolution_reserves_only_the_resolution_operation() {
+    let fs = fixture();
+    fs.report_inline_domains(false);
+    let governor = HostGovernor::independent(&HostConfig::default());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observer = observed.clone();
+    let host = governor.clone();
+    let timed = Arc::new(Timed {
+        inner: fs.clone(),
+        clock: ManualClock::new(),
+        on_resolve: Some(Arc::new(move || {
+            let grant = host.grants().into_iter().next().expect("admitted resolution");
+            observer.lock().unwrap().push((grant.required, grant.operations, grant.listing));
+        })),
+    });
+    let mut scan = Scan::open_outside_host_governor(
+        timed.clone(),
+        fs.root().to_path_buf(),
+        Arc::new(LoadAll),
+        follow(),
+        governor,
+        timed.clock.clone(),
+    )
+    .unwrap()
+    .with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap());
+    drain(&mut scan);
+    let observed = observed.lock().unwrap();
+    assert!(observed.len() > 1, "root plus child domain resolution");
+    assert!(
+        observed.iter().all(|&(reads, operations, listing)| reads == 1 && operations == 0 && !listing),
+        "{observed:?}"
+    );
+}
+
 struct ManualClock {
     start: Instant,
     offset: Mutex<Duration>,
@@ -53,6 +376,7 @@ impl Clock for ManualClock {
 struct Timed {
     inner: Arc<FakeFileSystem>,
     clock: Arc<ManualClock>,
+    on_resolve: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct TimedSession {
@@ -88,6 +412,9 @@ impl FileSystem for Timed {
         path: &RelativePath,
         parent: Option<&ProbeResult>,
     ) -> Result<ProbeResult, FsError> {
+        if let Some(observe) = &self.on_resolve {
+            observe();
+        }
         self.clock.advance(self.inner.domain_resolution_cost(path));
         self.inner.resolve_domain(root, path, parent)
     }
@@ -155,7 +482,7 @@ struct Opened {
 fn open_with(fs: Arc<FakeFileSystem>, policy: Arc<dyn ScanPolicy>, options: ScanOptions, host: HostConfig) -> Opened {
     let governor = HostGovernor::independent(&host);
     let clock = ManualClock::new();
-    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone() });
+    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None });
     let scan = Scan::open_outside_host_governor(
         timed,
         fs.root().to_path_buf(),
@@ -393,7 +720,7 @@ fn two_scans_share_one_envelope_and_one_domain_account() {
     let governor = HostGovernor::independent(&HostConfig::default());
     let clock = ManualClock::new();
     let open = || {
-        let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone() });
+        let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None });
         Scan::open_outside_host_governor(
             timed,
             fs.root().to_path_buf(),
@@ -508,7 +835,7 @@ fn a_quarantined_domain_is_reported_and_healthy_domains_continue() {
     governor.try_start(stuck, now(&governor, &clock)).expect("start the stuck call");
     governor.mark_stuck(stuck, now(&governor, &clock));
 
-    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone() });
+    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None });
     let mut scan = Scan::open_outside_host_governor(
         timed,
         fs.root().to_path_buf(),
@@ -1073,6 +1400,7 @@ fn an_adapter_panic_releases_its_grant_and_reserved_buffer() {
         scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap()).collect::<Result<Vec<_>, _>>();
     assert!(matches!(result, Err(Error::WorkerLost)));
     eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+    assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
 }
 
 #[test]

@@ -316,6 +316,19 @@ pub enum Continuation {
 
 pub trait ListingSession: Send {
     fn resume(self: Box<Self>, lease: Lease) -> (Continuation, SessionCost);
+
+    /// Transfer entries buffered by a suspended lease to a one-shot consumer.
+    ///
+    /// The default keeps the complete-listing contract. Implementations which
+    /// support draining must preserve their total entry ceiling and return the
+    /// same anchor across chunks. This method must perform no filesystem work.
+    fn take_chunk(&mut self) -> Option<DirectoryListing> {
+        None
+    }
+
+    fn supports_chunks(&self) -> bool {
+        false
+    }
 }
 
 pub fn list_directory(

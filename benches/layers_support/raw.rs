@@ -5,14 +5,20 @@ use std::time::{Duration, Instant};
 
 use tree_fucker::scan::{Scan, ScanEvent, ScanOptions};
 
+pub fn filesystem() -> Arc<dyn tree_fucker::FileSystem> {
+    let filesystem = tree_fucker::std_fs::StdFileSystem::new();
+    if super::delayed::delay().is_zero() { Arc::new(filesystem) } else { Arc::new(super::delayed::Delayed(filesystem)) }
+}
+
 pub fn scan(root: &Path, mode: &str, visit: &mut dyn FnMut(&Path), verify: bool) -> (usize, Option<Duration>) {
     let start = Instant::now();
     let mut first = None;
     let mut scan = Scan::open(
-        Arc::new(tree_fucker::std_fs::StdFileSystem::new()),
+        filesystem(),
         root.to_path_buf(),
         Arc::new(tree_fucker::LoadAll),
         ScanOptions {
+            streaming: mode == "scan-streaming",
             anchors: if mode == "scan-anchors" { 1024 } else { 0 },
             crossing: tree_fucker::domain::DomainCrossing::Follow,
             ceiling: Duration::MAX,

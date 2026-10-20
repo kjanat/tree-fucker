@@ -48,6 +48,14 @@ impl Clock for SystemClock {
     }
 }
 
+/// Whether non-root observations may be yielded without a retained anchor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnchorPolicy {
+    #[default]
+    Optional,
+    Required,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanOptions {
     pub crossing: DomainCrossing,
@@ -57,6 +65,10 @@ pub struct ScanOptions {
     pub operations_per_lease: usize,
     pub ceiling: Duration,
     pub anchors: usize,
+    pub anchor_policy: AnchorPolicy,
+    /// Yield bounded listing chunks before the directory is complete.
+    /// Requires a chunk-capable policy and filesystem session.
+    pub streaming: bool,
 }
 
 impl Default for ScanOptions {
@@ -70,6 +82,8 @@ impl Default for ScanOptions {
             operations_per_lease: config.operations_per_lease,
             ceiling: config.foreground_ceiling_per_command,
             anchors: 0,
+            anchor_policy: AnchorPolicy::Optional,
+            streaming: false,
         }
     }
 }
@@ -244,7 +258,19 @@ struct Frame {
 
 enum Node {
     List(Target),
+    Resume(Box<Listing>),
     Children(Box<Frame>),
+}
+
+struct Listing {
+    path: RelativePath,
+    context: PolicyContext,
+    located: Arc<Located>,
+    id: GrantId,
+    carried: Option<Granted>,
+    session: Box<dyn ListingSession>,
+    lease: u32,
+    starved: bool,
 }
 
 struct Need {
@@ -298,7 +324,7 @@ pub struct Scan {
     in_flight_bytes: u64,
     reported: (u64, u64),
     stats: ScanStats,
-    reserved: Duration,
+    bootstrap_charged: Duration,
     listing_executor: Option<ListingExecutor>,
     accounting: Option<Arc<ScanAccounting>>,
 }
@@ -378,6 +404,9 @@ impl Scan {
         clock: Arc<dyn Clock>,
     ) -> Result<Scan> {
         options.validate().map_err(Error::InvalidConfig)?;
+        if options.streaming && !policy.supports_chunks() {
+            return Err(Error::InvalidConfig("streaming requires a chunk-capable scan policy".into()));
+        }
         governor.limits().validate().map_err(Error::InvalidConfig)?;
         let base = governor.base(clock.now());
         let number = governor.next_tree();
@@ -400,7 +429,7 @@ impl Scan {
             in_flight_bytes: 0,
             reported: (0, 0),
             stats: ScanStats::default(),
-            reserved: Duration::ZERO,
+            bootstrap_charged: Duration::ZERO,
             listing_executor: None,
             accounting: None,
         };
@@ -452,6 +481,38 @@ impl Scan {
         self.cancel.clone()
     }
 
+    /// Perform one lazy, adapter-specific read under this scan's governor.
+    ///
+    /// Invoke this before advancing past the end of the scan. The callback
+    /// receives the original observation, including its retained anchor. It
+    /// must perform at most one physical read and must not reacquire this
+    /// scan. Raw reads made outside this method are outside scan accounting.
+    /// The callback runs inline; cancellation cannot interrupt a kernel call.
+    pub fn read<T>(
+        &mut self,
+        entry: &ScanEntry,
+        read: impl FnOnce(&ScanEntry) -> std::result::Result<T, FsError>,
+    ) -> Result<T> {
+        if self.finished {
+            return Err(Error::Shutdown);
+        }
+        // Keep governor charges authoritative even if a consumer catches a
+        // panic from its callback and continues using the scan.
+        self.accounting
+            .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
+        let id = self.next_grant();
+        let need = Need { reads: 1, operations: 1, lease: 0, domain: Some(entry.domain), listing: false };
+        let granted = match self.admit(id, &entry.path.path(), need)? {
+            Admission::Granted(granted) => granted,
+            Admission::Quarantined(_) => return Err(Error::Stuck),
+        };
+        self.stats.metadata_operations += 1;
+        let result = read(entry);
+        self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(entry.domain));
+        self.record(Some(entry.domain), result.is_err());
+        result.map_err(Error::from)
+    }
+
     /// Execute subsequent listing leases on a bounded, reusable worker pool.
     ///
     /// Bootstrap, domain resolution, and enrichment remain inline. A listing
@@ -476,7 +537,7 @@ impl Scan {
 
     fn admitted_cost(&self) -> Duration {
         if self.accounting.is_some() {
-            self.stats.admitted.max(self.reserved.saturating_add(self.governor.charged_by_tree(self.number)))
+            self.stats.admitted.max(self.bootstrap_charged.saturating_add(self.governor.charged_by_tree(self.number)))
         } else {
             self.stats.admitted
         }
@@ -567,7 +628,9 @@ impl Scan {
             }
         };
         self.stats.admitted += admitted.cost;
-        self.reserved += admitted.cost;
+        if id.tree().is_none() {
+            self.bootstrap_charged += admitted.cost;
+        }
         self.stats.grants += 1;
         let held = Held { id, governor: self.governor.clone(), clock: self.clock.clone(), base: self.base };
         loop {
@@ -627,9 +690,10 @@ impl Scan {
             Admission::Quarantined(_) => return Err(Error::Stuck),
         };
         let outcome = work(self.filesystem.as_ref());
+        self.governor.account(self.now());
         let overshoot = self.governor.overshoot_of(id);
         self.stats.admitted += overshoot;
-        self.reserved += overshoot;
+        self.bootstrap_charged += overshoot;
         outcome.map(|value| (value, granted.held)).map_err(Error::from)
     }
 
@@ -687,8 +751,15 @@ impl Scan {
             Site::Located(located) => return Ok(Some((located, None))),
             Site::Probed { probe, parent } => (*probe, parent, None),
             Site::Beneath(parent) => {
-                let operations = self.lease_operations(&parent.probe, false);
-                let need = Need { reads: 2, operations, lease: 0, domain: Some(parent.domain), listing: true };
+                let bounded = self.listing_executor.is_some();
+                let operations = if bounded { 0 } else { self.lease_operations(&parent.probe, false) };
+                let need = Need {
+                    reads: if bounded { 1 } else { 2 },
+                    operations,
+                    lease: 0,
+                    domain: Some(parent.domain),
+                    listing: !bounded,
+                };
                 let granted = match self.admit(id, path, need)? {
                     Admission::Granted(granted) => granted,
                     Admission::Quarantined(domain) => {
@@ -768,7 +839,20 @@ impl Scan {
             if cancel.is_cancelled() {
                 return;
             }
-            let (continuation, cost) = session.resume(lease);
+            let (continuation, cost) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.resume(lease)
+            })) {
+                Ok(result) => result,
+                Err(panic) => {
+                    let held = &memory.grant.as_ref().expect("physical grant").held;
+                    let now = MonotonicTime(held.clock.now().saturating_duration_since(held.base));
+                    held.governor.charge_surcharge(Some(domain), WorkOrigin::Foreground, now);
+                    held.governor.record_outcome(Some(domain), true, now);
+                    // The pool catches this unwind after resources are dropped.
+                    // Accounting also happens if the waiter already left.
+                    std::panic::resume_unwind(panic);
+                }
+            };
             let held = &memory.grant.as_ref().expect("physical grant").held;
             let now = MonotonicTime(held.clock.now().saturating_duration_since(held.base));
             let governor = &held.governor;
@@ -793,6 +877,11 @@ impl Scan {
             self.check_cancelled()?;
             match receiver.recv_timeout(executor::CHECK_INTERVAL) {
                 Ok((continuation, cost, overshoot, memory)) => {
+                    self.governor
+                        .try_return_scan_memory(memory.number, self.number, cost.bytes)
+                        .map_err(Error::ResourceLimited)?;
+                    self.in_flight_bytes = cost.bytes;
+                    self.reported = (self.stats.buffered_bytes, cost.bytes);
                     self.stats.admitted += overshoot;
                     return Ok(Some((continuation, cost, memory)));
                 }
@@ -818,13 +907,14 @@ impl Scan {
 
     fn listing_bytes(&self) -> u64 {
         let limits = self.governor.limits();
-        if self.listing_executor.is_some() {
+        let allowance = if self.listing_executor.is_some() {
             // A detached call can retain its whole allowance. Leave room for
             // other physical slots instead of reserving the host's entire pool.
             (limits.in_flight_listing_bytes / limits.maximum_in_flight as u64).max(1)
         } else {
             limits.in_flight_listing_bytes
-        }
+        };
+        allowance.min(limits.accounted_memory_ceiling.saturating_sub(self.stats.buffered_bytes))
     }
 
     fn list(&mut self, target: Target) -> Result<()> {
@@ -843,12 +933,39 @@ impl Scan {
             self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(domain));
         }
         let anchored = self.anchor_room();
+        if !anchored && self.options.anchor_policy == AnchorPolicy::Required {
+            self.unlisted(
+                path,
+                ScanFailure::ResourceLimited(ResourceLimited {
+                    limit: ResourceLimit::Anchors,
+                    configured: self.options.anchors as u64,
+                    observed: self.live_anchors.load(Ordering::SeqCst) as u64 + 1,
+                    domain: Some(domain),
+                }),
+            );
+            return Ok(());
+        }
         let ceilings = Ceilings { entries: self.options.entries_per_directory, bytes: self.listing_bytes() };
+        if ceilings.bytes == 0 {
+            return Err(self.limited(
+                ResourceLimit::AccountedMemory,
+                self.governor.memory_ceiling(),
+                self.stats.buffered_bytes.saturating_add(1),
+                Some(domain),
+            ));
+        }
         let at = ListingAt { beneath: beneath.as_ref(), anchored };
-        let mut session: Box<dyn ListingSession> =
+        let session: Box<dyn ListingSession> =
             self.filesystem.open_listing_at(&self.root, &path, at, ceilings, self.cancel.clone());
-        let mut lease = 0;
-        let mut starved = false;
+        if self.options.streaming && !session.supports_chunks() {
+            return Err(Error::InvalidConfig("streaming requires a chunk-capable listing session".into()));
+        }
+        self.resume_listing(Listing { path, context, located, id, carried, session, lease: 0, starved: false })
+    }
+
+    fn resume_listing(&mut self, listing: Listing) -> Result<()> {
+        let Listing { path, context, located, id, mut carried, mut session, mut lease, mut starved } = listing;
+        let domain = located.domain;
         let outcome = loop {
             let worker = if let Some(executor) = &self.listing_executor {
                 match executor.acquire(&self.cancel, || {
@@ -908,9 +1025,30 @@ impl Scan {
             self.report_memory();
             drop(memory);
             match continuation {
-                Continuation::Suspended(next) => {
+                Continuation::Suspended(mut next) => {
                     starved = cost.entries_enumerated == 0;
                     lease += 1;
+                    if self.options.streaming
+                        && let Some(chunk) = next.take_chunk()
+                    {
+                        self.in_flight_bytes = 0;
+                        let resume = Node::Resume(Box::new(Listing {
+                            path: path.clone(),
+                            context: context.clone(),
+                            located: located.clone(),
+                            id,
+                            carried: None,
+                            session: next,
+                            lease,
+                            starved,
+                        }));
+                        let before = self.stack.len();
+                        self.accept_listing(path, context, located, chunk)?;
+                        if self.stack.len() > before {
+                            self.stack.insert(before, resume);
+                        }
+                        return Ok(());
+                    }
                     session = next;
                 }
                 Continuation::Finished(outcome) => break (outcome, cost.bytes),
@@ -921,39 +1059,7 @@ impl Scan {
         let now = self.now();
         self.governor.record_bytes(Some(domain), bytes, now);
         match outcome {
-            SessionOutcome::Complete(mut listing) => {
-                self.record(Some(domain), false);
-                let anchor = listing.anchor.take();
-                if let Some(anchor) = &anchor {
-                    anchor.count_in(&self.live_anchors);
-                    let live = self.live_anchors.load(Ordering::SeqCst);
-                    self.stats.anchors_peak = self.stats.anchors_peak.max(live);
-                }
-                let child_context = self.policy.child_context(&context, &path, &listing);
-                let supplied = listing.supplied_fields.intersect(self.options.fields);
-                let missing = self.options.fields.without(listing.supplied_fields);
-                let enriched = match missing.any() && !listing.entries.is_empty() {
-                    true => {
-                        let names = listing.entries.iter().map(|entry| entry.name.clone()).collect();
-                        self.enrich(&path, domain, names, missing)?
-                    }
-                    false => HashMap::new(),
-                };
-                let bytes = listing.entries.iter().map(|entry| entry_bytes(&entry.name)).sum::<u64>();
-                self.stats.buffered_bytes = self.stats.buffered_bytes.saturating_add(bytes);
-                self.stats.peak_buffered_bytes = self.stats.peak_buffered_bytes.max(self.stats.buffered_bytes);
-                self.report_memory();
-                self.stack.push(Node::Children(Box::new(Frame {
-                    path,
-                    context: child_context,
-                    located,
-                    anchor,
-                    children: listing.entries.into_iter(),
-                    supplied,
-                    enriched,
-                    bytes,
-                })));
-            }
+            SessionOutcome::Complete(listing) => self.accept_listing(path, context, located, listing)?,
             SessionOutcome::Cancelled => {
                 self.record(Some(domain), true);
                 self.report_memory();
@@ -974,6 +1080,63 @@ impl Scan {
                 self.unlisted(path, ScanFailure::Fs(error));
             }
         }
+        Ok(())
+    }
+
+    fn accept_listing(
+        &mut self,
+        path: RelativePath,
+        context: PolicyContext,
+        located: Arc<Located>,
+        mut listing: crate::fs::DirectoryListing,
+    ) -> Result<()> {
+        let domain = located.domain;
+        self.record(Some(domain), false);
+        let anchor = listing.anchor.take();
+        if anchor.is_none() && self.options.anchor_policy == AnchorPolicy::Required {
+            self.report_memory();
+            self.unlisted(
+                path,
+                ScanFailure::ResourceLimited(ResourceLimited {
+                    limit: ResourceLimit::Anchors,
+                    configured: 0,
+                    observed: 1,
+                    domain: Some(domain),
+                }),
+            );
+            return Ok(());
+        }
+        if let Some(anchor) = &anchor {
+            anchor.count_in(&self.live_anchors);
+            let live = self.live_anchors.load(Ordering::SeqCst);
+            self.stats.anchors_peak = self.stats.anchors_peak.max(live);
+        }
+        let child_context = self.policy.child_context(&context, &path, &listing);
+        let supplied = listing.supplied_fields.intersect(self.options.fields);
+        let missing = self.options.fields.without(listing.supplied_fields);
+        let bytes = listing.entries.iter().map(|entry| entry_bytes(&entry.name)).sum::<u64>();
+        let retained = self.stats.buffered_bytes.saturating_add(bytes);
+        self.governor.try_retain_scan_memory(self.number, retained).map_err(Error::ResourceLimited)?;
+        self.stats.buffered_bytes = retained;
+        self.stats.peak_buffered_bytes = self.stats.peak_buffered_bytes.max(retained);
+        self.reported = (retained, 0);
+        let enriched = match missing.any() && !listing.entries.is_empty() {
+            true => {
+                let names = listing.entries.iter().map(|entry| entry.name.clone()).collect();
+                self.enrich(&path, domain, names, missing)?
+            }
+            false => HashMap::new(),
+        };
+        self.stack.push(Node::Children(Box::new(Frame {
+            path,
+            context: child_context,
+            located,
+            anchor,
+            children: listing.entries.into_iter(),
+            supplied,
+            enriched,
+            bytes,
+        })));
         Ok(())
     }
 
@@ -1118,6 +1281,7 @@ impl Scan {
             };
             match node {
                 Node::List(target) => self.list(target)?,
+                Node::Resume(listing) => self.resume_listing(*listing)?,
                 Node::Children(mut frame) => match frame.children.next() {
                     Some(child) => {
                         let (event, target) = self.child(&mut frame, child);

@@ -69,8 +69,15 @@ pub fn main(allocations: bool) {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/benchmarks");
         std::fs::create_dir_all(&base).unwrap();
         let fixture = tempfile::Builder::new().prefix("layers-").tempdir_in(base).unwrap();
+        let shape = std::env::var("BENCH_FIXTURE_SHAPE").unwrap_or_else(|_| "balanced".into());
+        assert!(["balanced", "wide", "deep"].contains(&shape.as_str()), "unknown fixture shape");
+        eprintln!("fixture_shape={shape} listing_delay_us={}", super::delayed::delay().as_micros());
         for i in 0..files {
-            let dir = fixture.path().join(format!("group-{}", i % 10));
+            let dir = match shape.as_str() {
+                "wide" => fixture.path().to_path_buf(),
+                "deep" => (0..i % 64).fold(fixture.path().to_path_buf(), |path, _| path.join("d")),
+                _ => fixture.path().join(format!("group-{}", i % 10)),
+            };
             std::fs::create_dir_all(&dir).unwrap();
             let file = std::fs::File::create(dir.join(format!("quoted-'ü-{i}.rs"))).unwrap();
             file.set_len(if i % 7 == 0 { 1_000_001 } else { 64 }).unwrap();
@@ -78,7 +85,11 @@ pub fn main(allocations: bool) {
         std::fs::create_dir(fixture.path().join(".hidden")).unwrap();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("group-0", fixture.path().join("link-dir")).unwrap();
+            let directory_target = match shape.as_str() {
+                "wide" | "deep" => ".hidden",
+                _ => "group-0",
+            };
+            std::os::unix::fs::symlink(directory_target, fixture.path().join("link-dir")).unwrap();
             std::os::unix::fs::symlink("missing", fixture.path().join("dangling")).unwrap();
         }
         Some(fixture)
@@ -95,6 +106,8 @@ pub fn main(allocations: bool) {
     let _governor = tree_fucker::HostGovernor::install(tree_fucker::HostConfig {
         foreground_duty: 1.0,
         domain_foreground_duty: 1.0,
+        background_duty: 1.0,
+        domain_background_duty: 1.0,
         ..Default::default()
     })
     .unwrap();

@@ -1516,6 +1516,52 @@ impl HostGovernor {
         Ok(())
     }
 
+    pub(crate) fn try_retain_scan_memory(&self, tree: TreeNumber, bytes: u64) -> Result<(), ResourceLimited> {
+        let mut governor = guard(&self.inner);
+        let (snapshot, in_flight) = governor.memory.get(&tree).copied().unwrap_or((0, 0));
+        let observed = governor.memory_total.saturating_sub(snapshot).saturating_sub(in_flight).saturating_add(bytes);
+        let configured = governor.memory_ceiling();
+        if observed > configured {
+            return Err(ResourceLimited { limit: ResourceLimit::AccountedMemory, configured, observed, domain: None });
+        }
+        governor.report_memory(tree, bytes, 0);
+        drop(governor);
+        self.changed();
+        Ok(())
+    }
+
+    pub(crate) fn try_return_scan_memory(
+        &self,
+        reservation: TreeNumber,
+        scan: TreeNumber,
+        bytes: u64,
+    ) -> Result<(), ResourceLimited> {
+        let mut governor = guard(&self.inner);
+        let (_, reserved) = governor.memory.get(&reservation).copied().unwrap_or((0, 0));
+        let (retained, previous) = governor.memory.get(&scan).copied().unwrap_or((0, 0));
+        for (limit, configured, observed) in [
+            (
+                ResourceLimit::AccountedMemory,
+                governor.memory_ceiling(),
+                governor.memory_total.saturating_sub(reserved).saturating_sub(previous).saturating_add(bytes),
+            ),
+            (
+                ResourceLimit::InFlightBytes,
+                governor.config.in_flight_listing_bytes,
+                governor.in_flight_total.saturating_sub(reserved).saturating_sub(previous).saturating_add(bytes),
+            ),
+        ] {
+            if observed > configured {
+                return Err(ResourceLimited { limit, configured, observed, domain: None });
+            }
+        }
+        governor.report_memory(reservation, 0, 0);
+        governor.report_memory(scan, retained, bytes);
+        drop(governor);
+        self.changed();
+        Ok(())
+    }
+
     pub fn forget_tree(&self, tree: TreeNumber) {
         guard(&self.inner).forget_tree(tree);
         self.changed();
@@ -1676,5 +1722,34 @@ impl HostGovernor {
 
     pub fn view(&self, now: MonotonicTime) -> GovernorView {
         guard(&self.inner).view(now)
+    }
+}
+
+#[cfg(test)]
+mod scan_memory_tests {
+    use super::*;
+
+    #[test]
+    fn returned_buffers_leave_real_capacity_available_before_reservation_cleanup() {
+        let governor = HostGovernor::independent(&HostConfig {
+            accounted_memory_ceiling: 1000,
+            in_flight_listing_bytes: 1000,
+            ..Default::default()
+        });
+        let scan = governor.next_tree();
+        let reservation = governor.next_tree();
+        let other = governor.next_tree();
+        let other_reservation = governor.next_tree();
+        governor.try_reserve_scan_memory(scan, reservation, 800).unwrap();
+        governor.try_return_scan_memory(reservation, scan, 400).unwrap();
+        // The returned resource owner is still alive. Another scan must be
+        // able to reserve all genuinely free capacity before it is dropped.
+        governor.try_reserve_scan_memory(other, other_reservation, 600).unwrap();
+        assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
+        governor.forget_tree(reservation);
+        assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
+        // Reject an adapter's oversized result without losing either charge.
+        assert!(governor.try_return_scan_memory(other_reservation, other, 601).is_err());
+        assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
     }
 }
