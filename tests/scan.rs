@@ -1616,3 +1616,91 @@ fn detached_listing_cursors_keep_their_anchor_slots() {
     worker.join().unwrap();
     eventually(|| scan.stats().anchors_live == 0 && governor.grants().is_empty());
 }
+
+struct CapacityWaitClock {
+    inner: Arc<ManualClock>,
+    waiting: std::sync::mpsc::SyncSender<()>,
+}
+
+impl Clock for CapacityWaitClock {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+    fn wait_for_change(&self, governor: &HostGovernor, seen: u64, timeout: Duration) {
+        let _ = self.waiting.try_send(());
+        governor.wait_for_change(seen, timeout.min(Duration::from_millis(10)));
+    }
+}
+
+#[test]
+fn waiting_to_start_a_grant_enforces_the_detached_calls_command_ceiling() {
+    let fs = fixture();
+    fs.set_domain("a", MEDIA);
+    // This fresh healthy domain has no prior listing-byte estimate, so its
+    // admission can succeed while the detached listing holds the byte pool.
+    fs.set_domain("c", DomainId::new(8));
+    let (entered, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(ListingGate { entered, released: Mutex::new(false), changed: std::sync::Condvar::new() });
+    let _release = ReleaseListing(gate.clone());
+    let governor = HostGovernor::independent(&HostConfig {
+        maximum_in_flight: 1,
+        per_domain_concurrency: 1,
+        foreground_duty: 1.0,
+        domain_foreground_duty: 1.0,
+        ..Default::default()
+    });
+    let clock = ManualClock::new();
+    let (waiting, waits) = std::sync::mpsc::sync_channel(1);
+    let scan = Scan::open_outside_host_governor(
+        Arc::new(BlockedListing { inner: fs.clone(), gate: gate.clone() }),
+        fs.root().to_path_buf(),
+        Arc::new(LoadAll),
+        ScanOptions { ceiling: Duration::from_secs(60), ..follow() },
+        governor.clone(),
+        Arc::new(CapacityWaitClock { inner: clock.clone(), waiting }),
+    )
+    .unwrap();
+    let (done, results) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done.send(
+            scan.with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap()).collect::<Result<Vec<_>, _>>(),
+        )
+        .unwrap();
+    });
+    receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    clock.advance(Duration::from_secs(31));
+    waits.recv_timeout(Duration::from_secs(5)).expect("post-admission capacity wait");
+    assert!(
+        governor.grants().iter().any(|grant| grant.path == path("c") && grant.started.is_none()),
+        "healthy sibling was admitted but cannot physically start"
+    );
+    clock.advance(Duration::from_secs(31));
+    assert!(matches!(results.recv_timeout(Duration::from_secs(5)).expect("capacity wait must enforce ceiling"),
+        Err(Error::ResourceLimited(limited)) if limited.limit == ResourceLimit::CommandWorkerTime));
+    worker.join().unwrap();
+    let grants = governor.grants();
+    assert_eq!(grants.len(), 1, "waiting grant is released; detached physical grant remains");
+    assert_eq!(grants[0].path, path("a"));
+    assert!(grants[0].started.is_some());
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    gate.release();
+    eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+}
+
+#[test]
+fn an_admitted_listing_can_start_at_exactly_the_command_ceiling() {
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.create_file("file", 1);
+    let Opened { mut scan, governor, .. } = open(fs.clone(), follow());
+    let ScanEvent::Entry(root) = scan.next().unwrap().unwrap() else { panic!("root") };
+    let ceiling = scan.stats().admitted + governor.cost_of(Some(root.domain), 1);
+    drop(scan);
+    let Opened { scan, .. } = open(fs, ScanOptions { ceiling, ..follow() });
+    let mut scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap());
+    let events = drain(&mut scan);
+    assert_eq!(paths(&events), vec![".", "file"]);
+    assert_eq!(scan.stats().admitted, ceiling, "the reservation already paid for this listing");
+}

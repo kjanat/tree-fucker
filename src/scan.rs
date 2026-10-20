@@ -641,6 +641,15 @@ impl Scan {
             self.check_cancelled()?;
             let seen = self.governor.changes();
             let now = self.now();
+            if self.accounting.is_some() {
+                self.governor.account(now);
+                // This grant's reservation is already charged and may fill
+                // the ceiling exactly. Abort only if continuing physical
+                // work has pushed the command beyond its admitted budget.
+                if self.admitted_cost() > self.options.ceiling {
+                    return Err(self.ceiling_reached());
+                }
+            }
             if self.governor.try_start(id, now).is_ok() {
                 break;
             }

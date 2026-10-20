@@ -1089,6 +1089,13 @@ Abstract
    work remains terminates with ResourceLimited naming CommandWorkerTime.
    Throttling delays a scan. It never truncates one.
 
+   After admission, a scan waiting for physical capacity MUST continue
+   accounting for detached calls. If their continuing work pushes the
+   command past its ceiling, the unstarted grant is released and the
+   scan terminates; running grants retain physical ownership. A grant
+   whose reservation exactly fills the ceiling may still start, because
+   that work has already been admitted and charged.
+
    Traversal is depth first. By default the scan lists a directory in
    full under Section 10.2, yields its children in enumeration order,
    and lists a child directory before its next sibling. Only Complete
