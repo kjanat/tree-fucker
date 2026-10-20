@@ -10,6 +10,9 @@ use crate::ids::{JobId, WatchReleaseId, WatchRequestId};
 use crate::path::RelativePath;
 use crate::update::{ResourceLimit, ResourceLimited, ThrottleCause};
 
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+mod shared;
+
 const LATENCY_HISTORY: usize = 32;
 const QUEUE_HISTORY: usize = 8;
 const TARGET_FACTOR: u32 = 2;
@@ -87,6 +90,9 @@ pub struct Grant {
     pub started: Option<MonotonicTime>,
     pub dispatched: Option<MonotonicTime>,
     pub stuck: bool,
+    /// A failure observed during this physical lease, including a rejected
+    /// result.
+    pub failed: bool,
     pub listing: bool,
     pub registration: bool,
     pub registration_took: Option<Duration>,
@@ -162,6 +168,73 @@ pub struct Admitted {
     pub operations: u32,
 }
 
+struct Preparation {
+    reservation: Reservation,
+    admitted: Admitted,
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+    estimate: Duration,
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+    physical: bool,
+}
+
+/// A provisional local budget reservation for composing admission authorities.
+///
+/// Dropping this value aborts preparation without charging work. It owns no
+/// physical capacity. Commit revalidates current policy and resource limits;
+/// only the returned admission may be used to request physical start.
+#[must_use = "dropping a preparation aborts its provisional reservation"]
+pub struct PreparedAdmission {
+    governor: HostGovernor,
+    id: GrantId,
+    admitted: Admitted,
+    armed: bool,
+}
+
+impl PreparedAdmission {
+    pub fn admitted(&self) -> Admitted {
+        self.admitted
+    }
+
+    /// Restrict a listing lease to the other authority's operation allowance.
+    ///
+    /// This does not increase a grant or release its held budget prematurely.
+    /// Commit computes the final charge using the reduced operation count.
+    pub fn limit_operations(&mut self, maximum: std::num::NonZeroU32) {
+        let mut governor = guard(&self.governor.inner);
+        let prepared = governor.prepared.get_mut(&self.id).expect("preparation owns its reservation");
+        prepared.reservation.operations = prepared.reservation.operations.min(maximum.get());
+        self.admitted.operations = self.admitted.operations.min(maximum.get());
+    }
+
+    /// Commit once, or abort if current limits no longer permit this work.
+    ///
+    /// The final operation count can be smaller than the prepared count when
+    /// estimates change. A caller composing authorities must reconcile that
+    /// count before either authority permits physical dispatch.
+    pub fn commit(mut self, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
+        let mut governor = guard(&self.governor.inner);
+        let mut prepared = governor.prepared.remove(&self.id).expect("preparation owns its reservation");
+        self.armed = false;
+        prepared.reservation.ceiling =
+            Some(prepared.reservation.ceiling.unwrap_or(Duration::MAX).min(prepared.admitted.cost));
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if self.governor.shared.is_some() {
+            drop(governor);
+            return self.governor.try_admit(prepared.reservation, now);
+        }
+        governor.try_admit(prepared.reservation, now)
+    }
+}
+
+impl Drop for PreparedAdmission {
+    fn drop(&mut self) {
+        if self.armed {
+            guard(&self.governor.inner).prepared.remove(&self.id);
+        }
+        self.governor.changed();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reported {
     pub blocking: Option<Duration>,
@@ -196,6 +269,9 @@ pub struct GovernorView {
     pub in_flight_bytes: u64,
     pub in_flight_bytes_ceiling: u64,
     pub reserved: Duration,
+    /// Reversible budget holds, separate from permanently admitted work.
+    pub prepared: Duration,
+    pub preparations: usize,
     pub charged: Duration,
     pub surcharged: Duration,
     pub reported_blocking: Duration,
@@ -492,6 +568,7 @@ pub struct Governor {
     stuck_threshold: Duration,
     surcharge: Duration,
     grants: BTreeMap<GrantId, Grant>,
+    prepared: BTreeMap<GrantId, Preparation>,
     failed_grants: BTreeSet<GrantId>,
     running: BTreeMap<Option<StorageDomainId>, usize>,
     stuck: BTreeMap<Option<StorageDomainId>, usize>,
@@ -534,6 +611,7 @@ impl Governor {
             stuck_threshold: config.stuck_threshold,
             surcharge: config.failure_surcharge,
             grants: BTreeMap::new(),
+            prepared: BTreeMap::new(),
             failed_grants: BTreeSet::new(),
             running: BTreeMap::new(),
             stuck: BTreeMap::new(),
@@ -805,7 +883,7 @@ impl Governor {
     }
 
     pub fn global_exhausted(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> bool {
-        let cost = nanos(self.cost_of(domain, 1));
+        let cost = nanos(self.cost_of(domain, 1)) + self.prepared_costs(domain, origin).0;
         match origin {
             WorkOrigin::Background => !self.global.affordable(cost),
             WorkOrigin::Foreground => !self.foreground.affordable(cost),
@@ -862,11 +940,19 @@ impl Governor {
                 WorkOrigin::Foreground => state.foreground.level,
             })
             .unwrap_or(global);
-        let mut level = global.min(local).min(nanos(self.capacity_for(domain, origin)));
+        let (global_held, domain_held) = self.prepared_costs(domain, origin);
+        let mut level = (global - global_held).min(local - domain_held).min(nanos(self.capacity_for(domain, origin)));
         if let Some(ceiling) = ceiling {
             level = level.min(nanos(ceiling));
         }
         level.max(0)
+    }
+
+    fn prepared_costs(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> (i128, i128) {
+        let held = self.prepared.values().filter(|prepared| prepared.reservation.origin == origin);
+        let global = held.clone().map(|prepared| nanos(prepared.admitted.cost)).sum();
+        let local = held.filter(|prepared| prepared.reservation.domain == domain).map(|p| nanos(p.admitted.cost)).sum();
+        (global, local)
     }
 
     fn permitted_operations(&self, estimate: Duration, required: u32, requested: u32, affordable: i128) -> u32 {
@@ -879,10 +965,13 @@ impl Governor {
         requested.min(room).max(1)
     }
 
-    pub fn try_admit(&mut self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
-        let Reservation { id, path, reads, registrations, operations, ceiling, lease, domain, origin, listing } =
-            reservation;
+    fn evaluate(&mut self, reservation: &Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
+        let Reservation { id, reads, registrations, operations, ceiling, domain, origin, listing, .. } = *reservation;
         self.account(now);
+        if self.grants.contains_key(&id) || self.prepared.contains_key(&id) {
+            self.deny(ThrottleCause::Concurrency, domain, Duration::ZERO, now);
+            return Err(ThrottleCause::Concurrency);
+        }
         if self.quarantined(domain) {
             self.deny(ThrottleCause::StuckWorker, domain, Duration::ZERO, now);
             return Err(ThrottleCause::StuckWorker);
@@ -913,10 +1002,67 @@ impl Governor {
         }
         let permitted = self.permitted_operations(estimate, required, operations, affordable);
         let cost = estimate.saturating_mul(required + permitted).min(capacity);
-        if !cleanup && domain.is_none() && self.bootstrap_outstanding + nanos(cost) > self.bootstrap_capacity {
+        let bootstrap_prepared: i128 = self
+            .prepared
+            .values()
+            .filter(|prepared| prepared.reservation.domain.is_none())
+            .map(|prepared| nanos(prepared.admitted.cost))
+            .sum();
+        if !cleanup
+            && domain.is_none()
+            && self.bootstrap_outstanding + bootstrap_prepared + nanos(cost) > self.bootstrap_capacity
+        {
             self.deny(ThrottleCause::DutyBudget, domain, cost, now);
             return Err(ThrottleCause::DutyBudget);
         }
+        Ok(Admitted { cost, operations: permitted })
+    }
+
+    fn try_prepare(&mut self, mut reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
+        // A preparation is short-lived and may not occupy a worker. Bound
+        // the bookkeeping independently of callers holding onto the guards.
+        if self.prepared.len() >= self.config.maximum_in_flight {
+            self.deny(ThrottleCause::Concurrency, reservation.domain, Duration::ZERO, now);
+            return Err(ThrottleCause::Concurrency);
+        }
+        let admitted = self.evaluate(&reservation, now)?;
+        reservation.operations = admitted.operations;
+        self.prepared.insert(
+            reservation.id,
+            Preparation {
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "illumos",
+                    target_os = "macos",
+                    windows
+                ))]
+                estimate: self.estimate_of(reservation.domain),
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "illumos",
+                    target_os = "macos",
+                    windows
+                ))]
+                physical: false,
+                reservation,
+                admitted,
+            },
+        );
+        Ok(admitted)
+    }
+
+    pub fn try_admit(&mut self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
+        let admitted = self.evaluate(&reservation, now)?;
+        Ok(self.record_admission(reservation, admitted, now))
+    }
+
+    fn record_admission(&mut self, reservation: Reservation, admitted: Admitted, now: MonotonicTime) -> Admitted {
+        let Admitted { cost, operations: permitted } = admitted;
+        let Reservation { id, path, reads, registrations, lease, domain, origin, listing, .. } = reservation;
+        let required = reads + registrations;
+        let cleanup = id.release().is_some();
         if domain.is_none() {
             self.bootstrap_outstanding += nanos(cost);
         }
@@ -964,12 +1110,13 @@ impl Governor {
                 started: None,
                 dispatched: None,
                 stuck: false,
+                failed: false,
                 listing,
                 registration: registrations > 0,
                 registration_took: None,
             },
         );
-        Ok(Admitted { cost, operations: permitted })
+        Admitted { cost, operations: permitted }
     }
 
     pub fn report(&mut self, id: GrantId, reported: Reported, now: MonotonicTime) {
@@ -1030,7 +1177,7 @@ impl Governor {
 
     pub fn try_start(&mut self, id: GrantId, at: MonotonicTime) -> Result<(), ThrottleCause> {
         let Some(grant) = self.grants.get(&id) else {
-            return Ok(());
+            return Err(ThrottleCause::Concurrency);
         };
         let domain = grant.domain;
         self.may_start(domain)?;
@@ -1147,8 +1294,12 @@ impl Governor {
     }
 
     pub(crate) fn record_grant_failure(&mut self, id: GrantId, now: MonotonicTime) {
-        let Some(grant) = self.grants.get(&id) else { return };
-        if grant.started.is_none() || !self.failed_grants.insert(id) {
+        let Some(grant) = self.grants.get_mut(&id) else { return };
+        if grant.started.is_none() {
+            return;
+        }
+        grant.failed = true;
+        if !self.failed_grants.insert(id) {
             return;
         }
         let (domain, origin) = (grant.domain, grant.origin);
@@ -1201,14 +1352,40 @@ impl Governor {
         cost: Duration,
         now: MonotonicTime,
     ) -> Option<MonotonicTime> {
+        self.budget_wait(domain, WorkOrigin::Background, cost, now).flatten()
+    }
+
+    // None means affordable; Some(None) waits for ownership to change rather
+    // than refill. A full bucket cannot refill past a provisional hold.
+    fn budget_wait(
+        &self,
+        domain: Option<StorageDomainId>,
+        origin: WorkOrigin,
+        cost: Duration,
+        now: MonotonicTime,
+    ) -> Option<Option<MonotonicTime>> {
+        let (global_held, local_held) = self.prepared_costs(domain, origin);
+        let global_bucket = match origin {
+            WorkOrigin::Background => &self.global,
+            WorkOrigin::Foreground => &self.foreground,
+        };
+        let local_bucket = domain.and_then(|id| self.domains.get(&id)).map(|state| match origin {
+            WorkOrigin::Background => &state.bucket,
+            WorkOrigin::Foreground => &state.foreground,
+        });
         let cost = nanos(cost);
-        let global = self.global.affordable_at(now, cost);
-        let local = domain.and_then(|id| self.domains.get(&id)).and_then(|state| state.bucket.affordable_at(now, cost));
+        if (global_held > 0 && cost + global_held > global_bucket.capacity)
+            || local_bucket.is_some_and(|bucket| local_held > 0 && cost + local_held > bucket.capacity)
+        {
+            return Some(None);
+        }
+        let global = global_bucket.affordable_at(now, cost + global_held);
+        let local = local_bucket.and_then(|bucket| bucket.affordable_at(now, cost + local_held));
         match (global, local) {
             (None, None) => None,
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => Some(Some(a.max(b))),
+            (Some(a), None) => Some(Some(a)),
+            (None, Some(b)) => Some(Some(b)),
         }
     }
 
@@ -1217,14 +1394,14 @@ impl Governor {
             return Some((ThrottleCause::Memory, None));
         }
         if let Some((domain, cost)) = self.denied
-            && let Some(at) = self.affordable_at(domain, cost, now)
+            && let Some(at) = self.budget_wait(domain, WorkOrigin::Background, cost, now)
         {
-            return Some((ThrottleCause::DutyBudget, Some(at)));
+            return Some((ThrottleCause::DutyBudget, at));
         }
         if let Some((domain, cost)) = self.denied_foreground
-            && let Some(at) = self.foreground_affordable_at(domain, cost, now)
+            && let Some(at) = self.budget_wait(domain, WorkOrigin::Foreground, cost, now)
         {
-            return Some((ThrottleCause::ForegroundCeiling, Some(at)));
+            return Some((ThrottleCause::ForegroundCeiling, at));
         }
         match self.grants.values().any(|grant| grant.stuck) {
             true => Some((ThrottleCause::StuckWorker, None)),
@@ -1248,35 +1425,17 @@ impl Governor {
         if self.memory_exceeded(0) {
             return Some((ThrottleCause::Memory, None));
         }
-        if let Some(at) = self.affordable_at(Some(domain), self.cost_of(Some(domain), 1), now) {
-            return Some((ThrottleCause::DutyBudget, Some(at)));
+        if let Some(at) = self.budget_wait(Some(domain), WorkOrigin::Background, self.cost_of(Some(domain), 1), now) {
+            return Some((ThrottleCause::DutyBudget, at));
         }
-        if let Some(at) = self.foreground_affordable_at(Some(domain), self.cost_of(Some(domain), 1), now)
+        if let Some(at) = self.budget_wait(Some(domain), WorkOrigin::Foreground, self.cost_of(Some(domain), 1), now)
             && self.denied_foreground.is_some()
         {
-            return Some((ThrottleCause::ForegroundCeiling, Some(at)));
+            return Some((ThrottleCause::ForegroundCeiling, at));
         }
         match queued && self.in_flight_on(Some(domain)) >= self.window_of(Some(domain)) {
             true => Some((ThrottleCause::Concurrency, None)),
             false => None,
-        }
-    }
-
-    fn foreground_affordable_at(
-        &self,
-        domain: Option<StorageDomainId>,
-        cost: Duration,
-        now: MonotonicTime,
-    ) -> Option<MonotonicTime> {
-        let cost = nanos(cost);
-        let global = self.foreground.affordable_at(now, cost);
-        let local =
-            domain.and_then(|id| self.domains.get(&id)).and_then(|state| state.foreground.affordable_at(now, cost));
-        match (global, local) {
-            (None, None) => None,
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
         }
     }
 
@@ -1341,6 +1500,8 @@ impl Governor {
             in_flight_bytes: self.in_flight_total,
             in_flight_bytes_ceiling: self.config.in_flight_listing_bytes,
             reserved: duration(self.reserved_total),
+            prepared: self.prepared.values().map(|prepared| prepared.admitted.cost).sum(),
+            preparations: self.prepared.len(),
             charged: duration(self.charged_total),
             surcharged: duration(self.surcharged_total),
             reported_blocking: duration(self.reported_total),
@@ -1381,6 +1542,9 @@ pub struct HostGovernor {
     base: Arc<Mutex<Option<Instant>>>,
     changes: Arc<(Mutex<Changes>, Condvar)>,
     limits: Arc<HostConfig>,
+    coordination: Option<Arc<crate::coordination::Selection>>,
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+    shared: Option<Arc<shared::Binding>>,
 }
 
 #[derive(Default)]
@@ -1395,6 +1559,7 @@ static PROCESS_GOVERNOR: OnceLock<HostGovernor> = OnceLock::new();
 pub enum HostGovernorError {
     AlreadyInstalled,
     InvalidConfig(String),
+    Coordination(crate::coordination::Error),
 }
 
 impl std::fmt::Display for HostGovernorError {
@@ -1402,11 +1567,19 @@ impl std::fmt::Display for HostGovernorError {
         match self {
             HostGovernorError::AlreadyInstalled => f.write_str("the process governor is already in use"),
             HostGovernorError::InvalidConfig(message) => write!(f, "invalid host configuration: {message}"),
+            HostGovernorError::Coordination(error) => error.fmt(f),
         }
     }
 }
 
-impl std::error::Error for HostGovernorError {}
+impl std::error::Error for HostGovernorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Coordination(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 pub fn host_governor() -> HostGovernor {
     PROCESS_GOVERNOR.get_or_init(|| HostGovernor::independent(&HostConfig::default())).clone()
@@ -1428,12 +1601,81 @@ fn guard_changes(changes: &Mutex<Changes>) -> MutexGuard<'_, Changes> {
 
 impl HostGovernor {
     pub fn install(config: HostConfig) -> Result<HostGovernor, HostGovernorError> {
-        config.validate().map_err(HostGovernorError::InvalidConfig)?;
-        let installed = HostGovernor::independent(&config);
+        Self::install_with_coordination(config, crate::coordination::Mode::ProcessOnly)
+    }
+
+    /// Install policy before the first use of the process-wide governor.
+    pub fn install_with_coordination(
+        config: HostConfig,
+        mode: crate::coordination::Mode,
+    ) -> Result<Self, HostGovernorError> {
+        if PROCESS_GOVERNOR.get().is_some() {
+            return Err(HostGovernorError::AlreadyInstalled);
+        }
+        let installed = Self::configured(&config, mode)?;
         match PROCESS_GOVERNOR.set(installed.clone()) {
             Ok(()) => Ok(installed),
             Err(_) => Err(HostGovernorError::AlreadyInstalled),
         }
+    }
+
+    /// Construct an explicit governor with an observable coordination policy.
+    pub fn configured(config: &HostConfig, mode: crate::coordination::Mode) -> Result<Self, HostGovernorError> {
+        use crate::coordination::{self, Mode};
+        config.validate().map_err(HostGovernorError::InvalidConfig)?;
+        let options = match &mode {
+            Mode::ProcessOnly => return Ok(Self::independent(config)),
+            Mode::Auto(options) | Mode::Required(options) => options,
+        };
+        options
+            .limits
+            .validate()
+            .map_err(|error| HostGovernorError::Coordination(coordination::Error::InvalidConfig(error.to_string())))?;
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        let connected = (|| {
+            let scope = match &options.scope {
+                coordination::Rendezvous::Discover => coordination::native::Scope::discover(options.limits),
+                coordination::Rendezvous::Directory(path) => coordination::native::Scope::open(path, options.limits),
+            }
+            .map_err(|error| (coordination::Error::from(error), true))?;
+            Self::with_coordination(config, scope).map_err(|error| (coordination::Error::from(error), false))
+        })();
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "macos",
+            windows
+        )))]
+        let connected: Result<Self, (coordination::Error, bool)> =
+            Err((coordination::Error::UnsupportedPlatform, true));
+        let mut governor = match connected {
+            Ok(governor) => governor,
+            Err((error, true)) if matches!(mode, Mode::Auto(_)) && error.permits_fallback() => {
+                let mut governor = Self::independent(config);
+                governor.coordination = Some(Arc::new(coordination::Selection { mode, fallback: Some(error) }));
+                return Ok(governor);
+            }
+            Err((error, _)) => return Err(HostGovernorError::Coordination(error)),
+        };
+        governor.coordination = Some(Arc::new(coordination::Selection { mode, fallback: None }));
+        Ok(governor)
+    }
+
+    /// Observe effective policy and connection health separately from local
+    /// accounting.
+    pub fn coordination_status(&self) -> crate::coordination::Status {
+        use crate::coordination::{Mode, State, Status};
+        let requested = self.coordination.as_ref().map_or(Mode::ProcessOnly, |selection| selection.mode.clone());
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(binding) = &self.shared {
+            return Status { requested, state: binding.status() };
+        }
+        let state = match self.coordination.as_ref().and_then(|selection| selection.fallback.clone()) {
+            Some(reason) => State::Fallback { reason },
+            None => State::ProcessOnly,
+        };
+        Status { requested, state }
     }
 
     pub fn independent(config: &HostConfig) -> HostGovernor {
@@ -1442,6 +1684,15 @@ impl HostGovernor {
             base: Arc::new(Mutex::new(None)),
             changes: Arc::new((Mutex::new(Changes::default()), Condvar::new())),
             limits: Arc::new(*config),
+            coordination: None,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "illumos",
+                target_os = "macos",
+                windows
+            ))]
+            shared: None,
         }
     }
 
@@ -1634,7 +1885,41 @@ impl HostGovernor {
     }
 
     pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
+        let work = match reservation.id {
+            GrantId::Bootstrap(_) => crate::coordination::protocol::Work::Bootstrap,
+            GrantId::WatchRegistration(..) => crate::coordination::protocol::Work::WatchRegistration,
+            GrantId::WatchRelease(..) => crate::coordination::protocol::Work::WatchRelease,
+            _ if reservation.listing => crate::coordination::protocol::Work::Listing,
+            _ => crate::coordination::protocol::Work::Enrichment,
+        };
+        self.try_admit_work(reservation, work, now)
+    }
+
+    pub fn try_admit_work(
+        &self,
+        reservation: Reservation,
+        _work: crate::coordination::protocol::Work,
+        now: MonotonicTime,
+    ) -> Result<Admitted, ThrottleCause> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.shared {
+            return shared.admit(self, reservation, _work, now);
+        }
         guard(&self.inner).try_admit(reservation, now)
+    }
+
+    /// Prepare local budget without making an irreversible admission charge.
+    ///
+    /// Other admissions observe this hold. No mutex or physical worker remains
+    /// held after this call. Dropping the returned guard aborts preparation.
+    pub fn try_prepare(
+        &self,
+        reservation: Reservation,
+        now: MonotonicTime,
+    ) -> Result<PreparedAdmission, ThrottleCause> {
+        let id = reservation.id;
+        let admitted = guard(&self.inner).try_prepare(reservation, now)?;
+        Ok(PreparedAdmission { governor: self.clone(), id, admitted, armed: true })
     }
 
     pub fn report(&self, id: GrantId, reported: Reported, now: MonotonicTime) {
@@ -1654,10 +1939,21 @@ impl HostGovernor {
     }
 
     pub fn try_start(&self, id: GrantId, at: MonotonicTime) -> Result<(), ThrottleCause> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.shared {
+            return shared.start(self, id, at);
+        }
         guard(&self.inner).try_start(id, at)
     }
 
     pub fn start(&self, id: GrantId, at: MonotonicTime) {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if self.shared.is_some() {
+            // Public unchecked entry points must never bypass shared
+            // permission. Internal dispatchers use the checked API.
+            let _ = self.try_start(id, at);
+            return;
+        }
         guard(&self.inner).start(id, at)
     }
 
@@ -1670,6 +1966,10 @@ impl HostGovernor {
     }
 
     pub(crate) fn release_was_stuck(&self, id: GrantId, now: MonotonicTime) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.shared {
+            return shared.release(self, id, now);
+        }
         let mut governor = guard(&self.inner);
         let stuck = governor.grants.get(&id).is_some_and(|grant| grant.stuck);
         governor.release(id, now);
@@ -1702,6 +2002,38 @@ impl HostGovernor {
         guard(&self.inner).record_grant_failure(id, now);
     }
 
+    /// Preserve the physical outcome when its local surcharge is accounted by
+    /// the tree's logical completion path.
+    pub(crate) fn note_grant_failure(&self, id: GrantId) {
+        let mut governor = guard(&self.inner);
+        if let Some(grant) = governor.grants.get_mut(&id)
+            && grant.started.is_some()
+        {
+            grant.failed = true;
+        }
+    }
+
+    pub(crate) fn grant_is_stuck(&self, id: GrantId) -> bool {
+        guard(&self.inner).grants.get(&id).is_some_and(|grant| grant.stuck)
+    }
+
+    pub(crate) fn has_shared_authority(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        {
+            self.shared.is_some()
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "macos",
+            windows
+        )))]
+        {
+            false
+        }
+    }
+
     pub fn newly_stuck(&self, now: MonotonicTime) -> Vec<GrantId> {
         guard(&self.inner).newly_stuck(now)
     }
@@ -1727,11 +2059,37 @@ impl HostGovernor {
     }
 
     pub fn throttle(&self, now: MonotonicTime) -> Option<(ThrottleCause, Option<MonotonicTime>)> {
+        if self.coordination_error().is_some() {
+            return Some((ThrottleCause::CoordinationFailed, None));
+        }
+        if let Some(at) = self.coordination_retry_at(now) {
+            return Some((ThrottleCause::Coordination, Some(at)));
+        }
         guard(&self.inner).throttle(now)
     }
 
     pub fn resume_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
-        guard(&self.inner).resume_at(now)
+        let local = guard(&self.inner).resume_at(now);
+        match (local, self.coordination_retry_at(now)) {
+            (Some(local), Some(shared)) => Some(local.min(shared)),
+            (local, shared) => local.or(shared),
+        }
+    }
+
+    pub fn coordination_error(&self) -> Option<String> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.shared {
+            return shared.failure();
+        }
+        None
+    }
+
+    pub fn coordination_retry_at(&self, _now: MonotonicTime) -> Option<MonotonicTime> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.shared {
+            return shared.retry_at(_now);
+        }
+        None
     }
 
     pub fn timer_hints(&self, now: MonotonicTime) -> (Option<MonotonicTime>, Option<MonotonicTime>) {

@@ -9,6 +9,7 @@
 )]
 
 pub mod config;
+pub mod coordination;
 pub mod core;
 pub mod domain;
 pub mod entry;
@@ -25,7 +26,9 @@ pub mod testing;
 pub mod tree;
 pub mod update;
 
-pub use core::{Admitted, DegradedCause, HostGovernor, HostGovernorError, Reported, Stats, host_governor};
+pub use core::{
+    Admitted, DegradedCause, HostGovernor, HostGovernorError, PreparedAdmission, Reported, Stats, host_governor,
+};
 
 pub use config::{ClassWeights, Config, HostConfig, LagMode, WatchRegistrationFailure};
 pub use domain::{

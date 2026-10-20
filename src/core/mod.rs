@@ -16,7 +16,7 @@ use std::time::Duration;
 pub(crate) use apply::requires_crossing_decision;
 pub use governor::{
     AdmissionDecision, Admitted, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor,
-    HostGovernorError, LatencySummary, Reported, Reservation, TreeNumber, host_governor,
+    HostGovernorError, LatencySummary, PreparedAdmission, Reported, Reservation, TreeNumber, host_governor,
 };
 use types::*;
 pub use types::{Class, DegradedCause, MonotonicTime, WorkOrigin};
@@ -849,6 +849,10 @@ impl Coordinator {
         matches!(self.shutdown, ShutdownState::Stopped | ShutdownState::Terminated { .. })
     }
 
+    pub(crate) fn has_pending_releases(&self) -> bool {
+        !self.pending_releases.is_empty()
+    }
+
     pub fn observe(&mut self, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         self.after_input();
@@ -858,6 +862,30 @@ impl Coordinator {
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         self.finish_stuck_jobs();
+        // Keep the completion record until the result has been classified.
+        // Validation failures and lost workers must reach shared settlement.
+        let completed = match &input {
+            Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => Some(self.job_grant(*job)),
+            _ => None,
+        };
+        match &input {
+            Input::WorkerLost(WorkerLoss::Job(job)) => self.governor.note_grant_failure(self.job_grant(*job)),
+            Input::WatchRegistered { request, result: Err(_) }
+            | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
+                let grant = match self.registrations.get(request).map(|registration| registration.target) {
+                    Some(RegistrationTarget::Job(job) | RegistrationTarget::AbandonedJob(job)) => self.job_grant(job),
+                    _ => self.registration_grant(*request),
+                };
+                self.governor.note_grant_failure(grant);
+            }
+            Input::WorkerLost(WorkerLoss::WatchRelease(release)) => {
+                self.governor.note_grant_failure(self.release_grant(*release))
+            }
+            Input::JobCompleted { job, result: JobResult::Enrichment(Ok(read)) } if !read.failed.is_empty() => {
+                self.governor.note_grant_failure(self.job_grant(*job));
+            }
+            _ => {}
+        }
         match &input {
             Input::JobCompleted { job, result } => {
                 self.blocking_slots.remove(&SlotOwner::Job(*job));
@@ -887,14 +915,13 @@ impl Coordinator {
                     let overshoot = self.governor.overshoot_of(self.job_grant(*job));
                     self.charge_commands(&barriers, overshoot);
                 }
-                if self.governor.release_was_stuck(self.job_grant(*job), now) {
+                if self.governor.grant_is_stuck(self.job_grant(*job)) {
                     self.finish_job(*job, JobOutcome::Stuck);
                 }
             }
             Input::WorkerLost(WorkerLoss::Job(job)) => {
                 self.blocking_slots.remove(&SlotOwner::Job(*job));
-                let now = self.now;
-                if self.governor.release_was_stuck(self.job_grant(*job), now) {
+                if self.governor.grant_is_stuck(self.job_grant(*job)) {
                     self.finish_job(*job, JobOutcome::Stuck);
                 }
             }
@@ -939,6 +966,9 @@ impl Coordinator {
                 | Input::WorkerLost(_)
                 | Input::Timer(_) => {}
             }
+            if let Some(grant) = completed {
+                self.governor.release(grant, self.now);
+            }
             self.after_input();
             return self.take_outputs();
         }
@@ -952,6 +982,9 @@ impl Coordinator {
             Input::WatchReleased { .. } => {}
             Input::WorkerLost(loss) => self.on_worker_lost(loss),
             Input::Timer(id) => self.on_timer(id),
+        }
+        if let Some(grant) = completed {
+            self.governor.release(grant, self.now);
         }
         self.after_input();
         self.take_outputs()
@@ -1333,6 +1366,14 @@ impl Coordinator {
         self.declare_stuck_workers();
         self.start_releases();
         if self.is_stopped() {
+            if !self.pending_releases.is_empty() && self.governor.coordination_error().is_none() {
+                let at = self.governor.coordination_retry_at(now).unwrap_or(now + self.config.minimum_period);
+                if self.timer_wake != Some(at) {
+                    self.timer_wake = Some(at);
+                    self.timer_id = self.timer_id.next();
+                    self.outputs.push(Output::SetTimer { id: self.timer_id, at });
+                }
+            }
             return;
         }
         self.report_memory();
@@ -1342,6 +1383,24 @@ impl Coordinator {
         self.maybe_dispatch();
         self.resume_sessions();
         self.start_queued();
+        if let Some(error) = self.governor.coordination_error() {
+            let commands: Vec<_> = self.commands.keys().copied().collect();
+            for id in commands {
+                self.finish_command(id, Err(Error::Coordination(error.clone())));
+            }
+            for id in std::mem::take(&mut self.initial_scan.waiters) {
+                self.outputs.push(Output::CommandFinished { id, result: Err(Error::Coordination(error.clone())) });
+            }
+            let queued: Vec<_> = self
+                .jobs
+                .iter()
+                .filter(|(_, job)| matches!(job.phase, JobPhase::Queued | JobPhase::Suspended))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in queued {
+                self.cancel_job(id);
+            }
+        }
         self.publish();
         self.arm_timer();
     }
@@ -1748,6 +1807,9 @@ impl Coordinator {
                 if job.phase.started().is_some() || job.session_open {
                     self.outputs.push(Output::CancelJob(id));
                 }
+                if job.phase.started().is_none() {
+                    self.governor.release(self.job_grant(id), self.now);
+                }
                 if let Some(entry) = job.entry() {
                     self.active_by_entry.remove(&entry);
                 }
@@ -1805,8 +1867,11 @@ impl Coordinator {
         if self.governor.try_admit(reservation, now).is_err() {
             return false;
         }
+        if self.governor.try_start(self.release_grant(release), now).is_err() {
+            self.governor.release(self.release_grant(release), now);
+            return false;
+        }
         self.next_watch_release = release.next();
-        self.governor.start(self.release_grant(release), now);
         self.blocking_slots.insert(
             SlotOwner::WatchRelease(release),
             Occupancy { path: pending.path.clone(), operation: JobOperation::WatchRelease, started: now },
@@ -1838,6 +1903,15 @@ impl Coordinator {
             });
         };
         let (resume, stuck_deadline) = self.governor.timer_hints(self.now);
+        let waiting_for_work = self.baseline_due
+            || !self.pending.is_empty()
+            || !self.pending_enrichment.is_empty()
+            || !self.pending_domain.is_empty()
+            || !self.pending_releases.is_empty()
+            || self.jobs.values().any(|job| matches!(job.phase, JobPhase::Queued | JobPhase::Suspended));
+        if waiting_for_work && let Some(at) = self.governor.coordination_retry_at(self.now) {
+            consider(at);
+        }
         if !self.baseline_due && self.batch.is_none() {
             let due = match self.next_admissible(resume) {
                 Some(at) => self.periodic_due.max(at),

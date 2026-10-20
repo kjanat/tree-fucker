@@ -1,5 +1,5 @@
 use super::types::*;
-use super::{Coordinator, JobResult, Output, Work, WorkerLoss};
+use super::{Coordinator, JobResult, Output, WorkerLoss};
 use crate::config::WatchRegistrationFailure;
 use crate::entry::{EntryKind, LoadState, Shape};
 use crate::error::Error;
@@ -41,7 +41,9 @@ impl Coordinator {
             self.record_session_cost(id, &cost);
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.session_open = suspended;
-                job.starved = suspended && cost.entries_enumerated == 0;
+                // Keep requesting operations when the session has demonstrated
+                // per-child work, even before its domain probe is published.
+                job.needs_operations = suspended && (cost.entries_enumerated == 0 || cost.per_child_operations() > 0);
             }
         }
         if !self.guards_valid(&job) {
@@ -89,9 +91,9 @@ impl Coordinator {
                         return;
                     }
                     if let Some(job) = self.jobs.get_mut(&id) {
-                        job.phase = JobPhase::Confirming(started);
+                        job.confirming = true;
+                        job.phase = JobPhase::Suspended;
                     }
-                    self.dispatch_job(id, Work::Metadata);
                 }
                 SessionState::Finished(SessionOutcome::Failed(err)) => {
                     self.listing_failures += 1;
@@ -358,7 +360,8 @@ impl Coordinator {
             outcome,
             JobOutcome::Failed(_) | JobOutcome::Rejected(_) | JobOutcome::Cancelled | JobOutcome::WorkerLost
         );
-        if surcharged {
+        if surcharged && (job.phase.started().is_some() || !self.governor.has_shared_authority()) {
+            self.governor.note_grant_failure(self.job_grant(job.id));
             self.governor.charge_surcharge(domain, job.origin, now);
         }
         match outcome {

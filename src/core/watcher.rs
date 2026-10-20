@@ -169,7 +169,10 @@ impl Coordinator {
                     if self.governor.try_admit(reservation, now).is_err() {
                         return true;
                     }
-                    self.governor.start(self.registration_grant(request), now);
+                    if self.governor.try_start(self.registration_grant(request), now).is_err() {
+                        self.governor.release(self.registration_grant(request), now);
+                        return true;
+                    }
                     self.hold_watch_path(id);
                     self.blocking_slots.insert(
                         super::SlotOwner::WatchRegistration(request),

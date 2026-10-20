@@ -441,6 +441,7 @@ impl Actor {
                 && self.registrations.is_empty()
                 && self.releases.is_empty()
                 && self.workers.is_empty()
+                && !self.coordinator.has_pending_releases()
             {
                 break;
             }
@@ -574,6 +575,9 @@ struct BootstrapGrant {
 impl Drop for BootstrapGrant {
     fn drop(&mut self) {
         let now = MonotonicTime(self.runtime.now().saturating_duration_since(self.base));
+        if std::thread::panicking() {
+            self.governor.record_grant_failure(self.id, now);
+        }
         self.governor.release(self.id, now);
     }
 }
@@ -587,6 +591,9 @@ async fn bootstrap<T: Send + 'static>(
 ) -> Result<T> {
     let id = GrantId::Bootstrap(governor.next_bootstrap());
     let grant = loop {
+        if let Some(error) = governor.coordination_error() {
+            return Err(Error::Coordination(error));
+        }
         let now = MonotonicTime(runtime.now().saturating_duration_since(base));
         let reservation = Reservation {
             id,
@@ -607,6 +614,9 @@ async fn bootstrap<T: Send + 'static>(
     };
     loop {
         let now = MonotonicTime(runtime.now().saturating_duration_since(base));
+        if let Some(error) = governor.coordination_error() {
+            return Err(Error::Coordination(error));
+        }
         if governor.try_start(id, now).is_ok() {
             break;
         }
@@ -631,6 +641,10 @@ async fn blocking<T: Send + 'static>(
     runtime
         .spawn_blocking(Box::new(move || {
             let outcome = work();
+            if outcome.is_err() {
+                let now = MonotonicTime(grant.runtime.now().saturating_duration_since(grant.base));
+                grant.governor.record_grant_failure(grant.id, now);
+            }
             drop(grant);
             let _ = tx.send(outcome);
         }))

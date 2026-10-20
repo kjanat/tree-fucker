@@ -26,6 +26,12 @@ impl Coordinator {
             self.outputs.push(Output::CommandFinished { id, result: Err(Error::Shutdown) });
             return;
         }
+        if !matches!(command, Command::Shutdown)
+            && let Some(error) = self.governor.coordination_error()
+        {
+            self.outputs.push(Output::CommandFinished { id, result: Err(Error::Coordination(error)) });
+            return;
+        }
         match command {
             Command::Shutdown => self.do_shutdown(id),
             Command::SetPriority(paths) => {
