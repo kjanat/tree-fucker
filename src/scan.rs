@@ -26,6 +26,10 @@ use crate::path::{RelativePath, validate_name};
 use crate::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use crate::update::{ResourceLimit, ResourceLimited, ThrottleCause};
 
+fn failed_listing(continuation: &Continuation) -> bool {
+    matches!(continuation, Continuation::Finished(outcome) if !matches!(outcome, SessionOutcome::Complete(_)))
+}
+
 const LONGEST_WAIT: Duration = Duration::from_secs(1);
 
 pub trait Clock: Send + Sync {
@@ -292,9 +296,19 @@ struct Held {
     base: Instant,
 }
 
+impl Held {
+    fn failed(&self) {
+        let now = MonotonicTime(self.clock.now().saturating_duration_since(self.base));
+        self.governor.record_grant_failure(self.id, now);
+    }
+}
+
 impl Drop for Held {
     fn drop(&mut self) {
         let now = MonotonicTime(self.clock.now().saturating_duration_since(self.base));
+        if std::thread::panicking() {
+            self.governor.record_grant_failure(self.id, now);
+        }
         self.governor.release(self.id, now);
     }
 }
@@ -505,15 +519,20 @@ impl Scan {
         self.accounting
             .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
         let id = self.next_grant();
-        let need = Need { reads: 1, operations: 1, lease: 0, domain: Some(entry.domain), listing: false };
+        let need = Need { reads: 1, operations: 0, lease: 0, domain: Some(entry.domain), listing: false };
         let granted = match self.admit(id, &entry.path.path(), need)? {
             Admission::Granted(granted) => granted,
             Admission::Quarantined(_) => return Err(Error::Stuck),
         };
         self.stats.metadata_operations += 1;
         let result = read(entry);
+        if result.is_err() {
+            granted.held.failed();
+        }
         self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(entry.domain));
-        self.record(Some(entry.domain), result.is_err());
+        if result.is_ok() {
+            self.record_success(Some(entry.domain));
+        }
         result.map_err(Error::from)
     }
 
@@ -583,13 +602,7 @@ impl Scan {
     fn admit(&mut self, id: GrantId, path: &RelativePath, need: Need) -> Result<Admission> {
         let admitted = loop {
             self.check_cancelled()?;
-            if self.accounting.is_some() {
-                let now = self.now();
-                self.governor.account(now);
-                for id in self.governor.newly_stuck(now) {
-                    self.governor.mark_stuck(id, now);
-                }
-            }
+            self.governor.account_and_quarantine(self.now());
             let remaining = self.options.ceiling.saturating_sub(self.admitted_cost());
             if remaining.is_zero() {
                 return Err(self.ceiling_reached());
@@ -641,14 +654,19 @@ impl Scan {
             self.check_cancelled()?;
             let seen = self.governor.changes();
             let now = self.now();
+            self.governor.account_and_quarantine(now);
             if self.accounting.is_some() {
-                self.governor.account(now);
                 // This grant's reservation is already charged and may fill
                 // the ceiling exactly. Abort only if continuing physical
                 // work has pushed the command beyond its admitted budget.
                 if self.admitted_cost() > self.options.ceiling {
                     return Err(self.ceiling_reached());
                 }
+            }
+            if let Some(domain) = need.domain
+                && self.governor.quarantined(Some(domain))
+            {
+                return Ok(Admission::Quarantined(domain));
             }
             if self.governor.try_start(id, now).is_ok() {
                 break;
@@ -684,12 +702,8 @@ impl Scan {
         drop(granted);
     }
 
-    fn record(&self, domain: Option<StorageDomainId>, failed: bool) {
-        let now = self.now();
-        if failed {
-            self.governor.charge_surcharge(domain, WorkOrigin::Foreground, now);
-        }
-        self.governor.record_outcome(domain, failed, now);
+    fn record_success(&self, domain: Option<StorageDomainId>) {
+        self.governor.record_outcome(domain, false, self.now());
     }
 
     fn bootstrap<T>(
@@ -703,6 +717,9 @@ impl Scan {
             Admission::Quarantined(_) => return Err(Error::Stuck),
         };
         let outcome = work(self.filesystem.as_ref());
+        if outcome.is_err() {
+            granted.held.failed();
+        }
         self.governor.account(self.now());
         let overshoot = self.governor.overshoot_of(id);
         self.stats.admitted += overshoot;
@@ -779,8 +796,8 @@ impl Scan {
                 match resolved {
                     Ok(probe) => (probe, parent, Some(granted)),
                     Err(error) => {
+                        granted.held.failed();
                         self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(parent.domain));
-                        self.record(Some(parent.domain), true);
                         if let Some(fatal) = fatal(&error) {
                             return Err(fatal);
                         }
@@ -796,7 +813,7 @@ impl Scan {
             if mode != DomainCrossing::Follow {
                 if let Some(granted) = granted {
                     self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(domain));
-                    self.record(Some(domain), false);
+                    self.record_success(Some(domain));
                 }
                 self.stats.boundaries += 1;
                 self.pending.push_back(ScanEvent::Boundary { path: path.clone(), mode, domain });
@@ -846,20 +863,10 @@ impl Scan {
             if cancel.is_cancelled() {
                 return;
             }
-            let (continuation, cost) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                session.resume(lease)
-            })) {
-                Ok(result) => result,
-                Err(panic) => {
-                    let held = &memory.grant.as_ref().expect("physical grant").held;
-                    let now = MonotonicTime(held.clock.now().saturating_duration_since(held.base));
-                    held.governor.charge_surcharge(Some(domain), WorkOrigin::Foreground, now);
-                    held.governor.record_outcome(Some(domain), true, now);
-                    // The pool catches this unwind after resources are dropped.
-                    // Accounting also happens if the waiter already left.
-                    std::panic::resume_unwind(panic);
-                }
-            };
+            let (continuation, cost) = session.resume(lease);
+            if failed_listing(&continuation) {
+                memory.grant.as_ref().expect("physical grant").held.failed();
+            }
             let held = &memory.grant.as_ref().expect("physical grant").held;
             let now = MonotonicTime(held.clock.now().saturating_duration_since(held.base));
             let governor = &held.governor;
@@ -899,12 +906,9 @@ impl Scan {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
             let now = self.now();
-            self.governor.account(now);
+            self.governor.account_and_quarantine(now);
             if self.admitted_cost() >= self.options.ceiling {
                 return Err(self.ceiling_reached());
-            }
-            if self.governor.newly_stuck(now).contains(&id) {
-                self.governor.mark_stuck(id, now);
             }
             if self.governor.stuck_grants().iter().any(|grant| grant.id == id) {
                 return Ok(None);
@@ -989,7 +993,7 @@ impl Scan {
         let outcome = loop {
             let worker = if let Some(executor) = &self.listing_executor {
                 match executor.acquire(&self.cancel, || {
-                    self.governor.account(self.now());
+                    self.governor.account_and_quarantine(self.now());
                     if self.admitted_cost() >= self.options.ceiling {
                         return Err(self.ceiling_reached());
                     }
@@ -1040,6 +1044,9 @@ impl Scan {
                 }
             } else {
                 let (continuation, cost) = session.resume(lease_budget);
+                if failed_listing(&continuation) {
+                    granted.held.failed();
+                }
                 let operations = cost.listing_operations.saturating_add(cost.per_child_operations()) + resolution;
                 self.settle(granted, Some(Reported { blocking: cost.blocking, operations }), Some(domain));
                 (continuation, cost, None)
@@ -1085,18 +1092,15 @@ impl Scan {
         match outcome {
             SessionOutcome::Complete(listing) => self.accept_listing(path, context, located, listing)?,
             SessionOutcome::Cancelled => {
-                self.record(Some(domain), true);
                 self.report_memory();
                 return Err(Error::Cancelled);
             }
             SessionOutcome::ResourceLimited(mut limited) => {
-                self.record(Some(domain), true);
                 self.report_memory();
                 limited.domain = Some(domain);
                 self.unlisted(path, ScanFailure::ResourceLimited(limited));
             }
             SessionOutcome::Failed(error) => {
-                self.record(Some(domain), true);
                 self.report_memory();
                 if let Some(fatal) = fatal(&error) {
                     return Err(fatal);
@@ -1115,7 +1119,7 @@ impl Scan {
         mut listing: crate::fs::DirectoryListing,
     ) -> Result<()> {
         let domain = located.domain;
-        self.record(Some(domain), false);
+        self.record_success(Some(domain));
         let anchor = listing.anchor.take();
         if anchor.is_none() && self.options.anchor_policy == AnchorPolicy::Required {
             self.report_memory();
@@ -1190,9 +1194,15 @@ impl Scan {
             self.stats.enrichments += 1;
             match enriched {
                 Ok(enrichment) => {
+                    let failed = !enrichment.failed.is_empty() || enrichment.children.len() != batch.children.len();
+                    if failed {
+                        granted.held.failed();
+                    }
                     let reported = Reported { blocking: None, operations: enrichment.metadata_operations };
                     self.settle(granted, Some(reported), Some(domain));
-                    self.record(Some(domain), false);
+                    if !failed {
+                        self.record_success(Some(domain));
+                    }
                     self.stats.metadata_operations += u64::from(enrichment.metadata_operations);
                     for (name, metadata) in enrichment.children {
                         results.insert(name, Ok(metadata));
@@ -1208,8 +1218,8 @@ impl Scan {
                     }
                 }
                 Err(error) => {
+                    granted.held.failed();
                     self.settle(granted, None, Some(domain));
-                    self.record(Some(domain), true);
                     if let Some(fatal) = fatal(&error) {
                         return Err(fatal);
                     }

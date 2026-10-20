@@ -1057,13 +1057,20 @@ Abstract
    remain. A wholly occupied pool waits for completion or cancellation;
    it MUST NOT manufacture replacement capacity. Pool waits MUST account
    for continuing detached work and enforce the command worker-time
-   ceiling, even when no new filesystem operation can start.
+   ceiling, even when no new filesystem operation can start. Admission,
+   pool, and physical-capacity waits MUST also detect newly stuck calls
+   abandoned by earlier scans. Same-domain work stops waiting and
+   reports Quarantined once its domain is quarantined.
 
    Abandoning a result MUST NOT release physical ownership. The worker
    retains the grant until its call returns, including on cancellation
    or after the scan is dropped. It then reports cost, releases the
    grant, and discards any abandoned continuation. Adapter panics become
    WorkerLost without leaking the grant or permanently losing the slot.
+   A stuck transition records one failure surcharge and one domain error
+   for that physical grant. A later failure or panic from the same call
+   MUST NOT record the failure again. Persistent Tree coordinators also
+   honor stuck transitions detected by another scan or Tree.
 
    A bounded listing reserves max(1, in_flight_listing_bytes divided by
    maximum_in_flight) bytes, further capped by the host accounted-memory
@@ -1213,10 +1220,12 @@ Abstract
    observation before scan exhaustion. It uses the same host governor,
    storage domain, cancellation token, and per-command ceiling, retains
    the physical grant through callback return or unwinding, and counts
-   the metadata operation. The callback receives the original anchor and
-   MUST perform at most one physical read. It runs inline; cancellation
-   cannot interrupt a call inside the kernel. No metadata is fetched
-   merely by creating or yielding an observation.
+   the metadata operation. Admission reserves exactly one read estimate.
+   A returned error or panic records the physical failure before
+   release, including when the consumer catches the unwind. The callback
+   receives the original anchor and MUST perform at most one physical
+   read. It runs inline; cancellation cannot interrupt a call inside
+   the kernel. Creating or yielding an observation fetches no metadata.
 
    Direct consumer calls outside Scan::read remain outside scan
    governance. Query-wide admission requires routing each physical lazy

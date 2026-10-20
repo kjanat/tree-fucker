@@ -244,6 +244,7 @@ fn lazy_reads_are_admitted_on_demand_and_release_on_panic_or_cancellation() {
     assert_eq!(result, 42);
     assert_eq!(scan.stats().metadata_operations, before + 1);
     assert!(governor.grants().is_empty());
+    let surcharge_before = governor.view(now(&governor, &clock)).surcharged;
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: Result<(), Error> = scan.read(&entry, |_| {
             clock.advance(Duration::from_secs(60));
@@ -252,6 +253,10 @@ fn lazy_reads_are_admitted_on_demand_and_release_on_panic_or_cancellation() {
     }));
     assert!(panicked.is_err());
     assert!(governor.grants().is_empty());
+    assert_eq!(
+        governor.view(now(&governor, &clock)).surcharged - surcharge_before,
+        governor.limits().failure_surcharge
+    );
     assert!(scan.stats().admitted >= Duration::from_secs(60), "unwinding cannot erase physical cost");
     scan.cancellation().cancel();
     assert_eq!(
@@ -945,8 +950,9 @@ fn requested_metadata_is_enriched_and_a_failed_read_marks_only_its_entry() {
     fs.fail("a/x", FakeOp::Enrich, FailureMode::Always(FsError::PermissionDenied));
     let size = MetadataFields { size: true, ..MetadataFields::NONE };
     let options = ScanOptions { fields: size, ..follow() };
-    let Opened { mut scan, .. } = open(fs.clone(), options);
+    let Opened { mut scan, governor, clock } = open(fs.clone(), options);
     let events = drain(&mut scan);
+    assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
     let y = entry(&events, "a/b/y");
     assert_eq!((y.metadata.size, y.fields, y.metadata_error.clone()), (Some(2), size, None));
     let x = entry(&events, "a/x");
@@ -1322,9 +1328,11 @@ fn a_freshly_blocked_listing_is_quarantined_without_abandoning_physical_ownershi
         governor.view(now(&governor, &clock)).accounted_memory,
         governor.limits().in_flight_listing_bytes / governor.limits().maximum_in_flight as u64
     );
+    assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
     gate.release();
     worker.join().unwrap();
     eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+    assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
 }
 
 #[test]
@@ -1703,4 +1711,116 @@ fn an_admitted_listing_can_start_at_exactly_the_command_ceiling() {
     let events = drain(&mut scan);
     assert_eq!(paths(&events), vec![".", "file"]);
     assert_eq!(scan.stats().admitted, ceiling, "the reservation already paid for this listing");
+}
+
+#[test]
+fn a_lazy_read_reserves_exactly_one_physical_operation() {
+    let fs = fixture();
+    let Opened { mut scan, governor, .. } = open(fs.clone(), follow());
+    let ScanEvent::Entry(root) = scan.next().unwrap().unwrap() else { panic!("root") };
+    let ceiling = scan.stats().admitted + governor.cost_of(Some(root.domain), 1);
+    drop(scan);
+    let Opened { mut scan, governor, .. } = open(fs, ScanOptions { ceiling, ..follow() });
+    let ScanEvent::Entry(root) = scan.next().unwrap().unwrap() else { panic!("root") };
+    scan.read(&root, |_| {
+        let grants = governor.grants();
+        assert_eq!(grants.len(), 1);
+        assert_eq!((grants[0].required, grants[0].operations), (1, 0));
+        Ok(())
+    })
+    .expect("a budget for one read must admit one read");
+    assert_eq!(scan.stats().admitted, ceiling);
+    assert_eq!(scan.stats().metadata_operations, 1);
+}
+
+struct ObservingWaitClock {
+    inner: Arc<ManualClock>,
+    checked: std::sync::mpsc::SyncSender<()>,
+}
+impl Clock for ObservingWaitClock {
+    fn now(&self) -> Instant {
+        let _ = self.checked.try_send(());
+        self.inner.now()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+    fn wait_for_change(&self, governor: &HostGovernor, seen: u64, timeout: Duration) {
+        governor.wait_for_change(seen, timeout.min(Duration::from_millis(10)));
+    }
+}
+
+#[test]
+fn a_later_scan_quarantines_cancelled_work_in_pool_and_physical_waits() {
+    for pool_capacity in [1, 2] {
+        let fs = fixture();
+        fs.set_domain("a", MEDIA);
+        let (entered, starts) = std::sync::mpsc::channel();
+        let gate = Arc::new(ListingGate { entered, released: Mutex::new(false), changed: std::sync::Condvar::new() });
+        let _release = ReleaseListing(gate.clone());
+        let governor = HostGovernor::independent(&HostConfig {
+            maximum_in_flight: 1,
+            per_domain_concurrency: 1,
+            foreground_duty: 1.0,
+            domain_foreground_duty: 1.0,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let executor = tree_fucker::ListingExecutor::new(pool_capacity).unwrap();
+        let first = Scan::open_outside_host_governor(
+            Arc::new(BlockedListing { inner: fs.clone(), gate: gate.clone() }),
+            fs.root().to_path_buf(),
+            Arc::new(LoadAll),
+            ScanOptions { ceiling: Duration::MAX, ..follow() },
+            governor.clone(),
+            clock.clone(),
+        )
+        .unwrap()
+        .with_listing_executor(executor.clone());
+        let other = Arc::new(FakeFileSystem::new(WatcherKind::None));
+        other.set_domain("", MEDIA);
+        other.create_file("file", 1);
+        let (checked, checks) = std::sync::mpsc::sync_channel(1);
+        let mut second = Scan::open_outside_host_governor(
+            other.clone(),
+            other.root().to_path_buf(),
+            Arc::new(LoadAll),
+            ScanOptions { ceiling: Duration::MAX, ..follow() },
+            governor.clone(),
+            Arc::new(ObservingWaitClock { inner: clock.clone(), checked }),
+        )
+        .unwrap()
+        .with_listing_executor(executor);
+        second.next().unwrap().unwrap();
+        while checks.try_recv().is_ok() {}
+        let cancel = first.cancellation();
+        let first_worker = std::thread::spawn(move || first.collect::<Result<Vec<_>, _>>());
+        starts.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancel.cancel();
+        assert!(matches!(first_worker.join().unwrap(), Err(Error::Cancelled)));
+        assert!(governor.stuck_grants().is_empty(), "cancelled before the stuck deadline");
+        let (done, results) = std::sync::mpsc::channel();
+        let second_worker = std::thread::spawn(move || done.send(second.collect::<Result<Vec<_>, _>>()).unwrap());
+        checks.recv_timeout(Duration::from_secs(5)).expect("second scan entered its wait path");
+        if pool_capacity == 2 {
+            eventually(|| governor.grants().iter().any(|grant| grant.started.is_none()));
+        }
+        clock.advance(Duration::from_secs(31));
+        let events = results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("pool {pool_capacity}: {error:?}; grants: {:?}", governor.grants()))
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ScanEvent::Unlisted { failure: ScanFailure::Quarantined(_), .. }))
+        );
+        assert_eq!(other.count_ops(FakeOp::ReadDir, ""), 0);
+        assert_eq!(governor.grants().len(), 1, "only the detached physical call remains");
+        assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
+        second_worker.join().unwrap();
+        gate.release();
+        eventually(|| governor.grants().is_empty());
+        assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
+    }
 }
