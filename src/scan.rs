@@ -5,6 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod anchors;
+mod executor;
+pub use executor::ListingExecutor;
+
 use crate::config::Config;
 use crate::core::{
     GrantId, HostGovernor, MonotonicTime, Reported, Reservation, TreeNumber, WorkOrigin, host_governor,
@@ -21,6 +25,10 @@ use crate::ids::JobId;
 use crate::path::{RelativePath, validate_name};
 use crate::policy::{PolicyContext, ScanDecision, ScanPolicy};
 use crate::update::{ResourceLimit, ResourceLimited, ThrottleCause};
+
+fn failed_listing(continuation: &Continuation) -> bool {
+    matches!(continuation, Continuation::Finished(outcome) if !matches!(outcome, SessionOutcome::Complete(_)))
+}
 
 const LONGEST_WAIT: Duration = Duration::from_secs(1);
 
@@ -45,6 +53,14 @@ impl Clock for SystemClock {
     }
 }
 
+/// Whether non-root observations may be yielded without a retained anchor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnchorPolicy {
+    #[default]
+    Optional,
+    Required,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanOptions {
     pub crossing: DomainCrossing,
@@ -54,6 +70,10 @@ pub struct ScanOptions {
     pub operations_per_lease: usize,
     pub ceiling: Duration,
     pub anchors: usize,
+    pub anchor_policy: AnchorPolicy,
+    /// Yield bounded listing chunks before the directory is complete.
+    /// Requires a chunk-capable policy and filesystem session.
+    pub streaming: bool,
 }
 
 impl Default for ScanOptions {
@@ -67,6 +87,8 @@ impl Default for ScanOptions {
             operations_per_lease: config.operations_per_lease,
             ceiling: config.foreground_ceiling_per_command,
             anchors: 0,
+            anchor_policy: AnchorPolicy::Optional,
+            streaming: false,
         }
     }
 }
@@ -204,7 +226,10 @@ pub struct ScanStats {
     pub throttled: Duration,
     pub buffered_bytes: u64,
     pub peak_buffered_bytes: u64,
+    /// Reserved anchor slots, including active/detached cursors and retained
+    /// observations.
     pub anchors_live: usize,
+    /// Maximum simultaneously reserved anchor slots.
     pub anchors_peak: usize,
     pub anchors_withheld: u64,
 }
@@ -241,7 +266,22 @@ struct Frame {
 
 enum Node {
     List(Target),
+    Resume(Box<Listing>),
     Children(Box<Frame>),
+}
+
+struct Listing {
+    path: RelativePath,
+    context: PolicyContext,
+    located: Arc<Located>,
+    id: GrantId,
+    carried: Option<Granted>,
+    session: Box<dyn ListingSession>,
+    lease: u32,
+    starved: bool,
+    // Bytes already emitted are no longer live, but remain part of the
+    // whole-directory observation used to admit later full listings.
+    emitted_bytes: u64,
 }
 
 struct Need {
@@ -259,9 +299,19 @@ struct Held {
     base: Instant,
 }
 
+impl Held {
+    fn failed(&self) {
+        let now = MonotonicTime(self.clock.now().saturating_duration_since(self.base));
+        self.governor.record_grant_failure(self.id, now);
+    }
+}
+
 impl Drop for Held {
     fn drop(&mut self) {
         let now = MonotonicTime(self.clock.now().saturating_duration_since(self.base));
+        if std::thread::panicking() {
+            self.governor.record_grant_failure(self.id, now);
+        }
         self.governor.release(self.id, now);
     }
 }
@@ -295,6 +345,38 @@ pub struct Scan {
     in_flight_bytes: u64,
     reported: (u64, u64),
     stats: ScanStats,
+    bootstrap_charged: Duration,
+    listing_executor: Option<ListingExecutor>,
+    accounting: Option<Arc<ScanAccounting>>,
+}
+
+struct ScanAccounting {
+    governor: HostGovernor,
+    number: TreeNumber,
+}
+
+impl Drop for ScanAccounting {
+    fn drop(&mut self) {
+        self.governor.forget_tree(self.number);
+    }
+}
+
+// Kept separate from the scan's tree number: dropping the logical scan must not
+// forget the bounded buffer still owned by an uninterruptible listing.
+struct ListingResources {
+    grant: Option<Granted>,
+    governor: HostGovernor,
+    number: TreeNumber,
+    _scan: Arc<ScanAccounting>,
+}
+
+impl Drop for ListingResources {
+    fn drop(&mut self) {
+        // Settle physical occupancy before the last scan-accounting owner
+        // drops.
+        drop(self.grant.take());
+        self.governor.forget_tree(self.number);
+    }
 }
 
 fn costs_per_child(probe: &ProbeResult) -> bool {
@@ -343,6 +425,9 @@ impl Scan {
         clock: Arc<dyn Clock>,
     ) -> Result<Scan> {
         options.validate().map_err(Error::InvalidConfig)?;
+        if options.streaming && !policy.supports_chunks() {
+            return Err(Error::InvalidConfig("streaming requires a chunk-capable scan policy".into()));
+        }
         governor.limits().validate().map_err(Error::InvalidConfig)?;
         let base = governor.base(clock.now());
         let number = governor.next_tree();
@@ -365,6 +450,9 @@ impl Scan {
             in_flight_bytes: 0,
             reported: (0, 0),
             stats: ScanStats::default(),
+            bootstrap_charged: Duration::ZERO,
+            listing_executor: None,
+            accounting: None,
         };
         let given = scan.root.clone();
         let (canonical, _) = scan.bootstrap(|fs| fs.canonicalize(&given))?;
@@ -414,8 +502,71 @@ impl Scan {
         self.cancel.clone()
     }
 
+    /// Perform one lazy, adapter-specific read under this scan's governor.
+    ///
+    /// Invoke this before advancing past the end of the scan. The callback
+    /// receives the original observation, including its retained anchor. It
+    /// must perform at most one physical read and must not reacquire this
+    /// scan. Raw reads made outside this method are outside scan accounting.
+    /// The callback runs inline; cancellation cannot interrupt a kernel call.
+    pub fn read<T>(
+        &mut self,
+        entry: &ScanEntry,
+        read: impl FnOnce(&ScanEntry) -> std::result::Result<T, FsError>,
+    ) -> Result<T> {
+        if self.finished {
+            return Err(Error::Shutdown);
+        }
+        // Keep governor charges authoritative even if a consumer catches a
+        // panic from its callback and continues using the scan.
+        self.accounting
+            .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
+        let id = self.next_grant();
+        let need = Need { reads: 1, operations: 0, lease: 0, domain: Some(entry.domain), listing: false };
+        let granted = match self.admit(id, &entry.path.path(), need)? {
+            Admission::Granted(granted) => granted,
+            Admission::Quarantined(_) => return Err(Error::Stuck),
+        };
+        self.stats.metadata_operations += 1;
+        let result = read(entry);
+        if result.is_err() {
+            granted.held.failed();
+        }
+        self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(entry.domain));
+        if result.is_ok() {
+            self.record_success(Some(entry.domain));
+        }
+        result.map_err(Error::from)
+    }
+
+    /// Execute subsequent listing leases on a bounded, reusable worker pool.
+    ///
+    /// Bootstrap, domain resolution, and enrichment remain inline. A listing
+    /// exceeding the governor's stuck threshold is reported as unlisted; its
+    /// worker, grant and buffer allowance remain held until physical
+    /// completion. Healthy domains can continue only while both pool and
+    /// governor capacity remain available.
+    pub fn with_listing_executor(mut self, executor: ListingExecutor) -> Self {
+        self.accounting
+            .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
+        self.listing_executor = Some(executor);
+        self
+    }
+
     pub fn stats(&self) -> ScanStats {
-        ScanStats { anchors_live: self.live_anchors.load(Ordering::SeqCst), ..self.stats.clone() }
+        ScanStats {
+            admitted: self.admitted_cost(),
+            anchors_live: self.live_anchors.load(Ordering::SeqCst),
+            ..self.stats.clone()
+        }
+    }
+
+    fn admitted_cost(&self) -> Duration {
+        if self.accounting.is_some() {
+            self.stats.admitted.max(self.bootstrap_charged.saturating_add(self.governor.charged_by_tree(self.number)))
+        } else {
+            self.stats.admitted
+        }
     }
 
     fn now(&self) -> MonotonicTime {
@@ -439,7 +590,7 @@ impl Scan {
     }
 
     fn ceiling_reached(&self) -> Error {
-        self.limited(ResourceLimit::CommandWorkerTime, nanos(self.options.ceiling), nanos(self.stats.admitted), None)
+        self.limited(ResourceLimit::CommandWorkerTime, nanos(self.options.ceiling), nanos(self.admitted_cost()), None)
     }
 
     fn wait(&mut self, seen: u64, now: MonotonicTime) {
@@ -454,7 +605,8 @@ impl Scan {
     fn admit(&mut self, id: GrantId, path: &RelativePath, need: Need) -> Result<Admission> {
         let admitted = loop {
             self.check_cancelled()?;
-            let remaining = self.options.ceiling.saturating_sub(self.stats.admitted);
+            self.governor.account_and_quarantine(self.now());
+            let remaining = self.options.ceiling.saturating_sub(self.admitted_cost());
             if remaining.is_zero() {
                 return Err(self.ceiling_reached());
             }
@@ -496,12 +648,29 @@ impl Scan {
             }
         };
         self.stats.admitted += admitted.cost;
+        if id.tree().is_none() {
+            self.bootstrap_charged += admitted.cost;
+        }
         self.stats.grants += 1;
         let held = Held { id, governor: self.governor.clone(), clock: self.clock.clone(), base: self.base };
         loop {
             self.check_cancelled()?;
             let seen = self.governor.changes();
             let now = self.now();
+            self.governor.account_and_quarantine(now);
+            if self.accounting.is_some() {
+                // This grant's reservation is already charged and may fill
+                // the ceiling exactly. Abort only if continuing physical
+                // work has pushed the command beyond its admitted budget.
+                if self.admitted_cost() > self.options.ceiling {
+                    return Err(self.ceiling_reached());
+                }
+            }
+            if let Some(domain) = need.domain
+                && self.governor.quarantined(Some(domain))
+            {
+                return Ok(Admission::Quarantined(domain));
+            }
             if self.governor.try_start(id, now).is_ok() {
                 break;
             }
@@ -536,12 +705,8 @@ impl Scan {
         drop(granted);
     }
 
-    fn record(&self, domain: Option<StorageDomainId>, failed: bool) {
-        let now = self.now();
-        if failed {
-            self.governor.charge_surcharge(domain, WorkOrigin::Foreground, now);
-        }
-        self.governor.record_outcome(domain, failed, now);
+    fn record_success(&self, domain: Option<StorageDomainId>) {
+        self.governor.record_outcome(domain, false, self.now());
     }
 
     fn bootstrap<T>(
@@ -555,7 +720,13 @@ impl Scan {
             Admission::Quarantined(_) => return Err(Error::Stuck),
         };
         let outcome = work(self.filesystem.as_ref());
-        self.stats.admitted += self.governor.overshoot_of(id);
+        if outcome.is_err() {
+            granted.held.failed();
+        }
+        self.governor.account(self.now());
+        let overshoot = self.governor.overshoot_of(id);
+        self.stats.admitted += overshoot;
+        self.bootstrap_charged += overshoot;
         outcome.map(|value| (value, granted.held)).map_err(Error::from)
     }
 
@@ -590,15 +761,8 @@ impl Scan {
         u32::try_from(self.options.operations_per_lease).unwrap_or(u32::MAX).max(1)
     }
 
-    fn anchor_room(&mut self) -> bool {
-        if self.options.anchors == 0 {
-            return false;
-        }
-        let room = self.live_anchors.load(Ordering::SeqCst) < self.options.anchors;
-        if !room {
-            self.stats.anchors_withheld += 1;
-        }
-        room
+    fn anchor_room(&self) -> bool {
+        self.live_anchors.load(Ordering::SeqCst) < self.options.anchors
     }
 
     fn locate(
@@ -608,13 +772,21 @@ impl Scan {
         context: &PolicyContext,
         site: Site,
         beneath: Option<&Anchor>,
+        listing_allowed: bool,
     ) -> Result<Option<(Arc<Located>, Option<Granted>)>> {
         let (probe, parent, granted) = match site {
             Site::Located(located) => return Ok(Some((located, None))),
             Site::Probed { probe, parent } => (*probe, parent, None),
             Site::Beneath(parent) => {
-                let operations = self.lease_operations(&parent.probe, false);
-                let need = Need { reads: 2, operations, lease: 0, domain: Some(parent.domain), listing: true };
+                let separate = self.listing_executor.is_some() || !listing_allowed;
+                let operations = if separate { 0 } else { self.lease_operations(&parent.probe, false) };
+                let need = Need {
+                    reads: if separate { 1 } else { 2 },
+                    operations,
+                    lease: 0,
+                    domain: Some(parent.domain),
+                    listing: !separate,
+                };
                 let granted = match self.admit(id, path, need)? {
                     Admission::Granted(granted) => granted,
                     Admission::Quarantined(domain) => {
@@ -627,8 +799,8 @@ impl Scan {
                 match resolved {
                     Ok(probe) => (probe, parent, Some(granted)),
                     Err(error) => {
+                        granted.held.failed();
                         self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(parent.domain));
-                        self.record(Some(parent.domain), true);
                         if let Some(fatal) = fatal(&error) {
                             return Err(fatal);
                         }
@@ -644,7 +816,7 @@ impl Scan {
             if mode != DomainCrossing::Follow {
                 if let Some(granted) = granted {
                     self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(domain));
-                    self.record(Some(domain), false);
+                    self.record_success(Some(domain));
                 }
                 self.stats.boundaries += 1;
                 self.pending.push_back(ScanEvent::Boundary { path: path.clone(), mode, domain });
@@ -668,24 +840,191 @@ impl Scan {
         self.stats.entries_enumerated += cost.entries_enumerated;
     }
 
+    fn resume_on_worker(
+        &mut self,
+        worker: executor::Worker,
+        granted: Granted,
+        session: Box<dyn ListingSession>,
+        lease: Lease,
+        domain: StorageDomainId,
+    ) -> Result<Option<(Continuation, SessionCost, ListingResources)>> {
+        let id = granted.held.id;
+        let mut memory = ListingResources {
+            grant: Some(granted),
+            governor: self.governor.clone(),
+            number: self.governor.next_tree(),
+            _scan: self.accounting.as_ref().expect("executor accounting").clone(),
+        };
+        let bytes = self.listing_bytes();
+        self.governor.try_reserve_scan_memory(self.number, memory.number, bytes).map_err(|mut limited| {
+            limited.domain = Some(domain);
+            Error::ResourceLimited(limited)
+        })?;
+        let cancel = self.cancel.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        worker.run(move || {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let (continuation, cost) = session.resume(lease);
+            if failed_listing(&continuation) {
+                memory.grant.as_ref().expect("physical grant").held.failed();
+            }
+            let held = &memory.grant.as_ref().expect("physical grant").held;
+            let now = MonotonicTime(held.clock.now().saturating_duration_since(held.base));
+            let governor = &held.governor;
+            governor.report(
+                id,
+                Reported {
+                    blocking: cost.blocking,
+                    operations: cost.listing_operations.saturating_add(cost.per_child_operations()),
+                },
+                now,
+            );
+            let overshoot = governor.overshoot_of(id);
+            drop(memory.grant.take());
+            // On cancellation/timeout the receiver is gone: the returned
+            // session and its buffer are dropped here, after the
+            // physical call completes.
+            let _ = sender.send((continuation, cost, overshoot, memory));
+        })?;
+        self.in_flight_bytes = 0;
+        self.report_memory();
+        loop {
+            self.check_cancelled()?;
+            match receiver.recv_timeout(executor::CHECK_INTERVAL) {
+                Ok((continuation, cost, overshoot, memory)) => {
+                    self.governor
+                        .try_return_scan_memory(memory.number, self.number, cost.bytes)
+                        .map_err(Error::ResourceLimited)?;
+                    self.in_flight_bytes = cost.bytes;
+                    self.reported = (self.stats.buffered_bytes, cost.bytes);
+                    self.stats.admitted += overshoot;
+                    return Ok(Some((continuation, cost, memory)));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.check_cancelled()?;
+                    return Err(Error::WorkerLost);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let now = self.now();
+            self.governor.account_and_quarantine(now);
+            if self.admitted_cost() >= self.options.ceiling {
+                return Err(self.ceiling_reached());
+            }
+            if self.governor.stuck_grants().iter().any(|grant| grant.id == id) {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn listing_bytes(&self) -> u64 {
+        let limits = self.governor.limits();
+        let allowance = if self.listing_executor.is_some() {
+            // A detached call can retain its whole allowance. Leave room for
+            // other physical slots instead of reserving the host's entire pool.
+            (limits.in_flight_listing_bytes / limits.maximum_in_flight as u64).max(1)
+        } else {
+            limits.in_flight_listing_bytes
+        };
+        allowance.min(limits.accounted_memory_ceiling.saturating_sub(self.stats.buffered_bytes))
+    }
+
     fn list(&mut self, target: Target) -> Result<()> {
         let Target { path, context, site, beneath } = target;
+        let anchored = self.anchor_room();
+        let listing_allowed = anchored || self.options.anchor_policy == AnchorPolicy::Optional;
         let id = self.next_grant();
-        let Some((located, mut carried)) = self.locate(id, &path, &context, site, beneath.as_ref())? else {
+        let Some((located, mut carried)) = self.locate(id, &path, &context, site, beneath.as_ref(), listing_allowed)?
+        else {
             return Ok(());
         };
         let domain = located.domain;
-        let anchored = self.anchor_room();
-        let ceilings = Ceilings {
-            entries: self.options.entries_per_directory,
-            bytes: self.governor.limits().in_flight_listing_bytes,
-        };
+        // Domain resolution remains inline. Do not hold its physical grant
+        // while waiting for an executor slot, or charge worker queue
+        // time as filesystem work.
+        if (self.listing_executor.is_some() || !listing_allowed)
+            && let Some(granted) = carried.take()
+        {
+            self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(domain));
+        }
+        if !anchored && self.options.anchors > 0 {
+            self.stats.anchors_withheld += 1;
+        }
+        if !listing_allowed {
+            self.unlisted(
+                path,
+                ScanFailure::ResourceLimited(ResourceLimited {
+                    limit: ResourceLimit::Anchors,
+                    configured: self.options.anchors as u64,
+                    observed: self.live_anchors.load(Ordering::SeqCst) as u64 + 1,
+                    domain: Some(domain),
+                }),
+            );
+            return Ok(());
+        }
+        let ceilings = Ceilings { entries: self.options.entries_per_directory, bytes: self.listing_bytes() };
+        if ceilings.bytes == 0 {
+            return Err(self.limited(
+                ResourceLimit::AccountedMemory,
+                self.governor.memory_ceiling(),
+                self.stats.buffered_bytes.saturating_add(1),
+                Some(domain),
+            ));
+        }
+        // Reserve before session construction, which may already create an
+        // anchor. The session wrapper retains this slot through detachment.
+        let slot = anchored.then(|| {
+            let (slot, live) = crate::fs::AnchorSlot::reserve(&self.live_anchors);
+            self.stats.anchors_peak = self.stats.anchors_peak.max(live);
+            slot
+        });
         let at = ListingAt { beneath: beneath.as_ref(), anchored };
-        let mut session: Box<dyn ListingSession> =
+        let session: Box<dyn ListingSession> =
             self.filesystem.open_listing_at(&self.root, &path, at, ceilings, self.cancel.clone());
-        let mut lease = 0;
-        let mut starved = false;
+        let session = anchors::track(session, slot);
+        if self.options.streaming && !session.supports_chunks() {
+            return Err(Error::InvalidConfig("streaming requires a chunk-capable listing session".into()));
+        }
+        self.resume_listing(Listing {
+            path,
+            context,
+            located,
+            id,
+            carried,
+            session,
+            lease: 0,
+            starved: false,
+            emitted_bytes: 0,
+        })
+    }
+
+    fn resume_listing(&mut self, listing: Listing) -> Result<()> {
+        let Listing { path, context, located, id, mut carried, mut session, mut lease, mut starved, mut emitted_bytes } =
+            listing;
+        let domain = located.domain;
         let outcome = loop {
+            let worker = if let Some(executor) = &self.listing_executor {
+                match executor.acquire(&self.cancel, || {
+                    self.governor.account_and_quarantine(self.now());
+                    if self.admitted_cost() >= self.options.ceiling {
+                        return Err(self.ceiling_reached());
+                    }
+                    if self.governor.quarantined(Some(domain)) { Err(Error::Stuck) } else { Ok(()) }
+                }) {
+                    Ok(worker) => Some(worker),
+                    Err(Error::Stuck) => {
+                        self.in_flight_bytes = 0;
+                        self.report_memory();
+                        self.unlisted(path, ScanFailure::Quarantined(domain));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
             let resolution = u32::from(carried.is_some());
             let granted = match carried.take() {
                 Some(granted) => granted,
@@ -708,20 +1047,58 @@ impl Scan {
                 }
             };
             let permitted = usize::try_from(granted.operations).unwrap_or(usize::MAX);
-            let (continuation, cost) =
-                session.resume(Lease { entries: self.options.entries_per_lease, operations: permitted });
+            let lease_budget = Lease { entries: self.options.entries_per_lease, operations: permitted };
+            let (continuation, cost, memory) = if let Some(worker) = worker {
+                match self.resume_on_worker(worker, granted, session, lease_budget, domain)? {
+                    Some((continuation, cost, memory)) => (continuation, cost, Some(memory)),
+                    None => {
+                        self.unlisted(path, ScanFailure::Quarantined(domain));
+                        return Ok(());
+                    }
+                }
+            } else {
+                let (continuation, cost) = session.resume(lease_budget);
+                if failed_listing(&continuation) {
+                    granted.held.failed();
+                }
+                let operations = cost.listing_operations.saturating_add(cost.per_child_operations()) + resolution;
+                self.settle(granted, Some(Reported { blocking: cost.blocking, operations }), Some(domain));
+                (continuation, cost, None)
+            };
             self.count(&cost);
-            let operations = cost.listing_operations.saturating_add(cost.per_child_operations()) + resolution;
-            self.settle(granted, Some(Reported { blocking: cost.blocking, operations }), Some(domain));
             self.in_flight_bytes = cost.bytes;
             self.report_memory();
+            drop(memory);
             match continuation {
-                Continuation::Suspended(next) => {
+                Continuation::Suspended(mut next) => {
                     starved = cost.entries_enumerated == 0;
                     lease += 1;
+                    if self.options.streaming
+                        && let Some(chunk) = next.take_chunk()
+                    {
+                        emitted_bytes = emitted_bytes.saturating_add(cost.bytes);
+                        self.in_flight_bytes = 0;
+                        let resume = Node::Resume(Box::new(Listing {
+                            path: path.clone(),
+                            context: context.clone(),
+                            located: located.clone(),
+                            id,
+                            carried: None,
+                            session: next,
+                            lease,
+                            starved,
+                            emitted_bytes,
+                        }));
+                        let before = self.stack.len();
+                        self.accept_listing(path, context, located, chunk)?;
+                        if self.stack.len() > before {
+                            self.stack.insert(before, resume);
+                        }
+                        return Ok(());
+                    }
                     session = next;
                 }
-                Continuation::Finished(outcome) => break (outcome, cost.bytes),
+                Continuation::Finished(outcome) => break (outcome, emitted_bytes.saturating_add(cost.bytes)),
             }
         };
         let (outcome, bytes) = outcome;
@@ -729,52 +1106,17 @@ impl Scan {
         let now = self.now();
         self.governor.record_bytes(Some(domain), bytes, now);
         match outcome {
-            SessionOutcome::Complete(mut listing) => {
-                self.record(Some(domain), false);
-                let anchor = listing.anchor.take();
-                if let Some(anchor) = &anchor {
-                    anchor.count_in(&self.live_anchors);
-                    let live = self.live_anchors.load(Ordering::SeqCst);
-                    self.stats.anchors_peak = self.stats.anchors_peak.max(live);
-                }
-                let child_context = self.policy.child_context(&context, &path, &listing);
-                let supplied = listing.supplied_fields.intersect(self.options.fields);
-                let missing = self.options.fields.without(listing.supplied_fields);
-                let enriched = match missing.any() && !listing.entries.is_empty() {
-                    true => {
-                        let names = listing.entries.iter().map(|entry| entry.name.clone()).collect();
-                        self.enrich(&path, domain, names, missing)?
-                    }
-                    false => HashMap::new(),
-                };
-                let bytes = listing.entries.iter().map(|entry| entry_bytes(&entry.name)).sum::<u64>();
-                self.stats.buffered_bytes = self.stats.buffered_bytes.saturating_add(bytes);
-                self.stats.peak_buffered_bytes = self.stats.peak_buffered_bytes.max(self.stats.buffered_bytes);
-                self.report_memory();
-                self.stack.push(Node::Children(Box::new(Frame {
-                    path,
-                    context: child_context,
-                    located,
-                    anchor,
-                    children: listing.entries.into_iter(),
-                    supplied,
-                    enriched,
-                    bytes,
-                })));
-            }
+            SessionOutcome::Complete(listing) => self.accept_listing(path, context, located, listing)?,
             SessionOutcome::Cancelled => {
-                self.record(Some(domain), true);
                 self.report_memory();
                 return Err(Error::Cancelled);
             }
             SessionOutcome::ResourceLimited(mut limited) => {
-                self.record(Some(domain), true);
                 self.report_memory();
                 limited.domain = Some(domain);
                 self.unlisted(path, ScanFailure::ResourceLimited(limited));
             }
             SessionOutcome::Failed(error) => {
-                self.record(Some(domain), true);
                 self.report_memory();
                 if let Some(fatal) = fatal(&error) {
                     return Err(fatal);
@@ -782,6 +1124,58 @@ impl Scan {
                 self.unlisted(path, ScanFailure::Fs(error));
             }
         }
+        Ok(())
+    }
+
+    fn accept_listing(
+        &mut self,
+        path: RelativePath,
+        context: PolicyContext,
+        located: Arc<Located>,
+        mut listing: crate::fs::DirectoryListing,
+    ) -> Result<()> {
+        let domain = located.domain;
+        self.record_success(Some(domain));
+        let anchor = listing.anchor.take();
+        if anchor.is_none() && self.options.anchor_policy == AnchorPolicy::Required {
+            self.report_memory();
+            self.unlisted(
+                path,
+                ScanFailure::ResourceLimited(ResourceLimited {
+                    limit: ResourceLimit::Anchors,
+                    configured: 0,
+                    observed: 1,
+                    domain: Some(domain),
+                }),
+            );
+            return Ok(());
+        }
+        let child_context = self.policy.child_context(&context, &path, &listing);
+        let supplied = listing.supplied_fields.intersect(self.options.fields);
+        let missing = self.options.fields.without(listing.supplied_fields);
+        let bytes = listing.entries.iter().map(|entry| entry_bytes(&entry.name)).sum::<u64>();
+        let retained = self.stats.buffered_bytes.saturating_add(bytes);
+        self.governor.try_retain_scan_memory(self.number, retained).map_err(Error::ResourceLimited)?;
+        self.stats.buffered_bytes = retained;
+        self.stats.peak_buffered_bytes = self.stats.peak_buffered_bytes.max(retained);
+        self.reported = (retained, 0);
+        let enriched = match missing.any() && !listing.entries.is_empty() {
+            true => {
+                let names = listing.entries.iter().map(|entry| entry.name.clone()).collect();
+                self.enrich(&path, domain, names, missing)?
+            }
+            false => HashMap::new(),
+        };
+        self.stack.push(Node::Children(Box::new(Frame {
+            path,
+            context: child_context,
+            located,
+            anchor,
+            children: listing.entries.into_iter(),
+            supplied,
+            enriched,
+            bytes,
+        })));
         Ok(())
     }
 
@@ -816,9 +1210,15 @@ impl Scan {
             self.stats.enrichments += 1;
             match enriched {
                 Ok(enrichment) => {
+                    let failed = !enrichment.failed.is_empty() || enrichment.children.len() != batch.children.len();
+                    if failed {
+                        granted.held.failed();
+                    }
                     let reported = Reported { blocking: None, operations: enrichment.metadata_operations };
                     self.settle(granted, Some(reported), Some(domain));
-                    self.record(Some(domain), false);
+                    if !failed {
+                        self.record_success(Some(domain));
+                    }
                     self.stats.metadata_operations += u64::from(enrichment.metadata_operations);
                     for (name, metadata) in enrichment.children {
                         results.insert(name, Ok(metadata));
@@ -834,8 +1234,8 @@ impl Scan {
                     }
                 }
                 Err(error) => {
+                    granted.held.failed();
                     self.settle(granted, None, Some(domain));
-                    self.record(Some(domain), true);
                     if let Some(fatal) = fatal(&error) {
                         return Err(fatal);
                     }
@@ -926,6 +1326,7 @@ impl Scan {
             };
             match node {
                 Node::List(target) => self.list(target)?,
+                Node::Resume(listing) => self.resume_listing(*listing)?,
                 Node::Children(mut frame) => match frame.children.next() {
                     Some(child) => {
                         let (event, target) = self.child(&mut frame, child);
@@ -946,7 +1347,12 @@ impl Scan {
         self.stack.clear();
         self.stats.buffered_bytes = 0;
         self.in_flight_bytes = 0;
-        self.governor.forget_tree(self.number);
+        if self.accounting.is_some() {
+            self.cancel.cancel();
+            self.report_memory();
+        } else {
+            self.governor.forget_tree(self.number);
+        }
     }
 }
 
@@ -985,6 +1391,11 @@ impl Iterator for Scan {
 
 impl Drop for Scan {
     fn drop(&mut self) {
-        self.governor.forget_tree(self.number);
+        if self.accounting.is_some() {
+            self.cancel.cancel();
+            self.governor.report_memory(self.number, 0, 0);
+        } else {
+            self.governor.forget_tree(self.number);
+        }
     }
 }

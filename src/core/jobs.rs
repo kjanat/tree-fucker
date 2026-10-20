@@ -356,11 +356,7 @@ impl Coordinator {
         }
         let surcharged = matches!(
             outcome,
-            JobOutcome::Failed(_)
-                | JobOutcome::Rejected(_)
-                | JobOutcome::Cancelled
-                | JobOutcome::WorkerLost
-                | JobOutcome::Stuck
+            JobOutcome::Failed(_) | JobOutcome::Rejected(_) | JobOutcome::Cancelled | JobOutcome::WorkerLost
         );
         if surcharged {
             self.governor.charge_surcharge(domain, job.origin, now);
@@ -370,9 +366,10 @@ impl Coordinator {
             JobOutcome::Failed(_)
             | JobOutcome::Rejected(_)
             | JobOutcome::AncestorNotDirectory
-            | JobOutcome::WorkerLost
-            | JobOutcome::Stuck => self.governor.record_outcome(domain, true, now),
-            JobOutcome::Removed
+            | JobOutcome::WorkerLost => self.governor.record_outcome(domain, true, now),
+            // The physical stuck transition already recorded its failure.
+            JobOutcome::Stuck
+            | JobOutcome::Removed
             | JobOutcome::ResultMismatch
             | JobOutcome::WatcherRegistrationFailed
             | JobOutcome::Stale

@@ -511,8 +511,9 @@ impl EntrySource for PlatformSource {
     }
 
     #[cfg(not(unix))]
-    fn anchor(&self, path: &Path) -> Option<Anchor> {
-        Some(Anchor::new(DirectoryAnchor { path: path.to_path_buf() }))
+    fn anchor(&self, _path: &Path) -> Option<Anchor> {
+        // A path alone cannot preserve the identity of the listed directory.
+        None
     }
 }
 
@@ -538,6 +539,8 @@ pub struct StdSession<S> {
     entries: Vec<DirEntry>,
     bytes: u64,
     anchored: bool,
+    anchor: Option<Anchor>,
+    enumerated: usize,
 }
 
 impl<S: EntrySource + 'static> StdSession<S> {
@@ -556,6 +559,8 @@ impl<S: EntrySource + 'static> StdSession<S> {
             entries: Vec::new(),
             bytes: 0,
             anchored: false,
+            anchor: None,
+            enumerated: 0,
         }
     }
 
@@ -569,7 +574,11 @@ impl<S: EntrySource + 'static> StdSession<S> {
         self.stream = match stream {
             Stream::Unopened(opener) => {
                 cost.listing_operations += 1;
-                Stream::Open(opener()?)
+                let opened = opener()?;
+                if self.anchored {
+                    self.anchor = opened.source.anchor(&self.full);
+                }
+                Stream::Open(opened)
             }
             other => other,
         };
@@ -577,6 +586,7 @@ impl<S: EntrySource + 'static> StdSession<S> {
     }
 
     fn push(&mut self, name: OsString, kind: ObservedKind, identity: Option<FileIdentity>, metadata: Metadata) {
+        self.enumerated += 1;
         self.bytes += entry_bytes(&name);
         self.entries.push(DirEntry::new(name, Observation { kind, metadata, identity }));
     }
@@ -695,7 +705,7 @@ impl<S: EntrySource + 'static> StdSession<S> {
             entries: std::mem::take(&mut self.entries),
             supplied_fields: inline_metadata_sources().inline(),
             domain: Box::new(opened.domain.clone()),
-            anchor: if self.anchored { opened.source.anchor(&self.full) } else { None },
+            anchor: self.anchor.clone(),
         })
     }
 
@@ -709,6 +719,23 @@ impl<S: EntrySource + 'static> StdSession<S> {
 }
 
 impl<S: EntrySource + 'static> ListingSession for StdSession<S> {
+    fn supports_chunks(&self) -> bool {
+        true
+    }
+
+    fn take_chunk(&mut self) -> Option<DirectoryListing> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        match self.complete() {
+            SessionOutcome::Complete(listing) => {
+                self.bytes = 0;
+                Some(listing)
+            }
+            _ => None,
+        }
+    }
+
     fn resume(mut self: Box<Self>, lease: Lease) -> (Continuation, SessionCost) {
         let started = Instant::now();
         let mut cost = SessionCost::default();
@@ -739,7 +766,7 @@ impl<S: EntrySource + 'static> ListingSession for StdSession<S> {
                 Ok(end) => end,
                 Err(err) => return finish(&mut cost, self.bytes, started, SessionOutcome::Failed(err)),
             };
-            if let Some(limited) = self.ceilings.exceeded_by(self.entries.len(), self.bytes) {
+            if let Some(limited) = self.ceilings.exceeded_by(self.enumerated, self.bytes) {
                 return finish(&mut cost, self.bytes, started, SessionOutcome::ResourceLimited(limited));
             }
             match end {

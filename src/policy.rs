@@ -46,6 +46,11 @@ impl fmt::Debug for PolicyContext {
 }
 
 pub trait ScanPolicy: Send + Sync {
+    /// True only when child_context does not require a complete listing.
+    fn supports_chunks(&self) -> bool {
+        false
+    }
+
     fn revision(&self) -> PolicyRevision;
     fn root_context(&self, root: &EntryInfo) -> PolicyContext;
     fn classify(&self, parent: &PolicyContext, path: &RelativePath, info: &EntryInfo) -> ScanDecision;
@@ -94,6 +99,10 @@ impl<F> ScanPolicy for PathPredicate<F>
 where
     F: Fn(&RelativePath, EntryKind) -> ScanDecision + Send + Sync,
 {
+    fn supports_chunks(&self) -> bool {
+        true
+    }
+
     fn revision(&self) -> PolicyRevision {
         PolicyRevision::new(self.revision.load(Ordering::SeqCst))
     }
@@ -119,6 +128,10 @@ where
 pub struct LoadAll;
 
 impl ScanPolicy for LoadAll {
+    fn supports_chunks(&self) -> bool {
+        true
+    }
+
     fn revision(&self) -> PolicyRevision {
         PolicyRevision::new(0)
     }
@@ -146,6 +159,10 @@ pub struct LoadDepth {
 }
 
 impl ScanPolicy for LoadDepth {
+    fn supports_chunks(&self) -> bool {
+        true
+    }
+
     fn revision(&self) -> PolicyRevision {
         PolicyRevision::new(0)
     }

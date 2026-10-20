@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -8,7 +8,7 @@ use crate::config::HostConfig;
 use crate::domain::{AccessTopology, DomainCapabilities, MediaHint, StorageDomainId};
 use crate::ids::{JobId, WatchReleaseId, WatchRequestId};
 use crate::path::RelativePath;
-use crate::update::ThrottleCause;
+use crate::update::{ResourceLimit, ResourceLimited, ThrottleCause};
 
 const LATENCY_HISTORY: usize = 32;
 const QUEUE_HISTORY: usize = 8;
@@ -492,6 +492,7 @@ pub struct Governor {
     stuck_threshold: Duration,
     surcharge: Duration,
     grants: BTreeMap<GrantId, Grant>,
+    failed_grants: BTreeSet<GrantId>,
     running: BTreeMap<Option<StorageDomainId>, usize>,
     stuck: BTreeMap<Option<StorageDomainId>, usize>,
     running_total: usize,
@@ -533,6 +534,7 @@ impl Governor {
             stuck_threshold: config.stuck_threshold,
             surcharge: config.failure_surcharge,
             grants: BTreeMap::new(),
+            failed_grants: BTreeSet::new(),
             running: BTreeMap::new(),
             stuck: BTreeMap::new(),
             running_total: 0,
@@ -1063,6 +1065,7 @@ impl Governor {
         let Some(grant) = self.grants.remove(&id) else {
             return;
         };
+        self.failed_grants.remove(&id);
         if grant.domain.is_none() {
             self.bootstrap_outstanding = (self.bootstrap_outstanding - nanos(grant.reserved)).max(0);
         }
@@ -1143,6 +1146,16 @@ impl Governor {
             .collect()
     }
 
+    pub(crate) fn record_grant_failure(&mut self, id: GrantId, now: MonotonicTime) {
+        let Some(grant) = self.grants.get(&id) else { return };
+        if grant.started.is_none() || !self.failed_grants.insert(id) {
+            return;
+        }
+        let (domain, origin) = (grant.domain, grant.origin);
+        self.charge_surcharge(domain, origin, now);
+        self.record_outcome(domain, true, now);
+    }
+
     pub fn mark_stuck(&mut self, id: GrantId, now: MonotonicTime) {
         let Some(grant) = self.grants.get_mut(&id) else {
             return;
@@ -1160,6 +1173,7 @@ impl Governor {
         if let Some(id) = domain {
             self.domain_mut(id, now).adapt(true);
         }
+        self.record_grant_failure(id, now);
     }
 
     pub fn domain_of_grant(&self, id: GrantId) -> Option<StorageDomainId> {
@@ -1485,6 +1499,83 @@ impl HostGovernor {
         self.changed();
     }
 
+    pub(crate) fn try_reserve_scan_memory(
+        &self,
+        source: TreeNumber,
+        tree: TreeNumber,
+        bytes: u64,
+    ) -> Result<(), ResourceLimited> {
+        let mut governor = guard(&self.inner);
+        let (snapshot, previous) = governor.memory.get(&source).copied().unwrap_or((0, 0));
+        for (limit, configured, observed) in [
+            (
+                ResourceLimit::AccountedMemory,
+                governor.memory_ceiling(),
+                governor.memory_total.saturating_sub(previous).saturating_add(bytes),
+            ),
+            (
+                ResourceLimit::InFlightBytes,
+                governor.config.in_flight_listing_bytes,
+                governor.in_flight_total.saturating_sub(previous).saturating_add(bytes),
+            ),
+        ] {
+            if observed > configured {
+                return Err(ResourceLimited { limit, configured, observed, domain: None });
+            }
+        }
+        governor.report_memory(source, snapshot, 0);
+        governor.report_memory(tree, 0, bytes);
+        drop(governor);
+        self.changed();
+        Ok(())
+    }
+
+    pub(crate) fn try_retain_scan_memory(&self, tree: TreeNumber, bytes: u64) -> Result<(), ResourceLimited> {
+        let mut governor = guard(&self.inner);
+        let (snapshot, in_flight) = governor.memory.get(&tree).copied().unwrap_or((0, 0));
+        let observed = governor.memory_total.saturating_sub(snapshot).saturating_sub(in_flight).saturating_add(bytes);
+        let configured = governor.memory_ceiling();
+        if observed > configured {
+            return Err(ResourceLimited { limit: ResourceLimit::AccountedMemory, configured, observed, domain: None });
+        }
+        governor.report_memory(tree, bytes, 0);
+        drop(governor);
+        self.changed();
+        Ok(())
+    }
+
+    pub(crate) fn try_return_scan_memory(
+        &self,
+        reservation: TreeNumber,
+        scan: TreeNumber,
+        bytes: u64,
+    ) -> Result<(), ResourceLimited> {
+        let mut governor = guard(&self.inner);
+        let (_, reserved) = governor.memory.get(&reservation).copied().unwrap_or((0, 0));
+        let (retained, previous) = governor.memory.get(&scan).copied().unwrap_or((0, 0));
+        for (limit, configured, observed) in [
+            (
+                ResourceLimit::AccountedMemory,
+                governor.memory_ceiling(),
+                governor.memory_total.saturating_sub(reserved).saturating_sub(previous).saturating_add(bytes),
+            ),
+            (
+                ResourceLimit::InFlightBytes,
+                governor.config.in_flight_listing_bytes,
+                governor.in_flight_total.saturating_sub(reserved).saturating_sub(previous).saturating_add(bytes),
+            ),
+        ] {
+            if observed > configured {
+                return Err(ResourceLimited { limit, configured, observed, domain: None });
+            }
+        }
+        governor.report_memory(reservation, 0, 0);
+        governor.report_memory(scan, retained, bytes);
+        drop(governor);
+        self.changed();
+        Ok(())
+    }
+
     pub fn forget_tree(&self, tree: TreeNumber) {
         guard(&self.inner).forget_tree(tree);
         self.changed();
@@ -1575,12 +1666,40 @@ impl HostGovernor {
     }
 
     pub fn release(&self, id: GrantId, now: MonotonicTime) {
-        guard(&self.inner).release(id, now);
+        self.release_was_stuck(id, now);
+    }
+
+    pub(crate) fn release_was_stuck(&self, id: GrantId, now: MonotonicTime) -> bool {
+        let mut governor = guard(&self.inner);
+        let stuck = governor.grants.get(&id).is_some_and(|grant| grant.stuck);
+        governor.release(id, now);
+        drop(governor);
         self.changed();
+        stuck
     }
 
     pub fn record_outcome(&self, domain: Option<StorageDomainId>, error: bool, now: MonotonicTime) {
         guard(&self.inner).record_outcome(domain, error, now)
+    }
+
+    /// Cooperatively supervise live calls even after their original waiter
+    /// left.
+    pub(crate) fn account_and_quarantine(&self, now: MonotonicTime) {
+        let mut governor = guard(&self.inner);
+        governor.account(now);
+        let newly_stuck = governor.newly_stuck(now);
+        let changed = !newly_stuck.is_empty();
+        for id in newly_stuck {
+            governor.mark_stuck(id, now);
+        }
+        drop(governor);
+        if changed {
+            self.changed();
+        }
+    }
+
+    pub(crate) fn record_grant_failure(&self, id: GrantId, now: MonotonicTime) {
+        guard(&self.inner).record_grant_failure(id, now);
     }
 
     pub fn newly_stuck(&self, now: MonotonicTime) -> Vec<GrantId> {
@@ -1645,5 +1764,78 @@ impl HostGovernor {
 
     pub fn view(&self, now: MonotonicTime) -> GovernorView {
         guard(&self.inner).view(now)
+    }
+}
+
+#[cfg(test)]
+mod scan_memory_tests {
+    use super::*;
+
+    #[test]
+    fn returned_buffers_leave_real_capacity_available_before_reservation_cleanup() {
+        let governor = HostGovernor::independent(&HostConfig {
+            accounted_memory_ceiling: 1000,
+            in_flight_listing_bytes: 1000,
+            ..Default::default()
+        });
+        let scan = governor.next_tree();
+        let reservation = governor.next_tree();
+        let other = governor.next_tree();
+        let other_reservation = governor.next_tree();
+        governor.try_reserve_scan_memory(scan, reservation, 800).unwrap();
+        governor.try_return_scan_memory(reservation, scan, 400).unwrap();
+        // The returned resource owner is still alive. Another scan must be
+        // able to reserve all genuinely free capacity before it is dropped.
+        governor.try_reserve_scan_memory(other, other_reservation, 600).unwrap();
+        assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
+        governor.forget_tree(reservation);
+        assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
+        // Reject an adapter's oversized result without losing either charge.
+        assert!(governor.try_return_scan_memory(other_reservation, other, 601).is_err());
+        assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_physical_failure_is_recorded_once_until_its_lease_is_released() {
+        let config = HostConfig { foreground_duty: 1.0, domain_foreground_duty: 1.0, ..Default::default() };
+        let mut governor = Governor::new(&config, MonotonicTime::ZERO);
+        let domain = StorageDomainId::of(&crate::domain::DomainKey::declared(9876));
+        let id = GrantId::Bootstrap(1);
+        let now = MonotonicTime::ZERO;
+        for lease in 0..2 {
+            governor
+                .try_admit(
+                    Reservation {
+                        id,
+                        path: RelativePath::root(),
+                        reads: 1,
+                        registrations: 0,
+                        operations: 0,
+                        ceiling: None,
+                        lease,
+                        domain: Some(domain),
+                        origin: WorkOrigin::Foreground,
+                        listing: false,
+                    },
+                    now,
+                )
+                .unwrap();
+            governor.record_grant_failure(id, now);
+            assert!(governor.failed_grants.is_empty(), "unstarted reservations cannot fail physically");
+            governor.start(id, now);
+            governor.mark_stuck(id, now);
+            governor.mark_stuck(id, now);
+            governor.record_grant_failure(id, now); // e.g. a late panic
+            assert_eq!(governor.view(now).surcharged, config.failure_surcharge * (lease + 1));
+            assert_eq!(governor.domains[&domain].errors.len(), (lease + 1) as usize);
+            assert!(governor.domains[&domain].errors.iter().all(|error| *error));
+            governor.release(id, now);
+            assert!(governor.failed_grants.is_empty());
+        }
     }
 }

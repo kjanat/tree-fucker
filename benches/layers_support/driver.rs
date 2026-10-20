@@ -69,8 +69,15 @@ pub fn main(allocations: bool) {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/benchmarks");
         std::fs::create_dir_all(&base).unwrap();
         let fixture = tempfile::Builder::new().prefix("layers-").tempdir_in(base).unwrap();
+        let shape = std::env::var("BENCH_FIXTURE_SHAPE").unwrap_or_else(|_| "balanced".into());
+        assert!(["balanced", "wide", "deep"].contains(&shape.as_str()), "unknown fixture shape");
+        eprintln!("fixture_shape={shape} listing_delay_us={}", super::delayed::delay().as_micros());
         for i in 0..files {
-            let dir = fixture.path().join(format!("group-{}", i % 10));
+            let dir = match shape.as_str() {
+                "wide" => fixture.path().to_path_buf(),
+                "deep" => (0..i % 64).fold(fixture.path().to_path_buf(), |path, _| path.join("d")),
+                _ => fixture.path().join(format!("group-{}", i % 10)),
+            };
             std::fs::create_dir_all(&dir).unwrap();
             let file = std::fs::File::create(dir.join(format!("quoted-'ü-{i}.rs"))).unwrap();
             file.set_len(if i % 7 == 0 { 1_000_001 } else { 64 }).unwrap();
@@ -78,7 +85,11 @@ pub fn main(allocations: bool) {
         std::fs::create_dir(fixture.path().join(".hidden")).unwrap();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("group-0", fixture.path().join("link-dir")).unwrap();
+            let directory_target = match shape.as_str() {
+                "wide" | "deep" => ".hidden",
+                _ => "group-0",
+            };
+            std::os::unix::fs::symlink(directory_target, fixture.path().join("link-dir")).unwrap();
             std::os::unix::fs::symlink("missing", fixture.path().join("dangling")).unwrap();
         }
         Some(fixture)
@@ -95,11 +106,13 @@ pub fn main(allocations: bool) {
     let _governor = tree_fucker::HostGovernor::install(tree_fucker::HostConfig {
         foreground_duty: 1.0,
         domain_foreground_duty: 1.0,
+        background_duty: 1.0,
+        domain_background_duty: 1.0,
         ..Default::default()
     })
     .unwrap();
     eprintln!("root={} runs={runs} warmups={warmups} allocations={allocations}", root.display());
-    println!("mode\trows\tmedian_ms\tmin_ms\tmax_ms\tallocations\treallocations\tbytes_allocated");
+    println!("mode\trows\tmedian_ms\tmin_ms\tmax_ms\tallocations\treallocations\tbytes_allocated\tfirst_result_ms");
     for mode in modes {
         assert!(super::MODES.contains(&mode), "unknown mode: {mode}");
         let expected = inventory(&root, mode.contains("size"));
@@ -110,16 +123,20 @@ pub fn main(allocations: bool) {
         verified.sort();
         assert_eq!(verified, expected, "path mismatch: {mode}");
         let mut times = Vec::with_capacity(runs);
+        let mut first_results = Vec::with_capacity(runs);
         let mut totals = [0usize; 3];
         for iteration in 0..warmups + runs {
             let region = stats_alloc::Region::new(&stats_alloc::INSTRUMENTED_SYSTEM);
             let start = Instant::now();
-            let count = super::measure(&root, mode, &mut |_| {}, false);
+            let (count, first) = super::measure(&root, mode, &mut |_| {}, false);
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let stats = region.change();
             assert_eq!(count, expected.len(), "row count changed during timing");
             if iteration >= warmups {
                 times.push(elapsed);
+                if let Some(first) = first {
+                    first_results.push(first.as_secs_f64() * 1000.0);
+                }
                 totals[0] += stats.allocations;
                 totals[1] += stats.reallocations;
                 totals[2] += stats.bytes_allocated;
@@ -128,8 +145,14 @@ pub fn main(allocations: bool) {
         assert_eq!(inventory(&root, mode.contains("size")), expected, "tree changed during measurement");
         times.sort_by(f64::total_cmp);
         let median = (times[(runs - 1) / 2] + times[runs / 2]) / 2.0;
+        first_results.sort_by(f64::total_cmp);
+        let first = if first_results.is_empty() {
+            "-".to_owned()
+        } else {
+            format!("{:.3}", (first_results[(runs - 1) / 2] + first_results[runs / 2]) / 2.0)
+        };
         println!(
-            "{mode}\t{}\t{median:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}",
+            "{mode}\t{}\t{median:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{first}",
             expected.len(),
             times[0],
             times[runs - 1],

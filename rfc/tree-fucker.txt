@@ -1031,12 +1031,57 @@ Abstract
           type Item = Result<ScanEvent>;
       }
 
-   A scan is synchronous. Each filesystem operation runs on the calling
-   thread after the host governor grants it, so a scan needs no runtime
-   adapter and occupies at most one worker slot at a time. A scan
-   waiting for admission sleeps until the earliest admissible time the
-   governor reports, or until the governor releases capacity when no
-   such time is computable. It does not poll.
+   A scan's iterator is synchronous. By default each filesystem
+   operation runs on the calling thread after the host governor grants
+   it, so a scan needs no runtime adapter and occupies at most one
+   worker slot at a time. A scan waiting for admission sleeps until the
+   earliest admissible time the governor reports, or until the governor
+   releases capacity when no such time is computable. It does not poll.
+
+   A caller MAY attach a ListingExecutor with with_listing_executor
+   after open. This opt-in dispatches ListingSession::resume on a
+   bounded reusable worker pool. Cloned executors share that bound. It
+   does not change bootstrap, domain resolution, session construction,
+   enrichment, or consumer-owned follow-up reads: those remain inline.
+   An executor slot is acquired before listing admission, without
+   holding a physical filesystem grant while waiting for that slot.
+   Domain resolution settles its own grant before the separate listing
+   grant.
+
+   While awaiting a dispatched listing, the scan checks cancellation and
+   its grant's stuck state at intervals no greater than 50 ms, subject
+   to scheduling. Once the grant reaches the configured stuck threshold,
+   the scan marks it stuck under Section 13.5, emits Unlisted with
+   Quarantined, and abandons that listing's eventual result. Healthy
+   domains can continue only while both executor and governor capacity
+   remain. A wholly occupied pool waits for completion or cancellation;
+   it MUST NOT manufacture replacement capacity. Pool waits MUST account
+   for continuing detached work and enforce the command worker-time
+   ceiling, even when no new filesystem operation can start. Admission,
+   pool, and physical-capacity waits MUST also detect newly stuck calls
+   abandoned by earlier scans. Same-domain work stops waiting and
+   reports Quarantined once its domain is quarantined.
+
+   Abandoning a result MUST NOT release physical ownership. The worker
+   retains the grant until its call returns, including on cancellation
+   or after the scan is dropped. It then reports cost, releases the
+   grant, and discards any abandoned continuation. Adapter panics become
+   WorkerLost without leaking the grant or permanently losing the slot.
+   A stuck transition records one failure surcharge and one domain error
+   for that physical grant. A later failure or panic from the same call
+   MUST NOT record the failure again. Persistent Tree coordinators also
+   honor stuck transitions detected by another scan or Tree.
+
+   A bounded listing reserves max(1, in_flight_listing_bytes divided by
+   maximum_in_flight) bytes, further capped by the host accounted-memory
+   ceiling minus this scan's retained buffers. The same ceiling is
+   passed to the adapter. Reservation and suspended-buffer accounting
+   transfer atomically. Reservations MUST respect both host memory
+   ceilings; failure terminates the scan with ResourceLimited. A
+   detached listing keeps its reservation until completion and disposal
+   of its result. Dropping the scan MUST NOT erase that reservation.
+   Inline listings also cap their buffers by the remaining per-scan
+   memory allowance.
 
    `open` canonicalizes the root, reads its metadata, and resolves its
    storage domain under bootstrap grants, then makes the root the first
@@ -1051,13 +1096,41 @@ Abstract
    work remains terminates with ResourceLimited naming CommandWorkerTime.
    Throttling delays a scan. It never truncates one.
 
-   Traversal is depth first. The scan lists a directory in full under
-   Section 10.2, yields its children in enumeration order, and lists a
-   child directory before it yields that directory's next sibling.
-   Complete is the only session outcome whose children are yielded. A
-   scan therefore holds at most one complete listing for each directory
-   on the current path, each bounded by the entries-per-directory limit,
-   and reports what it holds to the host governor as accounted memory.
+   After admission, a scan waiting for physical capacity MUST continue
+   accounting for detached calls. If their continuing work pushes the
+   command past its ceiling, the unstarted grant is released and the
+   scan terminates; running grants retain physical ownership. A grant
+   whose reservation exactly fills the ceiling may still start, because
+   that work has already been admitted and charged.
+
+   Traversal is depth first. By default the scan lists a directory in
+   full under Section 10.2, yields its children in enumeration order,
+   and lists a child directory before its next sibling. Only Complete
+   yields children in this mode. Retained listings along the active path
+   count against the host accounted-memory ceiling; each listing also
+   has an entries-per-directory and byte ceiling.
+
+   With ScanOptions::streaming, a chunk-capable ListingSession MAY
+   transfer entries after a suspended lease through take_chunk, without
+   performing filesystem work. The scan yields that chunk before
+   resuming the listing. Suspended cursors and at most one chunk per
+   active directory replace complete retained listings. The total
+   entries-per-directory ceiling MUST still span all chunks. A later
+   failure produces Unlisted without retracting earlier observations.
+   Dropping a scan discards its suspended cursors and buffered chunks.
+   SessionCost::bytes describes the current buffer, excluding chunks
+   already transferred. The scan retains their byte total separately
+   and combines it with the final buffer for one directory-size sample
+   in the governor. Lease boundaries MUST NOT reduce that sample to an
+   empty final buffer or a trailing chunk. This observation is not live
+   memory and MUST NOT keep emitted chunks charged as retained buffers.
+
+   Streaming requires both the session and ScanPolicy to declare
+   supports_chunks. The policy must be able to compute child_context
+   without the complete listing. Built-in path and depth policies meet
+   that requirement. Unsupported combinations fail explicitly with
+   InvalidConfig, rather than silently buffering a complete listing. The
+   persistent Tree continues to consume complete listings.
 
    The policy of Section 8 decides descent. The scan classifies the root
    and every child directory. An Eligible directory with
@@ -1067,10 +1140,12 @@ Abstract
 
    Before the scan lists a child directory, it resolves the child's
    storage domain unless the parent listing reported that domain inline.
-   The resolution is admitted together with the child's first listing
-   lease, as one grant that names both reads. When the scan holds the
-   anchor of the parent listing, both run beneath it under Section
-   10.2.
+   Inline execution admits resolution together with the child's first
+   listing lease, as one grant that names both reads. Bounded execution
+   admits resolution separately before dispatching the listing. When
+   the scan holds the anchor of the parent listing, both run beneath
+   it under Section 10.2. If required-anchor capacity is exhausted, only
+   resolution is admitted; the skipped listing MUST NOT be reserved.
    When the child is a domain crossing under Section 14.3, the crossing
    mode in the options, refined by the policy, decides. Follow lists the
    child under the child domain's buckets and window. Exclude and
@@ -1099,11 +1174,13 @@ Abstract
          ResourceLimited outcome naming the limit, the quarantined
          domain, or the child name that cannot be represented safely.
 
-   A directory's Entry precedes its Boundary or Unlisted event and
-   every event for its descendants. An Unlisted directory does not end
-   the scan, and its siblings continue. A listing on a domain
-   quarantined under Section 13.5 is reported as Unlisted at once, so a
-   dead mount cannot stall a scan of healthy domains.
+   A directory's Entry precedes its Boundary or Unlisted event and every
+   event for its descendants. An Unlisted directory does not end the
+   scan, and its siblings continue. A listing on a domain quarantined
+   under Section 13.5 is reported as Unlisted at once, so a previously
+   quarantined mount need not be listed. Detecting a newly blocked call
+   without waiting for its return requires the opt-in listing executor
+   and available capacity as described above.
 
    Metadata fields that the options request and the listing does not
    supply inline are read by enrichment under Section 10.1. An
@@ -1113,23 +1190,56 @@ Abstract
    reaching its ceiling, or when the listings it holds alone would
    exceed the accounted-memory ceiling. A terminated scan yields one
    error and then no further event. Events already yielded stand. A
-   scan holds no grant between events, so a consumer may stop iterating
-   and drop the scan at any point between events, and dropping it
-   releases its accounted memory. Cancellation from another thread sets
-   the token every listing session polls between chunks. A filesystem
-   call already inside the kernel runs to completion under Section 4.
+   default inline scan holds no grant between events, so a consumer may
+   stop iterating and drop the scan at any point between events, and
+   dropping it releases its accounted memory. Cancellation from another
+   thread sets the token every listing session polls between chunks. A
+   filesystem call already inside the kernel runs to completion under
+   Section 4. A bounded scan can also retain detached calls between
+   events. Its local completed-lease statistics exclude results it
+   abandoned; the host governor remains authoritative for physical
+   occupancy and cost.
 
    An anchor is an opaque, adapter-owned handle to the directory that a
-   listing enumerated. A scan retains one only when its options allow
-   anchors and the adapter offers an anchored session under Section
-   10.2. An anchor lets the consumer, or an adapter-specific extension,
-   read further relative to the observed directory instead of resolving
-   its path again. Every Entry from one listing shares that listing's
-   anchor, and the anchor lives until the scan and every such Entry have
-   released it. Live anchors count against the anchor limit in the
-   options. A listing that starts while the limit is reached runs
-   without an anchor, and the scan counts the withheld anchor in its
-   statistics. A core type never carries a raw descriptor or handle.
+   listing enumerated. Every Entry from that listing shares its anchor,
+   including across streamed chunks. The anchor lives until all cursors,
+   frames, and consumer observations release it. A slot is reserved
+   before anchored session construction and remains owned by the cursor
+   until disposal, including while a detached call is blocked. Returned
+   anchors share that slot with their cursor. Live and peak counts
+   include these pending reservations. The configured anchor limit
+   therefore bounds cursors as well as yielded observations. Core types
+   do not expose raw platform handles.
+
+   AnchorPolicy::Optional preserves optional retention: a listing begun
+   at the limit runs without an anchor and increments anchors_withheld.
+   AnchorPolicy::Required MUST NOT yield unanchored non-root entries.
+   Exhaustion reports Unlisted(ResourceLimited) naming Anchors, the
+   configured limit, and the additional slot required. If the adapter
+   cannot supply an anchor, the same outcome reports zero available and
+   one required. The bootstrap root is separate from a parent listing
+   and has no anchor. A path-only wrapper is not an anchored
+   observation; StdFileSystem currently provides retained directory
+   descriptors on Unix only.
+
+   Scan::read admits one consumer-selected follow-up read against an
+   observation before scan exhaustion. It uses the same host governor,
+   storage domain, cancellation token, and per-command ceiling, retains
+   the physical grant through callback return or unwinding, and counts
+   the metadata operation. Admission reserves exactly one read estimate.
+   A returned error or panic records the physical failure before
+   release, including when the consumer catches the unwind. The callback
+   receives the original anchor and MUST perform at most one physical
+   read. It runs inline; cancellation cannot interrupt a call inside
+   the kernel. Creating or yielding an observation fetches no metadata.
+
+   Direct consumer calls outside Scan::read remain outside scan
+   governance. Query-wide admission requires routing each physical lazy
+   read through this method; a retained descriptor alone does not
+   provide admission. A read after scan exhaustion returns Shutdown.
+   Consumers needing later reads must perform them before exhaustion or
+   establish their own admitted operation context. Consumer schemas and
+   caches remain outside the traversal core.
 
    Every scan opened in one process shares the host governor of Section
    15.9, as every tree does. An API that opens a scan under an

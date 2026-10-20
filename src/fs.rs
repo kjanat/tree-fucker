@@ -119,30 +119,36 @@ pub struct Anchor(Arc<Anchored>);
 
 struct Anchored {
     value: Box<dyn Any + Send + Sync>,
-    live: OnceLock<Arc<AtomicUsize>>,
+    slot: OnceLock<Arc<AnchorSlot>>,
 }
 
-impl Drop for Anchored {
+/// One reserved anchor slot, shared by its cursor and observations.
+pub(crate) struct AnchorSlot(Arc<AtomicUsize>);
+
+impl AnchorSlot {
+    pub(crate) fn reserve(live: &Arc<AtomicUsize>) -> (Arc<Self>, usize) {
+        let count = live.fetch_add(1, Ordering::SeqCst) + 1;
+        (Arc::new(Self(live.clone())), count)
+    }
+}
+
+impl Drop for AnchorSlot {
     fn drop(&mut self) {
-        if let Some(live) = self.live.get() {
-            live.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl Anchor {
     pub fn new<T: Any + Send + Sync>(value: T) -> Anchor {
-        Anchor(Arc::new(Anchored { value: Box::new(value), live: OnceLock::new() }))
+        Anchor(Arc::new(Anchored { value: Box::new(value), slot: OnceLock::new() }))
     }
 
     pub fn get<T: Any>(&self) -> Option<&T> {
         self.0.value.downcast_ref::<T>()
     }
 
-    pub(crate) fn count_in(&self, live: &Arc<AtomicUsize>) {
-        if self.0.live.set(live.clone()).is_ok() {
-            live.fetch_add(1, Ordering::SeqCst);
-        }
+    pub(crate) fn retain_slot(&self, slot: &Arc<AnchorSlot>) {
+        let _ = self.0.slot.set(slot.clone());
     }
 }
 
@@ -258,6 +264,9 @@ pub struct SessionCost {
     pub kind_resolutions: u32,
     pub identity_reads: u32,
     pub entries_enumerated: u64,
+    /// Bytes currently retained by the listing session, including the
+    /// returned final listing. This is not a per-lease allocation delta;
+    /// chunks already removed with `take_chunk` are excluded.
     pub bytes: u64,
 }
 
@@ -316,6 +325,21 @@ pub enum Continuation {
 
 pub trait ListingSession: Send {
     fn resume(self: Box<Self>, lease: Lease) -> (Continuation, SessionCost);
+
+    /// Transfer entries buffered by a suspended lease to a one-shot consumer.
+    ///
+    /// The default keeps the complete-listing contract. Implementations which
+    /// support draining must preserve their total entry ceiling and return the
+    /// same anchor across chunks. A returned chunk drains the buffered entries;
+    /// their bytes must be excluded from subsequent `SessionCost::bytes`.
+    /// This method must perform no filesystem work.
+    fn take_chunk(&mut self) -> Option<DirectoryListing> {
+        None
+    }
+
+    fn supports_chunks(&self) -> bool {
+        false
+    }
 }
 
 pub fn list_directory(

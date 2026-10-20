@@ -137,6 +137,7 @@ impl ResourceHealth {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceLimit {
+    Anchors,
     EntriesPerDirectory,
     RepresentedEntries,
     ListingBytes,
@@ -149,6 +150,7 @@ pub enum ResourceLimit {
 impl fmt::Display for ResourceLimit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ResourceLimit::Anchors => f.write_str("retained observation anchors"),
             ResourceLimit::EntriesPerDirectory => f.write_str("entries per directory"),
             ResourceLimit::RepresentedEntries => f.write_str("represented entries"),
             ResourceLimit::ListingBytes => f.write_str("listing bytes"),

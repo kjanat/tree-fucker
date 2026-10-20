@@ -857,6 +857,7 @@ impl Coordinator {
 
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
+        self.finish_stuck_jobs();
         match &input {
             Input::JobCompleted { job, result } => {
                 self.blocking_slots.remove(&SlotOwner::Job(*job));
@@ -886,12 +887,16 @@ impl Coordinator {
                     let overshoot = self.governor.overshoot_of(self.job_grant(*job));
                     self.charge_commands(&barriers, overshoot);
                 }
-                self.governor.release(self.job_grant(*job), now);
+                if self.governor.release_was_stuck(self.job_grant(*job), now) {
+                    self.finish_job(*job, JobOutcome::Stuck);
+                }
             }
             Input::WorkerLost(WorkerLoss::Job(job)) => {
                 self.blocking_slots.remove(&SlotOwner::Job(*job));
                 let now = self.now;
-                self.governor.release(self.job_grant(*job), now);
+                if self.governor.release_was_stuck(self.job_grant(*job), now) {
+                    self.finish_job(*job, JobOutcome::Stuck);
+                }
             }
             Input::WatchRegistered { request, .. } | Input::WorkerLost(WorkerLoss::WatchRegistration(request)) => {
                 let now = self.now;
@@ -1345,13 +1350,21 @@ impl Coordinator {
         let now = self.now;
         for grant in self.governor.newly_stuck(now) {
             self.governor.mark_stuck(grant, now);
-            let domain = self.governor.domain_of_grant(grant);
-            if let Some(job) = grant.job()
+        }
+        self.finish_stuck_jobs();
+    }
+
+    fn finish_stuck_jobs(&mut self) {
+        // Another scan or tree may have marked our physical call already.
+        // Match the complete owner identity before ending a logical job.
+        for grant in self.governor.stuck_grants() {
+            if grant.id.tree() == Some(self.tree)
+                && let Some(job) = grant.id.job()
                 && self.jobs.contains_key(&job)
             {
                 self.finish_job(job, JobOutcome::Stuck);
             }
-            self.release_quarantined(domain);
+            self.release_quarantined(grant.domain);
         }
     }
 

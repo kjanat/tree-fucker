@@ -1169,3 +1169,50 @@ fn a_full_bucket_always_affords_one_grant_on_a_domain_whose_estimate_reached_its
          capacity, so a slow domain keeps making progress"
     );
 }
+
+#[test]
+fn externally_marked_stuck_jobs_are_finished_only_by_their_owner() {
+    let shared = HostGovernor::independent(&HostConfig { maximum_in_flight: 4, ..Default::default() });
+    let make = |domain| {
+        let fs = tree(&["a"]);
+        fs.set_domain("", DomainId::new(domain));
+        fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_secs(3600));
+        Harness::open_under(fs, Arc::new(LoadAll), Config::default(), shared.clone()).unwrap()
+    };
+    let mut first = make(100);
+    let mut second = make(200);
+    first.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(1));
+    second.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(1));
+    let grants = shared.grants();
+    assert_eq!(grants.len(), 2, "both trees must have an outstanding listing");
+    let own = grants[0].id;
+    let other = grants[1].id;
+    assert_eq!(own.job(), other.job(), "job numbers collide across trees");
+    assert_ne!(own.tree(), other.tree());
+    let at = MonotonicTime::ZERO + Duration::from_secs(2);
+    shared.mark_stuck(own, at); // supervised by a different scan
+    let charged = shared.view(at).surcharged;
+    second.coordinator.observe(at);
+    assert!(second.coordinator.job_class(other.job().unwrap()).is_some(), "foreign stuck job must not end ours");
+    first.coordinator.observe(at);
+    assert!(first.coordinator.job_class(own.job().unwrap()).is_none(), "already-marked own job must finish");
+    assert_eq!(shared.view(at).surcharged, charged, "logical completion must not surcharge twice");
+    assert_eq!(shared.grants().len(), 2, "physical calls still own their slots");
+}
+
+#[test]
+fn a_late_worker_loss_does_not_charge_an_externally_marked_stuck_job_twice() {
+    let shared = HostGovernor::independent(&HostConfig::default());
+    let fs = tree(&["a"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_secs(3600));
+    let mut h = Harness::open_under(fs, Arc::new(LoadAll), Config::default(), shared.clone()).unwrap();
+    h.run_jobs_until(MonotonicTime::ZERO + Duration::from_secs(1));
+    let grant = shared.grants().into_iter().next().unwrap();
+    let at = MonotonicTime::ZERO + Duration::from_secs(2);
+    shared.mark_stuck(grant.id, at);
+    let charged = shared.view(at).surcharged;
+    h.coordinator
+        .handle(tree_fucker::core::Input::WorkerLost(tree_fucker::core::WorkerLoss::Job(grant.id.job().unwrap())), at);
+    assert_eq!(shared.view(at).surcharged, charged);
+    assert!(shared.grants().is_empty());
+}
