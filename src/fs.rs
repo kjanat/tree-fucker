@@ -119,30 +119,36 @@ pub struct Anchor(Arc<Anchored>);
 
 struct Anchored {
     value: Box<dyn Any + Send + Sync>,
-    live: OnceLock<Arc<AtomicUsize>>,
+    slot: OnceLock<Arc<AnchorSlot>>,
 }
 
-impl Drop for Anchored {
+/// One reserved anchor slot, shared by its cursor and observations.
+pub(crate) struct AnchorSlot(Arc<AtomicUsize>);
+
+impl AnchorSlot {
+    pub(crate) fn reserve(live: &Arc<AtomicUsize>) -> (Arc<Self>, usize) {
+        let count = live.fetch_add(1, Ordering::SeqCst) + 1;
+        (Arc::new(Self(live.clone())), count)
+    }
+}
+
+impl Drop for AnchorSlot {
     fn drop(&mut self) {
-        if let Some(live) = self.live.get() {
-            live.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl Anchor {
     pub fn new<T: Any + Send + Sync>(value: T) -> Anchor {
-        Anchor(Arc::new(Anchored { value: Box::new(value), live: OnceLock::new() }))
+        Anchor(Arc::new(Anchored { value: Box::new(value), slot: OnceLock::new() }))
     }
 
     pub fn get<T: Any>(&self) -> Option<&T> {
         self.0.value.downcast_ref::<T>()
     }
 
-    pub(crate) fn count_in(&self, live: &Arc<AtomicUsize>) {
-        if self.0.live.set(live.clone()).is_ok() {
-            live.fetch_add(1, Ordering::SeqCst);
-        }
+    pub(crate) fn retain_slot(&self, slot: &Arc<AnchorSlot>) {
+        let _ = self.0.slot.set(slot.clone());
     }
 }
 

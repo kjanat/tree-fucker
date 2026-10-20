@@ -320,6 +320,7 @@ fn bounded_resolution_reserves_only_the_resolution_operation() {
     let timed = Arc::new(Timed {
         inner: fs.clone(),
         clock: ManualClock::new(),
+        anchors: false,
         on_resolve: Some(Arc::new(move || {
             let grant = host.grants().into_iter().next().expect("admitted resolution");
             observer.lock().unwrap().push((grant.required, grant.operations, grant.listing));
@@ -342,6 +343,53 @@ fn bounded_resolution_reserves_only_the_resolution_operation() {
         observed.iter().all(|&(reads, operations, listing)| reads == 1 && operations == 0 && !listing),
         "{observed:?}"
     );
+}
+
+#[test]
+fn required_anchor_exhaustion_reserves_only_domain_resolution() {
+    let fs = fixture();
+    fs.report_inline_domains(false);
+    let governor = HostGovernor::independent(&HostConfig::default());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observer = observed.clone();
+    let host = governor.clone();
+    let timed = Arc::new(Timed {
+        inner: fs.clone(),
+        clock: ManualClock::new(),
+        anchors: true,
+        on_resolve: Some(Arc::new(move || {
+            let grant = host.grants().into_iter().next().expect("admitted resolution");
+            observer.lock().unwrap().push((grant.required, grant.operations, grant.listing));
+        })),
+    });
+    let mut scan = Scan::open_outside_host_governor(
+        timed.clone(),
+        fs.root().to_path_buf(),
+        Arc::new(LoadAll),
+        ScanOptions { anchors: 1, anchor_policy: tree_fucker::AnchorPolicy::Required, ..follow() },
+        governor.clone(),
+        timed.clock.clone(),
+    )
+    .unwrap();
+    let events = drain(&mut scan);
+    assert_eq!(scan.stats().listings, 1, "only the root can retain an anchor");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                ScanEvent::Unlisted { failure: ScanFailure::ResourceLimited(limited), .. }
+                    if limited.limit == ResourceLimit::Anchors
+            ))
+            .count(),
+        2
+    );
+    let observed = observed.lock().unwrap();
+    assert!(observed.len() > 1);
+    assert!(
+        observed.iter().all(|&(reads, operations, listing)| reads == 1 && operations == 0 && !listing),
+        "{observed:?}"
+    );
+    assert!(governor.grants().is_empty());
 }
 
 struct ManualClock {
@@ -379,6 +427,7 @@ impl Clock for ManualClock {
 }
 
 struct Timed {
+    anchors: bool,
     inner: Arc<FakeFileSystem>,
     clock: Arc<ManualClock>,
     on_resolve: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -442,6 +491,22 @@ impl FileSystem for Timed {
         })
     }
 
+    fn open_listing_at(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        at: tree_fucker::ListingAt<'_>,
+        ceilings: Ceilings,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        Box::new(TestAnchorSession {
+            inner: self.open_listing(root, path, ceilings, cancel),
+            anchored: at.anchored && self.anchors,
+            anchor: None,
+            gate: None,
+        })
+    }
+
     fn enrich(&self, root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError> {
         self.clock.advance(self.inner.enrichment_cost(path, batch));
         self.inner.enrich(root, path, batch)
@@ -487,7 +552,7 @@ struct Opened {
 fn open_with(fs: Arc<FakeFileSystem>, policy: Arc<dyn ScanPolicy>, options: ScanOptions, host: HostConfig) -> Opened {
     let governor = HostGovernor::independent(&host);
     let clock = ManualClock::new();
-    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None });
+    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None, anchors: false });
     let scan = Scan::open_outside_host_governor(
         timed,
         fs.root().to_path_buf(),
@@ -725,7 +790,7 @@ fn two_scans_share_one_envelope_and_one_domain_account() {
     let governor = HostGovernor::independent(&HostConfig::default());
     let clock = ManualClock::new();
     let open = || {
-        let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None });
+        let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None, anchors: false });
         Scan::open_outside_host_governor(
             timed,
             fs.root().to_path_buf(),
@@ -840,7 +905,7 @@ fn a_quarantined_domain_is_reported_and_healthy_domains_continue() {
     governor.try_start(stuck, now(&governor, &clock)).expect("start the stuck call");
     governor.mark_stuck(stuck, now(&governor, &clock));
 
-    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None });
+    let timed = Arc::new(Timed { inner: fs.clone(), clock: clock.clone(), on_resolve: None, anchors: false });
     let mut scan = Scan::open_outside_host_governor(
         timed,
         fs.root().to_path_buf(),
@@ -1108,6 +1173,35 @@ impl ListingSession for BlockedSession {
     }
 }
 
+// Creates its anchor inside the first physical call, before blocking,
+// matching an opened cursor whose enumeration cannot yet return a result.
+struct TestAnchorSession {
+    inner: Box<dyn ListingSession>,
+    anchored: bool,
+    anchor: Option<tree_fucker::Anchor>,
+    gate: Option<Arc<ListingGate>>,
+}
+impl ListingSession for TestAnchorSession {
+    fn resume(mut self: Box<Self>, lease: Lease) -> (Continuation, SessionCost) {
+        if self.anchored && self.anchor.is_none() {
+            self.anchor = Some(tree_fucker::Anchor::new(()));
+        }
+        if let Some(gate) = self.gate.take() {
+            gate.wait();
+        }
+        let (continuation, cost) = self.inner.resume(lease);
+        let continuation = match continuation {
+            Continuation::Suspended(inner) => Continuation::Suspended(Box::new(Self { inner, ..*self })),
+            Continuation::Finished(tree_fucker::SessionOutcome::Complete(mut listing)) => {
+                listing.anchor = self.anchor;
+                Continuation::Finished(tree_fucker::SessionOutcome::Complete(listing))
+            }
+            other => other,
+        };
+        (continuation, cost)
+    }
+}
+
 impl FileSystem for BlockedListing {
     fn capabilities(&self) -> FsCapabilities {
         self.inner.capabilities()
@@ -1135,6 +1229,21 @@ impl FileSystem for BlockedListing {
     ) -> Box<dyn ListingSession> {
         let inner = self.inner.open_listing(root, path, ceilings, cancel);
         if path.to_string() == "a" { Box::new(BlockedSession { inner, gate: self.gate.clone() }) } else { inner }
+    }
+    fn open_listing_at(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        at: tree_fucker::ListingAt<'_>,
+        ceilings: Ceilings,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        Box::new(TestAnchorSession {
+            inner: self.inner.open_listing(root, path, ceilings, cancel),
+            anchored: at.anchored,
+            anchor: None,
+            gate: (path.to_string() == "a").then(|| self.gate.clone()),
+        })
     }
     fn enrich(&self, root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError> {
         self.inner.enrich(root, path, batch)
@@ -1433,4 +1542,77 @@ fn a_quarantined_sibling_does_not_wait_for_an_exhausted_executor() {
     assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
     gate.release();
     eventually(|| governor.grants().is_empty());
+}
+
+#[test]
+fn waiting_for_a_pool_slot_enforces_the_detached_calls_command_ceiling() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::from_secs(60));
+    let _release = ReleaseListing(gate.clone());
+    let (events, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for event in scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap()) {
+            events.send(event).unwrap();
+        }
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    clock.advance(Duration::from_secs(31));
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        if matches!(event, Ok(ScanEvent::Entry(entry)) if entry.path.path() == path("c")) {
+            break;
+        }
+    }
+    clock.advance(Duration::from_secs(31));
+    assert!(matches!(receiver.recv_timeout(Duration::from_secs(5)).expect("pool wait must enforce ceiling"),
+        Err(Error::ResourceLimited(limited)) if limited.limit == ResourceLimit::CommandWorkerTime));
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    worker.join().unwrap();
+    gate.release();
+    eventually(|| governor.grants().is_empty());
+}
+
+#[test]
+fn detached_listing_cursors_keep_their_anchor_slots() {
+    let fs = fixture();
+    fs.set_domain("a", MEDIA);
+    let (entered, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(ListingGate { entered, released: Mutex::new(false), changed: std::sync::Condvar::new() });
+    let _release = ReleaseListing(gate.clone());
+    let governor = HostGovernor::independent(&HostConfig {
+        foreground_duty: 1.0,
+        domain_foreground_duty: 1.0,
+        ..Default::default()
+    });
+    let clock = ManualClock::new();
+    let scan = Scan::open_outside_host_governor(
+        Arc::new(BlockedListing { inner: fs.clone(), gate: gate.clone() }),
+        fs.root().to_path_buf(),
+        Arc::new(LoadAll),
+        ScanOptions { anchors: 2, ceiling: Duration::MAX, ..follow() },
+        governor.clone(),
+        clock.clone(),
+    )
+    .unwrap();
+    let (done, results) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap());
+        let mut healthy_anchored = None;
+        for event in scan.by_ref() {
+            if let ScanEvent::Entry(entry) = event.unwrap()
+                && entry.path.path() == path("c/z")
+            {
+                healthy_anchored = Some(entry.anchor.is_some());
+            }
+        }
+        done.send((healthy_anchored, scan)).unwrap();
+    });
+    receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    clock.advance(Duration::from_secs(31));
+    let (healthy_anchored, scan) = results.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(healthy_anchored, Some(false), "root and detached cursor occupy both slots");
+    assert_eq!(scan.stats().anchors_peak, 2);
+    assert_eq!(scan.stats().anchors_live, 1, "detached cursor still owns its anchor");
+    gate.release();
+    worker.join().unwrap();
+    eventually(|| scan.stats().anchors_live == 0 && governor.grants().is_empty());
 }

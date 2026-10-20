@@ -29,6 +29,8 @@ Bounded execution applies to listing leases. Bootstrap, domain resolution, sessi
 
 ## Measurement method
 
+The measurements below were captured from the implementation committed as `4712e4b`. Subsequent correctness fixes, including cursor-lifetime anchor reservations, are not represented by these timings.
+
 Machine: AMD Ryzen 9 3900X; Linux 7.1.10-1-MANJARO x86_64; Rust 1.101.0-nightly (`5d8fec066`, 2026-10-16). The normal optimized `layers` executable was obtained from Cargo's JSON artifact output, not a guessed binary path. Timings are warm-cache medians of 15 measured traversals after two warmups, including setup and teardown. Modes run sequentially. These synthetic fixtures are not the user's dprint checkout.
 
 Each shape contains 20,000 sparse files plus directories and fixture symlinks: balanced has 20,013 rows, wide has 20,003, and deep has 20,066. The controlled-delay run uses the balanced shape and injects 1 ms per directory opening. It tests latency sensitivity and governor accounting, not a real network mount, cold disk, or uninterruptible kernel fault. Separate barrier tests establish stuck-call and cancellation histories without depending on a live remote filesystem.

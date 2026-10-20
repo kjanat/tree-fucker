@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod anchors;
 mod executor;
 pub use executor::ListingExecutor;
 
@@ -221,7 +222,10 @@ pub struct ScanStats {
     pub throttled: Duration,
     pub buffered_bytes: u64,
     pub peak_buffered_bytes: u64,
+    /// Reserved anchor slots, including active/detached cursors and retained
+    /// observations.
     pub anchors_live: usize,
+    /// Maximum simultaneously reserved anchor slots.
     pub anchors_peak: usize,
     pub anchors_withheld: u64,
 }
@@ -728,15 +732,8 @@ impl Scan {
         u32::try_from(self.options.operations_per_lease).unwrap_or(u32::MAX).max(1)
     }
 
-    fn anchor_room(&mut self) -> bool {
-        if self.options.anchors == 0 {
-            return false;
-        }
-        let room = self.live_anchors.load(Ordering::SeqCst) < self.options.anchors;
-        if !room {
-            self.stats.anchors_withheld += 1;
-        }
-        room
+    fn anchor_room(&self) -> bool {
+        self.live_anchors.load(Ordering::SeqCst) < self.options.anchors
     }
 
     fn locate(
@@ -746,19 +743,20 @@ impl Scan {
         context: &PolicyContext,
         site: Site,
         beneath: Option<&Anchor>,
+        listing_allowed: bool,
     ) -> Result<Option<(Arc<Located>, Option<Granted>)>> {
         let (probe, parent, granted) = match site {
             Site::Located(located) => return Ok(Some((located, None))),
             Site::Probed { probe, parent } => (*probe, parent, None),
             Site::Beneath(parent) => {
-                let bounded = self.listing_executor.is_some();
-                let operations = if bounded { 0 } else { self.lease_operations(&parent.probe, false) };
+                let separate = self.listing_executor.is_some() || !listing_allowed;
+                let operations = if separate { 0 } else { self.lease_operations(&parent.probe, false) };
                 let need = Need {
-                    reads: if bounded { 1 } else { 2 },
+                    reads: if separate { 1 } else { 2 },
                     operations,
                     lease: 0,
                     domain: Some(parent.domain),
-                    listing: !bounded,
+                    listing: !separate,
                 };
                 let granted = match self.admit(id, path, need)? {
                     Admission::Granted(granted) => granted,
@@ -919,21 +917,26 @@ impl Scan {
 
     fn list(&mut self, target: Target) -> Result<()> {
         let Target { path, context, site, beneath } = target;
+        let anchored = self.anchor_room();
+        let listing_allowed = anchored || self.options.anchor_policy == AnchorPolicy::Optional;
         let id = self.next_grant();
-        let Some((located, mut carried)) = self.locate(id, &path, &context, site, beneath.as_ref())? else {
+        let Some((located, mut carried)) = self.locate(id, &path, &context, site, beneath.as_ref(), listing_allowed)?
+        else {
             return Ok(());
         };
         let domain = located.domain;
         // Domain resolution remains inline. Do not hold its physical grant
         // while waiting for an executor slot, or charge worker queue
         // time as filesystem work.
-        if self.listing_executor.is_some()
+        if (self.listing_executor.is_some() || !listing_allowed)
             && let Some(granted) = carried.take()
         {
             self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(domain));
         }
-        let anchored = self.anchor_room();
-        if !anchored && self.options.anchor_policy == AnchorPolicy::Required {
+        if !anchored && self.options.anchors > 0 {
+            self.stats.anchors_withheld += 1;
+        }
+        if !listing_allowed {
             self.unlisted(
                 path,
                 ScanFailure::ResourceLimited(ResourceLimited {
@@ -954,9 +957,17 @@ impl Scan {
                 Some(domain),
             ));
         }
+        // Reserve before session construction, which may already create an
+        // anchor. The session wrapper retains this slot through detachment.
+        let slot = anchored.then(|| {
+            let (slot, live) = crate::fs::AnchorSlot::reserve(&self.live_anchors);
+            self.stats.anchors_peak = self.stats.anchors_peak.max(live);
+            slot
+        });
         let at = ListingAt { beneath: beneath.as_ref(), anchored };
         let session: Box<dyn ListingSession> =
             self.filesystem.open_listing_at(&self.root, &path, at, ceilings, self.cancel.clone());
+        let session = anchors::track(session, slot);
         if self.options.streaming && !session.supports_chunks() {
             return Err(Error::InvalidConfig("streaming requires a chunk-capable listing session".into()));
         }
@@ -969,6 +980,10 @@ impl Scan {
         let outcome = loop {
             let worker = if let Some(executor) = &self.listing_executor {
                 match executor.acquire(&self.cancel, || {
+                    self.governor.account(self.now());
+                    if self.admitted_cost() >= self.options.ceiling {
+                        return Err(self.ceiling_reached());
+                    }
                     if self.governor.quarantined(Some(domain)) { Err(Error::Stuck) } else { Ok(()) }
                 }) {
                     Ok(worker) => Some(worker),
@@ -1105,11 +1120,6 @@ impl Scan {
                 }),
             );
             return Ok(());
-        }
-        if let Some(anchor) = &anchor {
-            anchor.count_in(&self.live_anchors);
-            let live = self.live_anchors.load(Ordering::SeqCst);
-            self.stats.anchors_peak = self.stats.anchors_peak.max(live);
         }
         let child_context = self.policy.child_context(&context, &path, &listing);
         let supplied = listing.supplied_fields.intersect(self.options.fields);

@@ -1055,7 +1055,9 @@ Abstract
    Quarantined, and abandons that listing's eventual result. Healthy
    domains can continue only while both executor and governor capacity
    remain. A wholly occupied pool waits for completion or cancellation;
-   it MUST NOT manufacture replacement capacity.
+   it MUST NOT manufacture replacement capacity. Pool waits MUST account
+   for continuing detached work and enforce the command worker-time
+   ceiling, even when no new filesystem operation can start.
 
    Abandoning a result MUST NOT release physical ownership. The worker
    retains the grant until its call returns, including on cancellation
@@ -1122,7 +1124,8 @@ Abstract
    listing lease, as one grant that names both reads. Bounded execution
    admits resolution separately before dispatching the listing. When
    the scan holds the anchor of the parent listing, both run beneath
-   it under Section 10.2.
+   it under Section 10.2. If required-anchor capacity is exhausted, only
+   resolution is admitted; the skipped listing MUST NOT be reserved.
    When the child is a domain crossing under Section 14.3, the crossing
    mode in the options, refined by the policy, decides. Follow lists the
    child under the child domain's buckets and window. Exclude and
@@ -1180,9 +1183,13 @@ Abstract
    An anchor is an opaque, adapter-owned handle to the directory that a
    listing enumerated. Every Entry from that listing shares its anchor,
    including across streamed chunks. The anchor lives until all cursors,
-   frames, and consumer observations release it. Live anchors count
-   against the configured anchor limit. Core types do not expose raw
-   platform handles.
+   frames, and consumer observations release it. A slot is reserved
+   before anchored session construction and remains owned by the cursor
+   until disposal, including while a detached call is blocked. Returned
+   anchors share that slot with their cursor. Live and peak counts
+   include these pending reservations. The configured anchor limit
+   therefore bounds cursors as well as yielded observations. Core types
+   do not expose raw platform handles.
 
    AnchorPolicy::Optional preserves optional retention: a listing begun
    at the limit runs without an anchor and increments anchors_withheld.
