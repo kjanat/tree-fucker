@@ -386,9 +386,9 @@ fn a_registration_dispatched_before_shutdown_releases_its_watch() {
     assert_eq!(fs.watch_count(), 2);
     assert_eq!(runtime.block_on(handle.unload(path("c"))), Ok(()));
     assert_eq!(fs.watch_count(), 1);
-    let mut load = Box::pin(handle.load(path("c")));
+    let mut load = std::pin::pin!(handle.load(path("c")));
     assert!(poll_once(load.as_mut()).is_pending());
-    let mut shut = Box::pin(handle.shutdown());
+    let mut shut = std::pin::pin!(handle.shutdown());
     assert!(poll_once(shut.as_mut()).is_pending());
     runtime.run_until_stalled();
     assert_eq!(fs.watch_count(), 0);
@@ -463,9 +463,9 @@ fn shutdown_closes_the_stream_while_a_registration_worker_never_runs() {
     assert_eq!(inner.block_on(handle.unload(path("c"))), Ok(()));
     assert_eq!(fs.watch_count(), 1);
     runtime.hold();
-    let mut load = Box::pin(handle.load(path("c")));
+    let mut load = std::pin::pin!(handle.load(path("c")));
     assert!(poll_once(load.as_mut()).is_pending());
-    let mut shut = Box::pin(handle.shutdown());
+    let mut shut = std::pin::pin!(handle.shutdown());
     assert!(poll_once(shut.as_mut()).is_pending());
     inner.run_until_stalled();
     assert_eq!(poll_once(shut.as_mut()), std::task::Poll::Ready(Ok(())));
@@ -552,7 +552,7 @@ fn fatal_termination_with_a_registration_outstanding_reports_the_same_error_befo
     switch.store(1, std::sync::atomic::Ordering::SeqCst);
     policy.bump_revision();
     runtime.hold_next(1);
-    let mut invalidate = Box::pin(handle.invalidate_policy(vec![path("")]));
+    let mut invalidate = std::pin::pin!(handle.invalidate_policy(vec![path("")]));
     assert!(poll_once(invalidate.as_mut()).is_pending());
     inner.run_until_stalled();
     assert_eq!(runtime.held(), 1);
@@ -582,7 +582,7 @@ fn a_job_cancelled_while_its_worker_is_held_leaves_no_listing_session_behind() {
     assert_eq!(handle.held_listing_sessions(), 0, "the initial scan left a listing session behind");
 
     holding.hold();
-    let mut refresh = Box::pin(handle.refresh(vec![path("wide")]));
+    let mut refresh = std::pin::pin!(handle.refresh(vec![path("wide")]));
     assert!(poll_once(refresh.as_mut()).is_pending());
     runtime.run_until_stalled();
     assert_eq!(holding.held(), 1, "the refresh listing never reached the blocking pool");
@@ -745,7 +745,7 @@ fn shutdown_keeps_reporting_a_stuck_worker_and_releases_its_slot_only_when_it_re
         .expect("open");
     inner.block_on(handle.initial_scan_complete()).expect("scan");
     runtime.hold_next(1);
-    let mut refresh = Box::pin(handle.refresh(vec![path("a")]));
+    let mut refresh = std::pin::pin!(handle.refresh(vec![path("a")]));
     assert!(poll_once(refresh.as_mut()).is_pending());
     inner.run_until_stalled();
     assert_eq!(runtime.held(), 1, "the refresh listing never reached the blocking pool");

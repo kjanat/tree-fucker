@@ -148,3 +148,7 @@ See the workflows in [`.github/workflows`](.github/workflows) for the platform m
 ## Name
 
 Yes, the crate is called `tree-fucker`.
+
+## Performance probes
+
+The [benchmark guide](benchmarks/README.md) documents `cargo bench:layers` and `cargo bench:alloc` for raw Scan, anchor budgets, path materialization, allocation counts and profiling. Both probes run correctness smoke checks in CI.

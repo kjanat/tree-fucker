@@ -10,6 +10,14 @@ clippy  = {}
 rust    = {}
 rustdoc = { all = "deny" }
 
+[[bench]]
+harness = false
+name    = "layers"
+
+[[bench]]
+harness = false
+name    = "layers_alloc"
+
 [dependencies]
 futures-channel = "0.3.34"
 futures-core    = "0.3.34"
@@ -23,6 +31,8 @@ optional = true
 
 [dev-dependencies]
 futures-executor = "0.3.34"
+stats_alloc      = "0.1.10"
+tempfile         = "3.27.0"
 
 [target."cfg(unix)".dependencies]
 libc   = "0.2.189"
