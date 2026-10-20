@@ -281,7 +281,12 @@ fn a_query_can_read_only_selected_metadata_through_the_original_anchor() {
     );
     scan.next().unwrap().unwrap();
     let ScanEvent::Entry(entry) = scan.next().unwrap().unwrap() else { panic!("file") };
-    assert_eq!(scan.stats().metadata_operations, 0, "a path-only row performs no lazy read");
+    // Listing may need metadata to resolve the entry kind (for example,
+    // illumos dirents have no inline kind). Consumer reads are additional.
+    let before = scan.stats();
+    assert_eq!(before.enrichments, 0, "no metadata fields were requested");
+    assert_eq!(entry.path.under(&root), root.join("selected"));
+    assert_eq!(scan.stats(), before, "reading the yielded path performs no filesystem work");
     std::fs::rename(&root, parent.path().join("moved")).unwrap();
     let size = scan
         .read(&entry, |entry| {
@@ -292,7 +297,7 @@ fn a_query_can_read_only_selected_metadata_through_the_original_anchor() {
         })
         .unwrap();
     assert_eq!(size, 3);
-    assert_eq!(scan.stats().metadata_operations, 1);
+    assert_eq!(scan.stats().metadata_operations, before.metadata_operations + 1);
     assert!(scan.next().is_none());
 }
 
