@@ -20,11 +20,14 @@ Generated fixtures live under **target/benchmarks**, and are removed when the pr
 | ------------ | -------------------------------------------------------------------------- |
 | std-count    | std::fs directory traversal and entry count, without collecting file paths |
 | scan-count   | raw Scan event traversal, no absolute file path materialization            |
+| scan-bounded | same traversal with a two-worker ListingExecutor, including pool startup   |
 | scan-anchors | same Scan with an anchor budget of 1024 instead of zero                    |
 | scan-paths   | Scan plus absolute path materialization per entry                          |
 | scan-stats   | Scan plus diagnostic ScanStats output; use for diagnostics, not timings    |
 
 The governor is installed once with foreground duty 1.0. Scan follows filesystem domains, uses an unlimited time ceiling and fails on errors, unlisted directories or unexpected boundaries. Anchors retain their safety semantics; this is a bounded-budget comparison, not a proposal to remove them.
+
+`first_result_ms` reports the median time from scan opening to the first non-root entry, including bootstrap, pool setup where applicable, and the first complete listing. It is `-` for `std-count` or an empty input. `scan-bounded` creates a pool per traversal to include startup costs; applications can reuse a cloned executor across scans. Use normal timings to compare throughput and latency, and the allocation executable separately to compare allocation cost. Allocation counts include worker-thread allocations, so unrelated concurrent allocator activity can affect them.
 
 Before each mode, an independent std::fs walk supplies the expected **complete path multiset**, which is compared with the probe's results. Verification materializes paths outside measured iterations. Each iteration checks its row count; the oracle is repeated afterward to detect changed membership. This does not detect every possible concurrent metadata change. Root entries are excluded. Verification checks query paths, not round-tripping the serialized output. The existing CLI benchmark remains responsible for external tool/output equivalence.
 

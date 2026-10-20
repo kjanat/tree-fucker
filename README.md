@@ -97,6 +97,17 @@ fn main() -> tree_fucker::Result<()> {
 
 A scan yields each listing's children as soon as that listing completes, and it keeps only the listings on the current path. Use `LoadDepth` to limit depth. With `ScanOptions::anchors` set, `StdFileSystem` attaches an anchor to each entry, holding the descriptor of the directory it was listed from, so follow-up reads can use `*at` calls. The scan also opens and probes each child directory through its parent's anchor instead of resolving the path again. The number of live anchors is capped.
 
+For listing calls that may block, opt into a reusable worker pool after opening the scan:
+
+```rust,ignore
+let executor = tree_fucker::ListingExecutor::new(2)?;
+let scan = scan.with_listing_executor(executor.clone());
+```
+
+Clones share the worker limit. Workers are created lazily and reused across leases and scans; there is no thread per directory. When a listing reaches the governor's stuck threshold, the scan reports that subtree as `Unlisted(Quarantined)` and can continue into healthy domains if both worker and governor capacity remain. Cancelling or dropping the scan does not reclaim a running call's worker, physical grant, or buffer allowance. Those remain held until the call returns. If all workers are blocked, the next listing waits for capacity or cancellation.
+
+This opt-in applies to `ListingSession::resume`. Bootstrap, domain resolution, session construction, and enrichment still run inline, so it does not promise progress past a blocked call in those operations. The default scan remains entirely inline. Bounded listings reserve `max(1, in_flight_listing_bytes / maximum_in_flight)` bytes each, with the same value passed as their result-size ceiling. Reservation failure reports a resource limit rather than exceeding the host envelope. Completed-lease statistics exclude abandoned results; the governor retains authoritative physical occupancy and charges. Cancellation and stuck checks during worker waits occur at intervals of at most 50 ms, subject to thread scheduling.
+
 The bundled `StdFileSystem` performs real platform-specific storage-domain probing on Linux, macOS, Windows, FreeBSD, illumos, and Solaris. Its current watcher capability is `None`, so it converges through direct reconciliation; custom `FileSystem` adapters can provide watcher events as low-latency hints.
 
 ## Storage domains

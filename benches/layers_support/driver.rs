@@ -99,7 +99,7 @@ pub fn main(allocations: bool) {
     })
     .unwrap();
     eprintln!("root={} runs={runs} warmups={warmups} allocations={allocations}", root.display());
-    println!("mode\trows\tmedian_ms\tmin_ms\tmax_ms\tallocations\treallocations\tbytes_allocated");
+    println!("mode\trows\tmedian_ms\tmin_ms\tmax_ms\tallocations\treallocations\tbytes_allocated\tfirst_result_ms");
     for mode in modes {
         assert!(super::MODES.contains(&mode), "unknown mode: {mode}");
         let expected = inventory(&root, mode.contains("size"));
@@ -110,16 +110,20 @@ pub fn main(allocations: bool) {
         verified.sort();
         assert_eq!(verified, expected, "path mismatch: {mode}");
         let mut times = Vec::with_capacity(runs);
+        let mut first_results = Vec::with_capacity(runs);
         let mut totals = [0usize; 3];
         for iteration in 0..warmups + runs {
             let region = stats_alloc::Region::new(&stats_alloc::INSTRUMENTED_SYSTEM);
             let start = Instant::now();
-            let count = super::measure(&root, mode, &mut |_| {}, false);
+            let (count, first) = super::measure(&root, mode, &mut |_| {}, false);
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let stats = region.change();
             assert_eq!(count, expected.len(), "row count changed during timing");
             if iteration >= warmups {
                 times.push(elapsed);
+                if let Some(first) = first {
+                    first_results.push(first.as_secs_f64() * 1000.0);
+                }
                 totals[0] += stats.allocations;
                 totals[1] += stats.reallocations;
                 totals[2] += stats.bytes_allocated;
@@ -128,8 +132,14 @@ pub fn main(allocations: bool) {
         assert_eq!(inventory(&root, mode.contains("size")), expected, "tree changed during measurement");
         times.sort_by(f64::total_cmp);
         let median = (times[(runs - 1) / 2] + times[runs / 2]) / 2.0;
+        first_results.sort_by(f64::total_cmp);
+        let first = if first_results.is_empty() {
+            "-".to_owned()
+        } else {
+            format!("{:.3}", (first_results[(runs - 1) / 2] + first_results[runs / 2]) / 2.0)
+        };
         println!(
-            "{mode}\t{}\t{median:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}",
+            "{mode}\t{}\t{median:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{first}",
             expected.len(),
             times[0],
             times[runs - 1],

@@ -8,7 +8,7 @@ use crate::config::HostConfig;
 use crate::domain::{AccessTopology, DomainCapabilities, MediaHint, StorageDomainId};
 use crate::ids::{JobId, WatchReleaseId, WatchRequestId};
 use crate::path::RelativePath;
-use crate::update::ThrottleCause;
+use crate::update::{ResourceLimit, ResourceLimited, ThrottleCause};
 
 const LATENCY_HISTORY: usize = 32;
 const QUEUE_HISTORY: usize = 8;
@@ -1483,6 +1483,37 @@ impl HostGovernor {
     pub fn report_memory(&self, tree: TreeNumber, snapshot_bytes: u64, in_flight_bytes: u64) {
         guard(&self.inner).report_memory(tree, snapshot_bytes, in_flight_bytes);
         self.changed();
+    }
+
+    pub(crate) fn try_reserve_scan_memory(
+        &self,
+        source: TreeNumber,
+        tree: TreeNumber,
+        bytes: u64,
+    ) -> Result<(), ResourceLimited> {
+        let mut governor = guard(&self.inner);
+        let (snapshot, previous) = governor.memory.get(&source).copied().unwrap_or((0, 0));
+        for (limit, configured, observed) in [
+            (
+                ResourceLimit::AccountedMemory,
+                governor.memory_ceiling(),
+                governor.memory_total.saturating_sub(previous).saturating_add(bytes),
+            ),
+            (
+                ResourceLimit::InFlightBytes,
+                governor.config.in_flight_listing_bytes,
+                governor.in_flight_total.saturating_sub(previous).saturating_add(bytes),
+            ),
+        ] {
+            if observed > configured {
+                return Err(ResourceLimited { limit, configured, observed, domain: None });
+            }
+        }
+        governor.report_memory(source, snapshot, 0);
+        governor.report_memory(tree, 0, bytes);
+        drop(governor);
+        self.changed();
+        Ok(())
     }
 
     pub fn forget_tree(&self, tree: TreeNumber) {

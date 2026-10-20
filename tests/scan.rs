@@ -728,3 +728,376 @@ fn a_large_directory_progresses_lease_by_lease_under_its_ceiling() {
     assert_eq!(governor.view(now(&governor, &clock)).lease_grants, stats.leases - 5, "each further lease is granted");
     assert!(governor.grants().is_empty());
 }
+
+// Barriers establish physical start/completion. Timeouts only bound a broken
+// test.
+struct ListingGate {
+    entered: std::sync::mpsc::Sender<()>,
+    released: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl ListingGate {
+    fn wait(&self) {
+        self.entered.send(()).expect("start notification");
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.changed.wait(released).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ReleaseListing(Arc<ListingGate>);
+impl Drop for ReleaseListing {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+struct BlockedListing {
+    inner: Arc<FakeFileSystem>,
+    gate: Arc<ListingGate>,
+}
+
+struct BlockedSession {
+    inner: Box<dyn ListingSession>,
+    gate: Arc<ListingGate>,
+}
+
+impl ListingSession for BlockedSession {
+    fn resume(self: Box<Self>, lease: Lease) -> (Continuation, SessionCost) {
+        self.gate.wait();
+        self.inner.resume(lease)
+    }
+}
+
+impl FileSystem for BlockedListing {
+    fn capabilities(&self) -> FsCapabilities {
+        self.inner.capabilities()
+    }
+    fn canonicalize(&self, root: &Path) -> Result<PathBuf, FsError> {
+        self.inner.canonicalize(root)
+    }
+    fn metadata(&self, root: &Path, path: &RelativePath) -> Result<EntryInfo, FsError> {
+        self.inner.metadata(root, path)
+    }
+    fn resolve_domain(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        parent: Option<&ProbeResult>,
+    ) -> Result<ProbeResult, FsError> {
+        self.inner.resolve_domain(root, path, parent)
+    }
+    fn open_listing(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        ceilings: Ceilings,
+        cancel: CancellationToken,
+    ) -> Box<dyn ListingSession> {
+        let inner = self.inner.open_listing(root, path, ceilings, cancel);
+        if path.to_string() == "a" { Box::new(BlockedSession { inner, gate: self.gate.clone() }) } else { inner }
+    }
+    fn enrich(&self, root: &Path, path: &RelativePath, batch: &EnrichmentBatch) -> Result<Enrichment, FsError> {
+        self.inner.enrich(root, path, batch)
+    }
+    fn watch(
+        &self,
+        root: &Path,
+        path: &RelativePath,
+        recursive: bool,
+        sink: Arc<dyn WatcherSink>,
+    ) -> Result<WatchId, FsError> {
+        self.inner.watch(root, path, recursive, sink)
+    }
+    fn unwatch(&self, watch: WatchId) {
+        self.inner.unwatch(watch)
+    }
+}
+
+fn eventually(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition did not become true");
+        std::thread::yield_now();
+    }
+}
+
+fn blocked_scan(
+    ceiling: Duration,
+) -> (Scan, HostGovernor, Arc<ManualClock>, Arc<ListingGate>, std::sync::mpsc::Receiver<()>) {
+    let fs = fixture();
+    fs.set_domain("a", MEDIA);
+    fs.mkdir("b");
+    fs.set_domain("b", MEDIA);
+    let (entered, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(ListingGate { entered, released: Mutex::new(false), changed: std::sync::Condvar::new() });
+    let governor = HostGovernor::independent(&HostConfig {
+        foreground_duty: 1.0,
+        domain_foreground_duty: 1.0,
+        ..Default::default()
+    });
+    let clock = ManualClock::new();
+    let scan = Scan::open_outside_host_governor(
+        Arc::new(BlockedListing { inner: fs.clone(), gate: gate.clone() }),
+        fs.root().to_path_buf(),
+        Arc::new(LoadAll),
+        ScanOptions { ceiling, ..follow() },
+        governor.clone(),
+        clock.clone(),
+    )
+    .unwrap();
+    (scan, governor, clock, gate, receiver)
+}
+
+#[test]
+fn a_freshly_blocked_listing_is_quarantined_without_abandoning_physical_ownership() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::MAX);
+    let _release = ReleaseListing(gate.clone());
+    let executor = tree_fucker::ListingExecutor::new(2).unwrap();
+    let (done, results) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut scan = scan.with_listing_executor(executor);
+        let events = drain(&mut scan);
+        drop(scan);
+        done.send(events).unwrap();
+    });
+    entered.recv_timeout(Duration::from_secs(5)).expect("held listing started");
+    clock.advance(Duration::from_secs(31));
+    let events = results.recv_timeout(Duration::from_secs(5)).expect("healthy siblings must make progress");
+    let media = StorageDomainId::of(&FakeFileSystem::domain_key(MEDIA));
+    assert!(events.contains(&ScanEvent::Unlisted { path: path("a"), failure: ScanFailure::Quarantined(media) }));
+    assert!(paths(&events).contains(&"c/z".to_owned()));
+    assert!(!paths(&events).contains(&"a/x".to_owned()));
+    assert_eq!(governor.stuck_grants().len(), 1);
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    assert_eq!(
+        governor.view(now(&governor, &clock)).accounted_memory,
+        governor.limits().in_flight_listing_bytes / governor.limits().maximum_in_flight as u64
+    );
+    gate.release();
+    worker.join().unwrap();
+    eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+}
+
+#[test]
+fn cancelling_a_running_listing_returns_without_releasing_its_physical_slot() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::MAX);
+    let _release = ReleaseListing(gate.clone());
+    let cancel = scan.cancellation();
+    let (done, results) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap());
+        let result = scan.by_ref().collect::<Result<Vec<_>, _>>();
+        assert!(scan.next().is_none());
+        drop(scan);
+        done.send(result).unwrap();
+    });
+    entered.recv_timeout(Duration::from_secs(5)).expect("held listing started");
+    cancel.cancel();
+    assert!(matches!(results.recv_timeout(Duration::from_secs(5)).unwrap(), Err(Error::Cancelled)));
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    assert!(governor.view(now(&governor, &clock)).accounted_memory > 0);
+    gate.release();
+    worker.join().unwrap();
+    eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+}
+
+#[test]
+fn inline_listing_waits_for_physical_completion_even_after_cancellation() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::MAX);
+    let _release = ReleaseListing(gate.clone());
+    let cancel = scan.cancellation();
+    let (done, results) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done.send(scan.collect::<Result<Vec<_>, _>>()).unwrap();
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    cancel.cancel();
+    // Cancellation cannot interrupt the inline adapter, and the start barrier
+    // proves the call is active before we check its physical ownership.
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    assert!(matches!(results.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    gate.release();
+    assert!(matches!(results.recv_timeout(Duration::from_secs(5)).unwrap(), Err(Error::Cancelled)));
+    worker.join().unwrap();
+    assert!(governor.grants().is_empty());
+}
+
+struct NotifyingClock(std::sync::mpsc::Sender<()>);
+impl Clock for NotifyingClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&self, duration: Duration) {
+        let _ = self.0.send(());
+        std::thread::sleep(duration.min(Duration::from_millis(10)));
+    }
+    fn wait_for_change(&self, governor: &HostGovernor, seen: u64, timeout: Duration) {
+        let _ = self.0.send(());
+        governor.wait_for_change(seen, timeout.min(Duration::from_millis(10)));
+    }
+}
+
+#[test]
+fn cancellation_while_waiting_for_admission_or_physical_capacity_leaks_no_reservation() {
+    for capacity in [false, true] {
+        let fs = fixture();
+        let governor = HostGovernor::independent(&HostConfig {
+            maximum_in_flight: 1,
+            per_domain_concurrency: 1,
+            failure_surcharge: Duration::from_secs(60),
+            foreground_duty: 1.0,
+            domain_foreground_duty: 1.0,
+            ..Default::default()
+        });
+        let (waiting, waits) = std::sync::mpsc::channel();
+        let clock = Arc::new(NotifyingClock(waiting));
+        let mut scan = Scan::open_outside_host_governor(
+            fs.clone(),
+            fs.root().to_path_buf(),
+            Arc::new(LoadAll),
+            follow(),
+            governor.clone(),
+            clock.clone(),
+        )
+        .unwrap()
+        .with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap());
+        let Some(Ok(ScanEvent::Entry(root))) = scan.next() else { panic!("root") };
+        while waits.try_recv().is_ok() {}
+        let base = governor.base(clock.now());
+        let at = || MonotonicTime(clock.now().saturating_duration_since(base));
+        let held = GrantId::Bootstrap(u64::MAX);
+        if capacity {
+            governor
+                .try_admit(
+                    Reservation {
+                        id: held,
+                        path: RelativePath::root(),
+                        reads: 1,
+                        registrations: 0,
+                        operations: 0,
+                        ceiling: None,
+                        lease: 0,
+                        domain: None,
+                        origin: WorkOrigin::Background,
+                        listing: false,
+                    },
+                    at(),
+                )
+                .unwrap();
+            governor.try_start(held, at()).unwrap();
+        } else {
+            governor.charge_surcharge(Some(root.domain), WorkOrigin::Foreground, at());
+        }
+        let cancel = scan.cancellation();
+        let (done, results) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = scan.next();
+            drop(scan);
+            done.send(result).unwrap();
+        });
+        waits.recv_timeout(Duration::from_secs(5)).expect("scan entered the waiting path");
+        assert_eq!(fs.count_ops(FakeOp::ReadDir, ""), 0);
+        if capacity {
+            assert!(governor.grants().iter().any(|grant| grant.id != held && grant.started.is_none()));
+        } else {
+            assert!(governor.grants().is_empty(), "admission was denied before any reservation");
+        }
+        cancel.cancel();
+        assert!(matches!(results.recv_timeout(Duration::from_secs(5)).unwrap(), Some(Err(Error::Cancelled))));
+        worker.join().unwrap();
+        assert_eq!(governor.grants().len(), usize::from(capacity));
+        if capacity {
+            governor.release(held, at());
+        }
+        assert!(governor.grants().is_empty());
+    }
+}
+
+#[test]
+fn bounded_listings_transfer_their_buffer_across_leases_without_double_reservation() {
+    let fs = fixture();
+    let Opened { scan, governor, clock } = open_with(
+        fs,
+        Arc::new(LoadAll),
+        ScanOptions { entries_per_lease: 1, ..follow() },
+        HostConfig { maximum_in_flight: 1, per_domain_concurrency: 1, ..Default::default() },
+    );
+    let mut scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap());
+    let events = drain(&mut scan);
+    assert_eq!(entries(&events).len(), 8);
+    assert!(scan.stats().leases > scan.stats().listings);
+    drop(scan);
+    assert!(governor.grants().is_empty());
+    assert_eq!(governor.view(now(&governor, &clock)).accounted_memory, 0);
+}
+
+#[test]
+fn a_running_listing_cannot_hide_the_command_ceiling() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::from_secs(2));
+    let _release = ReleaseListing(gate.clone());
+    let (done, results) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done.send(
+            scan.with_listing_executor(tree_fucker::ListingExecutor::new(2).unwrap()).collect::<Result<Vec<_>, _>>(),
+        )
+        .unwrap();
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    clock.advance(Duration::from_secs(3));
+    let result = results.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(result, Err(Error::ResourceLimited(limited)) if limited.limit == ResourceLimit::CommandWorkerTime)
+    );
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    gate.release();
+    worker.join().unwrap();
+    eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+}
+
+#[test]
+fn an_adapter_panic_releases_its_grant_and_reserved_buffer() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::MAX);
+    let _release = ReleaseListing(gate);
+    // The fake adapter panics sending its start notification to a closed
+    // channel.
+    drop(entered);
+    let result =
+        scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap()).collect::<Result<Vec<_>, _>>();
+    assert!(matches!(result, Err(Error::WorkerLost)));
+    eventually(|| governor.grants().is_empty() && governor.view(now(&governor, &clock)).accounted_memory == 0);
+}
+
+#[test]
+fn a_quarantined_sibling_does_not_wait_for_an_exhausted_executor() {
+    let (scan, governor, clock, gate, entered) = blocked_scan(Duration::MAX);
+    let _release = ReleaseListing(gate.clone());
+    let cancel = scan.cancellation();
+    let (events, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for event in scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap()) {
+            events.send(event).unwrap();
+        }
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    clock.advance(Duration::from_secs(31));
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(5)).expect("quarantined sibling must not need a worker");
+        if matches!(event, Ok(ScanEvent::Unlisted { path: p, failure: ScanFailure::Quarantined(_) }) if p == path("b"))
+        {
+            break;
+        }
+    }
+    cancel.cancel();
+    worker.join().unwrap();
+    assert_eq!(governor.view(now(&governor, &clock)).in_flight, 1);
+    gate.release();
+    eventually(|| governor.grants().is_empty());
+}

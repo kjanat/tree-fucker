@@ -51,7 +51,8 @@ pub use path::{CaseSensitivity, PathError, PathKey, RelativePath};
 pub use policy::{LoadAll, LoadDepth, PathPredicate, PolicyContext, ScanDecision, ScanPolicy};
 pub use runtime::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle};
 pub use scan::{
-    Clock, Descent, Scan, ScanEntry, ScanEvent, ScanFailure, ScanOptions, ScanPath, ScanStats, SystemClock,
+    Clock, Descent, ListingExecutor, Scan, ScanEntry, ScanEvent, ScanFailure, ScanOptions, ScanPath, ScanStats,
+    SystemClock,
 };
 pub use snapshot::Snapshot;
 pub use tree::{Tree, TreeHandle, UpdateStream};

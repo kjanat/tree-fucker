@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod executor;
+pub use executor::ListingExecutor;
+
 use crate::config::Config;
 use crate::core::{
     GrantId, HostGovernor, MonotonicTime, Reported, Reservation, TreeNumber, WorkOrigin, host_governor,
@@ -295,6 +298,38 @@ pub struct Scan {
     in_flight_bytes: u64,
     reported: (u64, u64),
     stats: ScanStats,
+    reserved: Duration,
+    listing_executor: Option<ListingExecutor>,
+    accounting: Option<Arc<ScanAccounting>>,
+}
+
+struct ScanAccounting {
+    governor: HostGovernor,
+    number: TreeNumber,
+}
+
+impl Drop for ScanAccounting {
+    fn drop(&mut self) {
+        self.governor.forget_tree(self.number);
+    }
+}
+
+// Kept separate from the scan's tree number: dropping the logical scan must not
+// forget the bounded buffer still owned by an uninterruptible listing.
+struct ListingResources {
+    grant: Option<Granted>,
+    governor: HostGovernor,
+    number: TreeNumber,
+    _scan: Arc<ScanAccounting>,
+}
+
+impl Drop for ListingResources {
+    fn drop(&mut self) {
+        // Settle physical occupancy before the last scan-accounting owner
+        // drops.
+        drop(self.grant.take());
+        self.governor.forget_tree(self.number);
+    }
 }
 
 fn costs_per_child(probe: &ProbeResult) -> bool {
@@ -365,6 +400,9 @@ impl Scan {
             in_flight_bytes: 0,
             reported: (0, 0),
             stats: ScanStats::default(),
+            reserved: Duration::ZERO,
+            listing_executor: None,
+            accounting: None,
         };
         let given = scan.root.clone();
         let (canonical, _) = scan.bootstrap(|fs| fs.canonicalize(&given))?;
@@ -414,8 +452,34 @@ impl Scan {
         self.cancel.clone()
     }
 
+    /// Execute subsequent listing leases on a bounded, reusable worker pool.
+    ///
+    /// Bootstrap, domain resolution, and enrichment remain inline. A listing
+    /// exceeding the governor's stuck threshold is reported as unlisted; its
+    /// worker, grant and buffer allowance remain held until physical
+    /// completion. Healthy domains can continue only while both pool and
+    /// governor capacity remain available.
+    pub fn with_listing_executor(mut self, executor: ListingExecutor) -> Self {
+        self.accounting
+            .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
+        self.listing_executor = Some(executor);
+        self
+    }
+
     pub fn stats(&self) -> ScanStats {
-        ScanStats { anchors_live: self.live_anchors.load(Ordering::SeqCst), ..self.stats.clone() }
+        ScanStats {
+            admitted: self.admitted_cost(),
+            anchors_live: self.live_anchors.load(Ordering::SeqCst),
+            ..self.stats.clone()
+        }
+    }
+
+    fn admitted_cost(&self) -> Duration {
+        if self.accounting.is_some() {
+            self.stats.admitted.max(self.reserved.saturating_add(self.governor.charged_by_tree(self.number)))
+        } else {
+            self.stats.admitted
+        }
     }
 
     fn now(&self) -> MonotonicTime {
@@ -439,7 +503,7 @@ impl Scan {
     }
 
     fn ceiling_reached(&self) -> Error {
-        self.limited(ResourceLimit::CommandWorkerTime, nanos(self.options.ceiling), nanos(self.stats.admitted), None)
+        self.limited(ResourceLimit::CommandWorkerTime, nanos(self.options.ceiling), nanos(self.admitted_cost()), None)
     }
 
     fn wait(&mut self, seen: u64, now: MonotonicTime) {
@@ -454,7 +518,14 @@ impl Scan {
     fn admit(&mut self, id: GrantId, path: &RelativePath, need: Need) -> Result<Admission> {
         let admitted = loop {
             self.check_cancelled()?;
-            let remaining = self.options.ceiling.saturating_sub(self.stats.admitted);
+            if self.accounting.is_some() {
+                let now = self.now();
+                self.governor.account(now);
+                for id in self.governor.newly_stuck(now) {
+                    self.governor.mark_stuck(id, now);
+                }
+            }
+            let remaining = self.options.ceiling.saturating_sub(self.admitted_cost());
             if remaining.is_zero() {
                 return Err(self.ceiling_reached());
             }
@@ -496,6 +567,7 @@ impl Scan {
             }
         };
         self.stats.admitted += admitted.cost;
+        self.reserved += admitted.cost;
         self.stats.grants += 1;
         let held = Held { id, governor: self.governor.clone(), clock: self.clock.clone(), base: self.base };
         loop {
@@ -555,7 +627,9 @@ impl Scan {
             Admission::Quarantined(_) => return Err(Error::Stuck),
         };
         let outcome = work(self.filesystem.as_ref());
-        self.stats.admitted += self.governor.overshoot_of(id);
+        let overshoot = self.governor.overshoot_of(id);
+        self.stats.admitted += overshoot;
+        self.reserved += overshoot;
         outcome.map(|value| (value, granted.held)).map_err(Error::from)
     }
 
@@ -668,6 +742,91 @@ impl Scan {
         self.stats.entries_enumerated += cost.entries_enumerated;
     }
 
+    fn resume_on_worker(
+        &mut self,
+        worker: executor::Worker,
+        granted: Granted,
+        session: Box<dyn ListingSession>,
+        lease: Lease,
+        domain: StorageDomainId,
+    ) -> Result<Option<(Continuation, SessionCost, ListingResources)>> {
+        let id = granted.held.id;
+        let mut memory = ListingResources {
+            grant: Some(granted),
+            governor: self.governor.clone(),
+            number: self.governor.next_tree(),
+            _scan: self.accounting.as_ref().expect("executor accounting").clone(),
+        };
+        let bytes = self.listing_bytes();
+        self.governor.try_reserve_scan_memory(self.number, memory.number, bytes).map_err(|mut limited| {
+            limited.domain = Some(domain);
+            Error::ResourceLimited(limited)
+        })?;
+        let cancel = self.cancel.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        worker.run(move || {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let (continuation, cost) = session.resume(lease);
+            let held = &memory.grant.as_ref().expect("physical grant").held;
+            let now = MonotonicTime(held.clock.now().saturating_duration_since(held.base));
+            let governor = &held.governor;
+            governor.report(
+                id,
+                Reported {
+                    blocking: cost.blocking,
+                    operations: cost.listing_operations.saturating_add(cost.per_child_operations()),
+                },
+                now,
+            );
+            let overshoot = governor.overshoot_of(id);
+            drop(memory.grant.take());
+            // On cancellation/timeout the receiver is gone: the returned
+            // session and its buffer are dropped here, after the
+            // physical call completes.
+            let _ = sender.send((continuation, cost, overshoot, memory));
+        })?;
+        self.in_flight_bytes = 0;
+        self.report_memory();
+        loop {
+            self.check_cancelled()?;
+            match receiver.recv_timeout(executor::CHECK_INTERVAL) {
+                Ok((continuation, cost, overshoot, memory)) => {
+                    self.stats.admitted += overshoot;
+                    return Ok(Some((continuation, cost, memory)));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.check_cancelled()?;
+                    return Err(Error::WorkerLost);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let now = self.now();
+            self.governor.account(now);
+            if self.admitted_cost() >= self.options.ceiling {
+                return Err(self.ceiling_reached());
+            }
+            if self.governor.newly_stuck(now).contains(&id) {
+                self.governor.mark_stuck(id, now);
+            }
+            if self.governor.stuck_grants().iter().any(|grant| grant.id == id) {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn listing_bytes(&self) -> u64 {
+        let limits = self.governor.limits();
+        if self.listing_executor.is_some() {
+            // A detached call can retain its whole allowance. Leave room for
+            // other physical slots instead of reserving the host's entire pool.
+            (limits.in_flight_listing_bytes / limits.maximum_in_flight as u64).max(1)
+        } else {
+            limits.in_flight_listing_bytes
+        }
+    }
+
     fn list(&mut self, target: Target) -> Result<()> {
         let Target { path, context, site, beneath } = target;
         let id = self.next_grant();
@@ -675,17 +834,38 @@ impl Scan {
             return Ok(());
         };
         let domain = located.domain;
+        // Domain resolution remains inline. Do not hold its physical grant
+        // while waiting for an executor slot, or charge worker queue
+        // time as filesystem work.
+        if self.listing_executor.is_some()
+            && let Some(granted) = carried.take()
+        {
+            self.settle(granted, Some(Reported { blocking: None, operations: 1 }), Some(domain));
+        }
         let anchored = self.anchor_room();
-        let ceilings = Ceilings {
-            entries: self.options.entries_per_directory,
-            bytes: self.governor.limits().in_flight_listing_bytes,
-        };
+        let ceilings = Ceilings { entries: self.options.entries_per_directory, bytes: self.listing_bytes() };
         let at = ListingAt { beneath: beneath.as_ref(), anchored };
         let mut session: Box<dyn ListingSession> =
             self.filesystem.open_listing_at(&self.root, &path, at, ceilings, self.cancel.clone());
         let mut lease = 0;
         let mut starved = false;
         let outcome = loop {
+            let worker = if let Some(executor) = &self.listing_executor {
+                match executor.acquire(&self.cancel, || {
+                    if self.governor.quarantined(Some(domain)) { Err(Error::Stuck) } else { Ok(()) }
+                }) {
+                    Ok(worker) => Some(worker),
+                    Err(Error::Stuck) => {
+                        self.in_flight_bytes = 0;
+                        self.report_memory();
+                        self.unlisted(path, ScanFailure::Quarantined(domain));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
             let resolution = u32::from(carried.is_some());
             let granted = match carried.take() {
                 Some(granted) => granted,
@@ -708,13 +888,25 @@ impl Scan {
                 }
             };
             let permitted = usize::try_from(granted.operations).unwrap_or(usize::MAX);
-            let (continuation, cost) =
-                session.resume(Lease { entries: self.options.entries_per_lease, operations: permitted });
+            let lease_budget = Lease { entries: self.options.entries_per_lease, operations: permitted };
+            let (continuation, cost, memory) = if let Some(worker) = worker {
+                match self.resume_on_worker(worker, granted, session, lease_budget, domain)? {
+                    Some((continuation, cost, memory)) => (continuation, cost, Some(memory)),
+                    None => {
+                        self.unlisted(path, ScanFailure::Quarantined(domain));
+                        return Ok(());
+                    }
+                }
+            } else {
+                let (continuation, cost) = session.resume(lease_budget);
+                let operations = cost.listing_operations.saturating_add(cost.per_child_operations()) + resolution;
+                self.settle(granted, Some(Reported { blocking: cost.blocking, operations }), Some(domain));
+                (continuation, cost, None)
+            };
             self.count(&cost);
-            let operations = cost.listing_operations.saturating_add(cost.per_child_operations()) + resolution;
-            self.settle(granted, Some(Reported { blocking: cost.blocking, operations }), Some(domain));
             self.in_flight_bytes = cost.bytes;
             self.report_memory();
+            drop(memory);
             match continuation {
                 Continuation::Suspended(next) => {
                     starved = cost.entries_enumerated == 0;
@@ -946,7 +1138,12 @@ impl Scan {
         self.stack.clear();
         self.stats.buffered_bytes = 0;
         self.in_flight_bytes = 0;
-        self.governor.forget_tree(self.number);
+        if self.accounting.is_some() {
+            self.cancel.cancel();
+            self.report_memory();
+        } else {
+            self.governor.forget_tree(self.number);
+        }
     }
 }
 
@@ -985,6 +1182,11 @@ impl Iterator for Scan {
 
 impl Drop for Scan {
     fn drop(&mut self) {
-        self.governor.forget_tree(self.number);
+        if self.accounting.is_some() {
+            self.cancel.cancel();
+            self.governor.report_memory(self.number, 0, 0);
+        } else {
+            self.governor.forget_tree(self.number);
+        }
     }
 }

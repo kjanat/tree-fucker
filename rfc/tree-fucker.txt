@@ -1031,12 +1031,46 @@ Abstract
           type Item = Result<ScanEvent>;
       }
 
-   A scan is synchronous. Each filesystem operation runs on the calling
-   thread after the host governor grants it, so a scan needs no runtime
-   adapter and occupies at most one worker slot at a time. A scan
-   waiting for admission sleeps until the earliest admissible time the
-   governor reports, or until the governor releases capacity when no
-   such time is computable. It does not poll.
+   A scan's iterator is synchronous. By default each filesystem
+   operation runs on the calling thread after the host governor grants
+   it, so a scan needs no runtime adapter and occupies at most one
+   worker slot at a time. A scan waiting for admission sleeps until the
+   earliest admissible time the governor reports, or until the governor
+   releases capacity when no such time is computable. It does not poll.
+
+   A caller MAY attach a ListingExecutor with with_listing_executor
+   after open. This opt-in dispatches ListingSession::resume on a
+   bounded reusable worker pool. Cloned executors share that bound. It
+   does not change bootstrap, domain resolution, session construction,
+   enrichment, or consumer-owned follow-up reads: those remain inline.
+   An executor slot is acquired before listing admission, without
+   holding a physical filesystem grant while waiting for that slot.
+   Domain resolution settles its own grant before the separate listing
+   grant.
+
+   While awaiting a dispatched listing, the scan checks cancellation and
+   its grant's stuck state at intervals no greater than 50 ms, subject
+   to scheduling. Once the grant reaches the configured stuck threshold,
+   the scan marks it stuck under Section 13.5, emits Unlisted with
+   Quarantined, and abandons that listing's eventual result. Healthy
+   domains can continue only while both executor and governor capacity
+   remain. A wholly occupied pool waits for completion or cancellation;
+   it MUST NOT manufacture replacement capacity.
+
+   Abandoning a result MUST NOT release physical ownership. The worker
+   retains the grant until its call returns, including on cancellation
+   or after the scan is dropped. It then reports cost, releases the
+   grant, and discards any abandoned continuation. Adapter panics become
+   WorkerLost without leaking the grant or permanently losing the slot.
+
+   A bounded listing reserves max(1, in_flight_listing_bytes divided by
+   maximum_in_flight) bytes before dispatch and passes that same ceiling
+   to the adapter. The reservation and the scan's suspended buffer
+   accounting transfer atomically. Reservations MUST respect both host
+   memory ceilings; failure terminates the scan with ResourceLimited. A
+   detached listing keeps its reservation until completion and disposal
+   of its result. Dropping the scan MUST NOT erase that reservation.
+   This conservative allowance leaves capacity for other physical slots.
 
    `open` canonicalizes the root, reads its metadata, and resolves its
    storage domain under bootstrap grants, then makes the root the first
@@ -1099,11 +1133,13 @@ Abstract
          ResourceLimited outcome naming the limit, the quarantined
          domain, or the child name that cannot be represented safely.
 
-   A directory's Entry precedes its Boundary or Unlisted event and
-   every event for its descendants. An Unlisted directory does not end
-   the scan, and its siblings continue. A listing on a domain
-   quarantined under Section 13.5 is reported as Unlisted at once, so a
-   dead mount cannot stall a scan of healthy domains.
+   A directory's Entry precedes its Boundary or Unlisted event and every
+   event for its descendants. An Unlisted directory does not end the
+   scan, and its siblings continue. A listing on a domain quarantined
+   under Section 13.5 is reported as Unlisted at once, so a previously
+   quarantined mount need not be listed. Detecting a newly blocked call
+   without waiting for its return requires the opt-in listing executor
+   and available capacity as described above.
 
    Metadata fields that the options request and the listing does not
    supply inline are read by enrichment under Section 10.1. An
@@ -1113,11 +1149,15 @@ Abstract
    reaching its ceiling, or when the listings it holds alone would
    exceed the accounted-memory ceiling. A terminated scan yields one
    error and then no further event. Events already yielded stand. A
-   scan holds no grant between events, so a consumer may stop iterating
-   and drop the scan at any point between events, and dropping it
-   releases its accounted memory. Cancellation from another thread sets
-   the token every listing session polls between chunks. A filesystem
-   call already inside the kernel runs to completion under Section 4.
+   default inline scan holds no grant between events, so a consumer may
+   stop iterating and drop the scan at any point between events, and
+   dropping it releases its accounted memory. Cancellation from another
+   thread sets the token every listing session polls between chunks. A
+   filesystem call already inside the kernel runs to completion under
+   Section 4. A bounded scan can also retain detached calls between
+   events. Its local completed-lease statistics exclude results it
+   abandoned; the host governor remains authoritative for physical
+   occupancy and cost.
 
    An anchor is an opaque, adapter-owned handle to the directory that a
    listing enumerated. A scan retains one only when its options allow
