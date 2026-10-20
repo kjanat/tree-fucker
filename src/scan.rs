@@ -279,6 +279,9 @@ struct Listing {
     session: Box<dyn ListingSession>,
     lease: u32,
     starved: bool,
+    // Bytes already emitted are no longer live, but remain part of the
+    // whole-directory observation used to admit later full listings.
+    emitted_bytes: u64,
 }
 
 struct Need {
@@ -984,11 +987,22 @@ impl Scan {
         if self.options.streaming && !session.supports_chunks() {
             return Err(Error::InvalidConfig("streaming requires a chunk-capable listing session".into()));
         }
-        self.resume_listing(Listing { path, context, located, id, carried, session, lease: 0, starved: false })
+        self.resume_listing(Listing {
+            path,
+            context,
+            located,
+            id,
+            carried,
+            session,
+            lease: 0,
+            starved: false,
+            emitted_bytes: 0,
+        })
     }
 
     fn resume_listing(&mut self, listing: Listing) -> Result<()> {
-        let Listing { path, context, located, id, mut carried, mut session, mut lease, mut starved } = listing;
+        let Listing { path, context, located, id, mut carried, mut session, mut lease, mut starved, mut emitted_bytes } =
+            listing;
         let domain = located.domain;
         let outcome = loop {
             let worker = if let Some(executor) = &self.listing_executor {
@@ -1062,6 +1076,7 @@ impl Scan {
                     if self.options.streaming
                         && let Some(chunk) = next.take_chunk()
                     {
+                        emitted_bytes = emitted_bytes.saturating_add(cost.bytes);
                         self.in_flight_bytes = 0;
                         let resume = Node::Resume(Box::new(Listing {
                             path: path.clone(),
@@ -1072,6 +1087,7 @@ impl Scan {
                             session: next,
                             lease,
                             starved,
+                            emitted_bytes,
                         }));
                         let before = self.stack.len();
                         self.accept_listing(path, context, located, chunk)?;
@@ -1082,7 +1098,7 @@ impl Scan {
                     }
                     session = next;
                 }
-                Continuation::Finished(outcome) => break (outcome, cost.bytes),
+                Continuation::Finished(outcome) => break (outcome, emitted_bytes.saturating_add(cost.bytes)),
             }
         };
         let (outcome, bytes) = outcome;

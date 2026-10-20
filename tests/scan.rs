@@ -1824,3 +1824,73 @@ fn a_later_scan_quarantines_cancelled_work_in_pool_and_physical_waits() {
         assert_eq!(governor.view(now(&governor, &clock)).surcharged, governor.limits().failure_surcharge);
     }
 }
+
+#[test]
+fn listing_byte_estimates_include_all_streamed_chunks_without_double_counting_leases() {
+    for files in [0, 1, 4, 5] {
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = 0;
+        for i in 0..files {
+            let name = format!("file-{i}");
+            expected += tree_fucker::entry_bytes(std::ffi::OsStr::new(&name));
+            std::fs::write(root.path().join(name), b"").unwrap();
+        }
+        for streaming in [false, true] {
+            for bounded in [false, true] {
+                let governor = HostGovernor::independent(&HostConfig {
+                    foreground_duty: 1.0,
+                    domain_foreground_duty: 1.0,
+                    ..Default::default()
+                });
+                let mut scan = Scan::open_outside_host_governor(
+                    Arc::new(tree_fucker::std_fs::StdFileSystem::new()),
+                    root.path().to_path_buf(),
+                    Arc::new(LoadAll),
+                    ScanOptions { streaming, entries_per_lease: 2, ceiling: Duration::MAX, ..follow() },
+                    governor.clone(),
+                    Arc::new(SystemClock),
+                )
+                .unwrap();
+                if bounded {
+                    scan = scan.with_listing_executor(tree_fucker::ListingExecutor::new(1).unwrap());
+                }
+                let events = drain(&mut scan);
+                let domain = entries(&events)[0].domain;
+                assert_eq!(entries(&events).len(), files + 1);
+                assert_eq!(
+                    governor.bytes_estimate(Some(domain)),
+                    expected,
+                    "files={files}, streaming={streaming}, bounded={bounded}"
+                );
+                assert_eq!(scan.stats().buffered_bytes, 0);
+                drop(scan);
+                if expected > 0 {
+                    let retained = governor.next_tree();
+                    governor.report_memory(retained, governor.memory_ceiling() - expected + 1, 0);
+                    let now = MonotonicTime(Instant::now().saturating_duration_since(governor.base(Instant::now())));
+                    let admission = governor.try_admit(
+                        Reservation {
+                            id: GrantId::Bootstrap(governor.next_bootstrap()),
+                            path: RelativePath::root(),
+                            reads: 1,
+                            registrations: 0,
+                            operations: 0,
+                            ceiling: None,
+                            lease: 0,
+                            domain: Some(domain),
+                            origin: WorkOrigin::Foreground,
+                            listing: true,
+                        },
+                        now,
+                    );
+                    assert_eq!(
+                        admission,
+                        Err(tree_fucker::update::ThrottleCause::Memory),
+                        "a subsequent full listing must reserve its entire estimated buffer"
+                    );
+                    governor.forget_tree(retained);
+                }
+            }
+        }
+    }
+}

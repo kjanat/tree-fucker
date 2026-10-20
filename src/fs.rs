@@ -264,6 +264,9 @@ pub struct SessionCost {
     pub kind_resolutions: u32,
     pub identity_reads: u32,
     pub entries_enumerated: u64,
+    /// Bytes currently retained by the listing session, including the
+    /// returned final listing. This is not a per-lease allocation delta;
+    /// chunks already removed with `take_chunk` are excluded.
     pub bytes: u64,
 }
 
@@ -327,7 +330,9 @@ pub trait ListingSession: Send {
     ///
     /// The default keeps the complete-listing contract. Implementations which
     /// support draining must preserve their total entry ceiling and return the
-    /// same anchor across chunks. This method must perform no filesystem work.
+    /// same anchor across chunks. A returned chunk drains the buffered entries;
+    /// their bytes must be excluded from subsequent `SessionCost::bytes`.
+    /// This method must perform no filesystem work.
     fn take_chunk(&mut self) -> Option<DirectoryListing> {
         None
     }

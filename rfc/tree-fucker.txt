@@ -1118,6 +1118,12 @@ Abstract
    entries-per-directory ceiling MUST still span all chunks. A later
    failure produces Unlisted without retracting earlier observations.
    Dropping a scan discards its suspended cursors and buffered chunks.
+   SessionCost::bytes describes the current buffer, excluding chunks
+   already transferred. The scan retains their byte total separately
+   and combines it with the final buffer for one directory-size sample
+   in the governor. Lease boundaries MUST NOT reduce that sample to an
+   empty final buffer or a trailing chunk. This observation is not live
+   memory and MUST NOT keep emitted chunks charged as retained buffers.
 
    Streaming requires both the session and ScanPolicy to declare
    supports_chunks. The policy must be able to compute child_context
