@@ -24,7 +24,7 @@ Bounded execution applies to listing leases. Bootstrap, domain resolution, sessi
 - `cargo doc --no-deps --all-features --locked`: passed.
 - `cargo fmt --check` and the documented Markdown/RFC formatting checks.
 - Both `[[bench]]` targets pass correctness smoke checks; every comparison mode verifies full path multisets before timing and checks counts during timing.
-- In the fsql checkout: `cargo test -p fsql walk::tests --locked --config 'paths=["/home/kjanat/projects/tree-fucker"]'`: **10 passed**, using the local tree-fucker library. Its pinned dependency and lockfile remain unchanged. This is compatibility validation; adoption of the new opt-in policies by fsql is a consumer change.
+- From an fsql checkout beside the tree-fucker checkout: `cargo test -p fsql walk::tests --locked --config 'paths=["../tree-fucker"]'`: **10 passed**, using the local tree-fucker library. Its pinned dependency and lockfile remain unchanged. This is compatibility validation; adoption of the new opt-in policies by fsql is a consumer change.
 - Review regressions cover duplicate command charges, separate resolution admission, atomic return of worker buffers, and panic failure surcharges.
 
 ## Measurement method
@@ -70,7 +70,7 @@ The persistent Tree control is substantially more expensive, particularly on the
 
 ## Separate resource probes
 
-The fixed input was `/home/kjanat/projects/tree-fucker/target/benchmarks/acceptance-profile-input`, containing the balanced 20,000-file shape (20,013 rows). Each process ran 30 measured traversals, zero warmups, one verification traversal, two oracle walks, startup, and teardown. CPU totals come from `wait4` for that entire process. The sampler/redactor CPU is excluded. Private-memory and descriptor peaks are sampled lower bounds, not exact maxima; inspection/redaction adds overhead beyond the 5 ms sampling sleep. These runs do not supply the normal timings above.
+The fixed input was `target/benchmarks/acceptance-profile-input`, relative to the tree-fucker repository root, containing the balanced 20,000-file shape (20,013 rows). Each process ran 30 measured traversals, zero warmups, one verification traversal, two oracle walks, startup, and teardown. CPU totals come from `wait4` for that entire process. The sampler/redactor CPU is excluded. Private-memory and descriptor peaks are sampled lower bounds, not exact maxima; inspection/redaction adds overhead beyond the 5 ms sampling sleep. These runs do not supply the normal timings above.
 
 | Mode                 | User CPU (s) | System CPU (s) | Sampled private peak (KiB) | Sampled FD peak | Samples |
 | -------------------- | -----------: | -------------: | -------------------------: | --------------: | ------: |
@@ -96,6 +96,6 @@ Each `strace -f -c` process used the same fixed input, one measured traversal, z
 
 The committed [benchmark guide](README.md) provides the Cargo commands, fixture-shape and delay controls, resource sampler, and separate syscall-profiling commands. The [fsql baseline notes](baselines/fsql/README.md) identify the frozen source and adaptations. All generated fixtures and raw reports are under the ignored `target/benchmarks/` directory; the implementation and this report are versioned.
 
-The exact optimized executable for this run was `/home/kjanat/projects/tree-fucker/target/release/build/tree-fucker/c117965850ae4b4d/out/layers-c117965850ae4b4d`. Cargo artifact metadata is saved in `target/benchmarks/acceptance-artifacts.jsonl`; rebuild and extract the current executable path as described in the guide instead of assuming this path remains stable.
+The run used the optimized `layers` benchmark executable identified by Cargo. Its exact local path is recorded in the generated `target/benchmarks/acceptance-artifacts.jsonl`; rebuild and extract the executable path as described in the guide, since Cargo artifact locations depend on the checkout and build configuration.
 
 Raw timing reports are `acceptance-{balanced,wide,deep,delayed}.tsv`, with matching `.log` files. Resource reports are `acceptance-{MODE}-resources.json` (plus `.stdout` and `.stderr`), and syscall summaries are `acceptance-{MODE}-syscalls.txt`, all relative to `target/benchmarks/`. The mode names in these final reports match the documented benchmark interface.
