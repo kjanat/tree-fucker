@@ -188,7 +188,7 @@ impl DeterministicRuntime {
     }
 
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let mut future = Box::pin(future);
+        let mut future = std::pin::pin!(future);
         let main = Arc::new(Flag(AtomicBool::new(false)));
         loop {
             self.run_until_stalled();
