@@ -111,6 +111,27 @@ cargo bench --bench coordination_processes_alloc -- \
 
 Allocated bytes fell 49.1% and allocation count fell 37.0%. Reports are `target/benchmarks/coordination-journal-cache-{before,after}.tsv`, produced by the counting-allocator executable identified above. The existing byte-interruption and native writer-kill tests pass with this change. New cache tests modify both older and newest cached payloads while repairing their checksums, verify rejection, and check that another writer's committed accounting replaces the previously loaded state.
 
+## Reusing journal read buffers
+
+Each journal handle now retains one bounded read buffer per slot. Reads still check both slot headers, sequence numbers, checksums, and configuration agreement. The buffer contents are never used as mutable authority state: the selected payload is decoded into a fresh authority for every load or transaction. The exact validated payload cache remains separate so validation reuse still requires byte-for-byte equality.
+
+The counting-allocator executable used the same tiny shared workload and options as above, with two warmups and seven measured rounds. The prior median is the three-round “After” result in the previous section; the current median is computed from the seven raw rounds:
+
+| Metric, median per round | Before buffer reuse | After buffer reuse | Change |
+| ------------------------ | ------------------: | -----------------: | -----: |
+| Allocations              |               3,941 |              3,639 |  -7.7% |
+| Allocated bytes          |          27,492,000 |         27,259,602 |  -0.8% |
+| Authority acquisitions   |                 301 |                301 |     0% |
+
+Reproduce with:
+
+```sh
+cargo bench --bench coordination_processes_alloc -- \
+  --scenario tiny --mode shared --workers 1 --iterations 100 --runs 7 --warmups 2
+```
+
+This change reduces allocation count without changing lock acquisitions. The byte reduction is small because fresh authority decoding and snapshot publication still dominate allocated volume. The journal corruption and interruption tests remain the safety check for the reused buffers.
+
 ## Contention retry intervals
 
 With snapshot validation reuse already enabled, the timing executable compared the fixed 10 ms retry with a 3 ms initial delay for lock and physical-capacity conflicts, doubling repeated denials up to 10 ms. Successful preparation or authorization resets the delay. Budget, bootstrap, and quarantined-domain denials retain 10 ms.

@@ -71,6 +71,9 @@ pub struct Journal<S> {
     capacity: u32,
     generation: Generation,
     validated: Option<Validated>,
+    // Reuse bounded per-slot read buffers. The selected payload is decoded
+    // afresh below so another process's accounting is never cached.
+    payloads: [Vec<u8>; 2],
 }
 
 struct Snapshot {
@@ -89,7 +92,8 @@ struct Validated {
 struct Candidate {
     slot: u64,
     prepared: bool,
-    validated: Validated,
+    sequence: u64,
+    config: Config,
     authority: Option<Authority>,
 }
 
@@ -114,7 +118,7 @@ impl<S: Read + Write + Seek> Journal<S> {
         header.u64(checksum(&header.0));
         storage.seek(SeekFrom::Start(0))?;
         storage.write_all(&header.0)?;
-        let mut journal = Self { storage, capacity, generation, validated: None };
+        let mut journal = Self { storage, capacity, generation, validated: None, payloads: [Vec::new(), Vec::new()] };
         journal.storage.seek(SeekFrom::Start(journal.length() - 1))?;
         journal.storage.write_all(&[0])?;
         journal.storage.flush()?;
@@ -146,7 +150,7 @@ impl<S: Read + Write + Seek> Journal<S> {
         {
             return Err(Error::Malformed);
         }
-        let mut journal = Self { storage, capacity, generation, validated: None };
+        let mut journal = Self { storage, capacity, generation, validated: None, payloads: [Vec::new(), Vec::new()] };
         if journal.storage.seek(SeekFrom::End(0))? != journal.length() {
             return Err(Error::Malformed);
         }
@@ -195,26 +199,31 @@ impl<S: Read + Write + Seek> Journal<S> {
         if sequence == 0 || (sequence - 1) % 2 != slot || length == 0 || length > self.capacity {
             return invalid();
         }
-        let mut payload = Vec::new();
-        payload.try_reserve_exact(length as usize).map_err(|_| io::Error::other("cannot allocate journal snapshot"))?;
+        let payload = &mut self.payloads[slot as usize];
+        if payload.capacity() < length as usize {
+            payload
+                .try_reserve_exact(length as usize - payload.len())
+                .map_err(|_| io::Error::other("cannot allocate journal snapshot"))?;
+        }
         payload.resize(length as usize, 0);
-        self.read_at(offset + SLOT_HEADER, &mut payload)?;
-        if digest(self.generation, sequence, &payload) != sum {
+        self.storage.seek(SeekFrom::Start(offset + SLOT_HEADER))?;
+        self.storage.read_exact(payload)?;
+        if digest(self.generation, sequence, payload) != sum {
             return invalid();
         }
         // A complete but incompatible/malformed state is not an interrupted
         // write. Never fall back to an older compatible budget.
-        let cached = self.validated.as_ref().filter(|cached| cached.sequence == sequence && cached.payload == payload);
+        let cached = self.validated.as_ref().filter(|cached| cached.sequence == sequence && cached.payload == *payload);
         let (config, authority) = if let Some(cached) = cached {
             (cached.config, None)
         } else {
-            let authority = Authority::decode(&payload)?;
+            let authority = Authority::decode(payload)?;
             if authority.ledger().generation() != self.generation {
                 return Err(Error::Malformed);
             }
             (authority.config(), Some(authority))
         };
-        Ok(Some(Candidate { slot, prepared, validated: Validated { sequence, payload, config }, authority }))
+        Ok(Some(Candidate { slot, prepared, sequence, config, authority }))
     }
 
     fn latest(&mut self) -> Result<Snapshot, Error> {
@@ -222,11 +231,10 @@ impl<S: Read + Write + Seek> Journal<S> {
         let second = self.snapshot(1)?;
         let latest = match (first, second) {
             (Some(a), Some(b)) => {
-                if a.validated.sequence.abs_diff(b.validated.sequence) != 1 || a.validated.config != b.validated.config
-                {
+                if a.sequence.abs_diff(b.sequence) != 1 || a.config != b.config {
                     return Err(Error::Malformed);
                 }
-                if a.validated.sequence > b.validated.sequence { a } else { b }
+                if a.sequence > b.sequence { a } else { b }
             }
             (Some(a), None) | (None, Some(a)) => a,
             (None, None) => return Err(Error::Uninitialized),
@@ -239,10 +247,17 @@ impl<S: Read + Write + Seek> Journal<S> {
         }
         let authority = match latest.authority {
             Some(authority) => authority,
-            None => Authority::decode(&latest.validated.payload)?,
+            None => Authority::decode(&self.payloads[latest.slot as usize])?,
         };
-        let sequence = latest.validated.sequence;
-        self.validated = Some(latest.validated);
+        let sequence = latest.sequence;
+        let selected = &self.payloads[latest.slot as usize];
+        let cache_matches = self
+            .validated
+            .as_ref()
+            .is_some_and(|cached| cached.sequence == sequence && cached.payload.as_slice() == selected.as_slice());
+        if !cache_matches {
+            self.validated = Some(Validated { sequence, payload: selected.clone(), config: latest.config });
+        }
         Ok(Snapshot { sequence, authority })
     }
 
