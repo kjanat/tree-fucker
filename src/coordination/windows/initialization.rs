@@ -83,7 +83,8 @@ pub(super) fn open(
         return Err(Error::Incompatible);
     }
     let retained = clock::Epoch::decode(bytes[32..64].try_into().expect("clock epoch"))?;
-    clock.epoch.require(retained).map_err(|_| Error::Incompatible)?;
+    clock.epoch.require_counter(retained).map_err(|_| Error::Incompatible)?;
+    let rebooted = clock.epoch != retained;
     let generation = Generation(bytes[16..32].try_into().expect("generation"));
     let mut journal = if bytes[12] == PREPARING {
         let recovered = if state.metadata()?.len() > journal::HEADER {
@@ -117,10 +118,70 @@ pub(super) fn open(
     if authority.config() != config || authority.ledger().generation() != generation {
         return Err(Error::Incompatible);
     }
+    if rebooted {
+        // QPC restarts with Windows. Continue from the last committed logical
+        // time so downtime does not refill the retained shared budgets.
+        clock.rebase(authority.now())?;
+    }
     if bytes[12] == PREPARING {
         anchor.seek(SeekFrom::Start(12))?;
         anchor.write_all(&[READY])?;
         anchor.flush()?;
     }
     Ok((root, journal))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use super::*;
+    use crate::HostConfig;
+    use crate::coordination::authority::{Config, Origin, Request};
+    use crate::coordination::protocol::Work;
+    use crate::coordination::windows::{Completion, Scope};
+
+    #[test]
+    fn retained_authority_reopens_after_a_boot_epoch_change_without_resetting_debt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordination");
+        let config = Config::from_host(&HostConfig::default(), 4, 8, 4).unwrap();
+        let scope = Scope::open(&path, config).unwrap();
+        let generation = scope.diagnostics().unwrap().generation;
+        let client = scope.join().unwrap();
+        let mut prepared = client
+            .prepare(Request {
+                work: Work::LazyRead,
+                origin: Origin::Foreground,
+                domain: None,
+                required: 1,
+                desired: 0,
+                ceiling_ns: u64::MAX,
+            })
+            .unwrap();
+        prepared.try_run(|_| Completion { value: (), operations: 1, failed: false }).unwrap();
+        let charged = scope.view().unwrap().charged_ns;
+        drop((prepared, client, scope));
+
+        let mut anchor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("coordination.authority.lock"))
+            .unwrap();
+        let mut header = [0; HEADER];
+        anchor.read_exact(&mut header).unwrap();
+        let retained = clock::Epoch::decode(header[32..64].try_into().unwrap()).unwrap();
+        let sequence = if retained.sequence + 1 == u32::MAX { 1 } else { retained.sequence + 1 };
+        header[32..64].copy_from_slice(&clock::Epoch { sequence, ..retained }.encode());
+        let checksum = hash(&header);
+        header[248..].copy_from_slice(&checksum.to_le_bytes());
+        anchor.seek(SeekFrom::Start(0)).unwrap();
+        anchor.write_all(&header).unwrap();
+        anchor.flush().unwrap();
+
+        let reopened = Scope::open(&path, config).unwrap();
+        assert_eq!(reopened.diagnostics().unwrap().generation, generation);
+        assert!(reopened.view().unwrap().charged_ns >= charged);
+    }
 }

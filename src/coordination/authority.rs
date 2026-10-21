@@ -301,6 +301,12 @@ impl Authority {
         &self.ledger
     }
 
+    /// Latest committed logical timestamp used by the shared authority.
+    #[cfg(windows)]
+    pub(crate) fn now(&self) -> u64 {
+        self.now
+    }
+
     pub fn join(&mut self, version: u32) -> Result<Participant, Error> {
         Ok(self.ledger.join(version)?)
     }

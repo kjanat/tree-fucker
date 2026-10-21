@@ -49,9 +49,10 @@ jobs:
         run: |
           cargo test --test coordination_namespaces --no-run --message-format=json > target/namespace-build.jsonl
           test_executable=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_namespaces") | .executable // empty' target/namespace-build.jsonl)
-          sudo install -d -m 755 "${RUNNER_TEMP}/coordination-namespaces"
-          sudo install -m 755 "${test_executable}" "${RUNNER_TEMP}/coordination-namespaces/coordination_namespaces"
-          sudo "${RUNNER_TEMP}/coordination-namespaces/coordination_namespaces" namespace_histories --ignored --nocapture
+          namespace_dir=$(mktemp -d /tmp/tree-fucker-coordination-namespaces.XXXXXX)
+          chmod 755 "${namespace_dir}"
+          sudo install -m 755 "${test_executable}" "${namespace_dir}/coordination_namespaces"
+          sudo "${namespace_dir}/coordination_namespaces" namespace_histories --ignored --nocapture
       - name: Coordination process benchmark smoke tests
         if: startsWith(matrix.os, 'ubuntu-') || startsWith(matrix.os, 'macos-')
         run: |

@@ -113,6 +113,9 @@ fn retry<T>(mut operation: impl FnMut() -> Result<T, Error>) -> T {
         match operation() {
             Ok(value) => return value,
             Err(Error::Busy) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Err(error) => panic!("coordination: {error}"),
         }
     }

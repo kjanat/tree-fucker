@@ -99,6 +99,10 @@ impl Scope {
         Ok(self.clock.now()?)
     }
 
+    fn now_at(&self, state: &Authority) -> Result<u64, Error> {
+        Ok(self.clock.now()?.max(state.now()))
+    }
+
     pub(crate) fn check_context(&self) -> Result<(), Error> {
         self.principal.check().map_err(|_| Error::Incompatible)?;
         if self.failed.load(Ordering::Acquire) {
@@ -224,7 +228,8 @@ impl Scope {
             journal
                 .transaction_with(|state| {
                     self.recover(state, recovery_slot, &mut recovered)?;
-                    Ok::<_, Error>(operation(state, self.now()?))
+                    let now = self.now_at(state)?;
+                    Ok::<_, Error>(operation(state, now))
                 })?
                 .map_err(Error::Authority)
         })
@@ -255,7 +260,7 @@ impl Scope {
                 .take(remaining)
                 .collect();
             remaining -= ids.len();
-            let at = self.now()?;
+            let at = self.now_at(state)?;
             for id in ids {
                 state.reclaim_after_owner_exit(id, at)?;
             }

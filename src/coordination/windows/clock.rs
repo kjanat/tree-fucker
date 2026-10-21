@@ -1,6 +1,7 @@
-//! One boot-qualified performance-counter epoch for cooperating processes.
+//! Boot-qualified performance-counter time for cooperating processes.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
 use windows_sys::Wdk::System::SystemServices::KUSER_SHARED_DATA;
@@ -56,11 +57,11 @@ impl Epoch {
         )
     }
 
-    pub(crate) fn require(self, retained: Self) -> io::Result<()> {
-        if self != retained {
+    pub(crate) fn require_counter(self, retained: Self) -> io::Result<()> {
+        if self.frequency != retained.frequency {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "retained coordination clock belongs to a different Windows boot or counter",
+                "retained coordination clock uses a different performance counter",
             ));
         }
         Ok(())
@@ -76,6 +77,8 @@ impl Epoch {
 
 pub(crate) struct Clock {
     pub epoch: Epoch,
+    raw_base: AtomicU64,
+    logical_base: AtomicU64,
 }
 
 impl Clock {
@@ -114,10 +117,14 @@ impl Clock {
         }
         let frequency = u64::try_from(frequency)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative performance counter frequency"))?;
-        Ok(Self { epoch: Epoch::checked(information.entry, sequence, frequency)? })
+        Ok(Self {
+            epoch: Epoch::checked(information.entry, sequence, frequency)?,
+            raw_base: AtomicU64::new(0),
+            logical_base: AtomicU64::new(0),
+        })
     }
 
-    pub(crate) fn now(&self) -> io::Result<u64> {
+    fn raw_now(&self) -> io::Result<u64> {
         let mut ticks = 0;
         // SAFETY: live correctly sized output; no process-relative origin or
         // floating-point conversion is introduced into shared timestamps.
@@ -126,6 +133,31 @@ impl Clock {
         }
         self.epoch.nanos(ticks)
     }
+
+    pub(crate) fn now(&self) -> io::Result<u64> {
+        let raw = self.raw_now()?;
+        let raw_base = self.raw_base.load(Ordering::Acquire);
+        let logical_base = self.logical_base.load(Ordering::Acquire);
+        logical_at(raw_base, logical_base, raw)
+    }
+
+    /// Continue the retained authority timeline from its last committed time
+    /// after Windows restarts its boot-relative performance counter.
+    pub(crate) fn rebase(&self, logical_now: u64) -> io::Result<()> {
+        let raw_now = self.raw_now()?;
+        self.logical_base.store(logical_now, Ordering::Relaxed);
+        self.raw_base.store(raw_now, Ordering::Release);
+        Ok(())
+    }
+}
+
+fn logical_at(raw_base: u64, logical_base: u64, raw_now: u64) -> io::Result<u64> {
+    let elapsed = raw_now
+        .checked_sub(raw_base)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Windows performance counter regressed"))?;
+    logical_base
+        .checked_add(elapsed)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock overflowed"))
 }
 
 #[cfg(test)]
@@ -133,15 +165,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clock_epoch_checks_reboot_counter_identity_and_malformed_headers() {
+    fn clock_epoch_checks_counter_compatibility_and_malformed_headers() {
         let epoch = Epoch::checked([1; 16], 7, 10_000_000).unwrap();
         assert_eq!(Epoch::decode(epoch.encode()).unwrap(), epoch);
-        epoch.require(epoch).unwrap();
-        for other in
-            [Epoch { sequence: 8, ..epoch }, Epoch { entry: [2; 16], ..epoch }, Epoch { frequency: 1, ..epoch }]
-        {
-            assert!(matches!(epoch.require(other), Err(error) if error.kind() == io::ErrorKind::InvalidData));
-        }
+        epoch.require_counter(epoch).unwrap();
+        Epoch { sequence: 8, ..epoch }.require_counter(epoch).unwrap();
+        Epoch { entry: [2; 16], ..epoch }.require_counter(epoch).unwrap();
+        assert!(
+            matches!(Epoch { frequency: 1, ..epoch }.require_counter(epoch), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+        );
         for other in [
             Epoch { sequence: 0, ..epoch },
             Epoch { sequence: u32::MAX, ..epoch },
@@ -176,12 +208,33 @@ mod tests {
         for _ in 0..8 {
             std::thread::spawn(move || {
                 let clock = Clock::current().unwrap();
-                clock.epoch.require(retained).unwrap();
+                clock.epoch.require_counter(retained).unwrap();
                 assert!(clock.now().unwrap() >= before);
             })
             .join()
             .unwrap();
         }
         assert!(first.now().unwrap() >= before);
+    }
+
+    #[test]
+    fn native_clock_rebase_continues_from_retained_logical_time() {
+        let clock = Clock::current().unwrap();
+        let retained = clock.now().unwrap().saturating_add(60_000_000_000);
+        clock.rebase(retained).unwrap();
+        assert!(clock.now().unwrap() >= retained);
+    }
+
+    #[test]
+    fn reboot_rebase_preserves_the_retained_timeline_without_refilling_downtime() {
+        assert_eq!(logical_at(900, 12_000, 925).unwrap(), 12_025);
+        assert_eq!(logical_at(0, 50_000, 0).unwrap(), 50_000);
+        assert!(logical_at(901, 12_000, 900).is_err());
+        assert!(logical_at(0, u64::MAX, 1).is_err());
+
+        let previous = Epoch::checked([1; 16], 7, 10_000_000).unwrap();
+        let rebooted = Epoch { sequence: 8, ..previous };
+        rebooted.require_counter(previous).unwrap();
+        assert!(Epoch { frequency: 1, ..rebooted }.require_counter(previous).is_err());
     }
 }
