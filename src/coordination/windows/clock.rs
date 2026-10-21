@@ -137,8 +137,7 @@ impl Clock {
     /// Align this connection's performance counter with committed logical time.
     pub(crate) fn rebase(&self, logical_now: u64) -> io::Result<()> {
         let raw_now = self.raw_now()?;
-        let offset = i64::try_from(i128::from(logical_now) - i128::from(raw_now))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock offset is out of range"))?;
+        let offset = rebase_offset(self.logical_offset.load(Ordering::Acquire), raw_now, logical_now)?;
         self.logical_offset.store(offset, Ordering::Release);
         Ok(())
     }
@@ -147,6 +146,12 @@ impl Clock {
 fn logical_at(offset: i64, raw_now: u64) -> io::Result<u64> {
     u64::try_from(i128::from(raw_now) + i128::from(offset))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock is out of range"))
+}
+
+fn rebase_offset(current_offset: i64, raw_now: u64, logical_minimum: u64) -> io::Result<i64> {
+    let current = logical_at(current_offset, raw_now)?;
+    i64::try_from(i128::from(logical_minimum.max(current)) - i128::from(raw_now))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock offset is out of range"))
 }
 
 #[cfg(test)]
@@ -220,6 +225,8 @@ mod tests {
         assert_eq!(logical_at(0, 50_000).unwrap(), 50_000);
         assert!(logical_at(-1, 0).is_err());
         assert!(logical_at(1, u64::MAX).is_err());
+        assert_eq!(rebase_offset(100, 1_000, 1_050).unwrap(), 100);
+        assert_eq!(rebase_offset(100, 1_000, 1_200).unwrap(), 200);
 
         let previous = Epoch::checked([1; 16], 7, 10_000_000).unwrap();
         let rebooted = Epoch { sequence: 8, ..previous };
