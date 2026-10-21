@@ -1,7 +1,7 @@
 //! Boot-qualified performance-counter time for cooperating processes.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
 use windows_sys::Wdk::System::SystemServices::KUSER_SHARED_DATA;
@@ -77,8 +77,7 @@ impl Epoch {
 
 pub(crate) struct Clock {
     pub epoch: Epoch,
-    raw_base: AtomicU64,
-    logical_base: AtomicU64,
+    logical_offset: AtomicI64,
 }
 
 impl Clock {
@@ -117,11 +116,7 @@ impl Clock {
         }
         let frequency = u64::try_from(frequency)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative performance counter frequency"))?;
-        Ok(Self {
-            epoch: Epoch::checked(information.entry, sequence, frequency)?,
-            raw_base: AtomicU64::new(0),
-            logical_base: AtomicU64::new(0),
-        })
+        Ok(Self { epoch: Epoch::checked(information.entry, sequence, frequency)?, logical_offset: AtomicI64::new(0) })
     }
 
     fn raw_now(&self) -> io::Result<u64> {
@@ -136,27 +131,22 @@ impl Clock {
 
     pub(crate) fn now(&self) -> io::Result<u64> {
         let raw = self.raw_now()?;
-        let raw_base = self.raw_base.load(Ordering::Acquire);
-        let logical_base = self.logical_base.load(Ordering::Acquire);
-        logical_at(raw_base, logical_base, raw)
+        logical_at(self.logical_offset.load(Ordering::Acquire), raw)
     }
 
     /// Align this connection's performance counter with committed logical time.
     pub(crate) fn rebase(&self, logical_now: u64) -> io::Result<()> {
         let raw_now = self.raw_now()?;
-        self.logical_base.store(logical_now, Ordering::Relaxed);
-        self.raw_base.store(raw_now, Ordering::Release);
+        let offset = i64::try_from(i128::from(logical_now) - i128::from(raw_now))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock offset is out of range"))?;
+        self.logical_offset.store(offset, Ordering::Release);
         Ok(())
     }
 }
 
-fn logical_at(raw_base: u64, logical_base: u64, raw_now: u64) -> io::Result<u64> {
-    let elapsed = raw_now
-        .checked_sub(raw_base)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Windows performance counter regressed"))?;
-    logical_base
-        .checked_add(elapsed)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock overflowed"))
+fn logical_at(offset: i64, raw_now: u64) -> io::Result<u64> {
+    u64::try_from(i128::from(raw_now) + i128::from(offset))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock is out of range"))
 }
 
 #[cfg(test)]
@@ -226,10 +216,10 @@ mod tests {
 
     #[test]
     fn reboot_rebase_preserves_the_retained_timeline_without_refilling_downtime() {
-        assert_eq!(logical_at(900, 12_000, 925).unwrap(), 12_025);
-        assert_eq!(logical_at(0, 50_000, 0).unwrap(), 50_000);
-        assert!(logical_at(901, 12_000, 900).is_err());
-        assert!(logical_at(0, u64::MAX, 1).is_err());
+        assert_eq!(logical_at(11_100, 925).unwrap(), 12_025);
+        assert_eq!(logical_at(0, 50_000).unwrap(), 50_000);
+        assert!(logical_at(-1, 0).is_err());
+        assert!(logical_at(1, u64::MAX).is_err());
 
         let previous = Epoch::checked([1; 16], 7, 10_000_000).unwrap();
         let rebooted = Epoch { sequence: 8, ..previous };
