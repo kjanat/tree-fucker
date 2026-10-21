@@ -18,6 +18,18 @@ name    = "layers"
 harness = false
 name    = "layers_alloc"
 
+[[bench]]
+harness = false
+name    = "coordination"
+
+[[bench]]
+harness = false
+name    = "coordination_processes"
+
+[[bench]]
+harness = false
+name    = "coordination_processes_alloc"
+
 [dependencies]
 futures-channel = "0.3.34"
 futures-core    = "0.3.34"
@@ -35,12 +47,33 @@ stats_alloc      = "0.1.10"
 tempfile         = "3.27.0"
 tokio            = { version = "1.53.1", features = ["rt", "time"] }
 
+[target."cfg(any(unix, windows))".dependencies]
+getrandom = { version = "0.4.3", features = ["std"] }
+
 [target."cfg(unix)".dependencies]
 libc   = "0.2.189"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "time"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemServices"] }
+windows-sys = { version = "0.61.2", features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+  "Wdk_System_SystemInformation",
+  "Wdk_System_SystemServices",
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_Kernel",
+  "Win32_System_Performance",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_UI_Shell"
+] }
 
 [features]
 tokio = ["dep:tokio"]

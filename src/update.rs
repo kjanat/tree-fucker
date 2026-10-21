@@ -102,6 +102,8 @@ pub enum ThrottleCause {
     Memory,
     ForegroundCeiling,
     StuckWorker,
+    Coordination,
+    CoordinationFailed,
 }
 
 impl fmt::Display for ThrottleCause {
@@ -112,6 +114,8 @@ impl fmt::Display for ThrottleCause {
             ThrottleCause::Memory => f.write_str("accounted memory"),
             ThrottleCause::ForegroundCeiling => f.write_str("foreground allowance"),
             ThrottleCause::StuckWorker => f.write_str("stuck worker"),
+            ThrottleCause::Coordination => f.write_str("shared admission"),
+            ThrottleCause::CoordinationFailed => f.write_str("shared authority unavailable after joining"),
         }
     }
 }

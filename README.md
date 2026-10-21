@@ -128,6 +128,31 @@ This project exists partly because "walk the whole tree periodically" is a surpr
 
 The host governor is process-wide. Multiple trees opened in one process share the same physical ceilings instead of each multiplying the allowed load. Work is charged to the storage domain that caused it, and a stuck domain can be quarantined without preventing healthy domains from making progress.
 
+Linux, FreeBSD, and illumos applications can opt into a shared authority before opening their first Scan or Tree:
+
+```rust
+use tree_fucker::{HostConfig, HostGovernor};
+use tree_fucker::coordination::{Mode, Options, Rendezvous, authority};
+
+let local = HostConfig::default();
+let limits = authority::Config::from_host(&local, 64, 256, 128)?;
+let governor = HostGovernor::install_with_coordination(local, Mode::Required(Options {
+    scope: Rendezvous::Discover,
+    limits,
+}))?;
+let status = governor.coordination_status();
+```
+
+FreeBSD discovery requires an administrator-mounted tmpfs at `/var/run/tree-fucker`. Host and jail processes with the same filesystem root and effective user share the retained authority. Different roots cannot join that authority; capability mode receives an explicit unavailable result.
+
+illumos discovery uses an administrator-created sticky directory at `/var/run/tree-fucker` on tmpfs. Root identity and the zone incarnation qualify each authority; domains without cross-process identity still consume the shared aggregate allowance.
+
+The macOS adapter uses an administrator-mounted tmpfs at `/var/run/tree-fucker`; its native acceptance is tracked in [the platform contracts](rfc/coordination-platforms.md#macos).
+
+The Windows adapter retains its journal under the effective user's OS-configured local application-data directory, verifies local NTFS/ReFS storage and protected permissions, and uses exclusive file handles for operation ownership. Native acceptance and retained accounting across reboot are tracked in [the Windows contract](rfc/coordination-platforms.md#windows).
+
+`ProcessOnly` remains the default. `Required` requires shared admission for every governed operation. `Auto` permits process-only fallback when the native backend is unavailable before joining and reports the reason in `coordination_status()`. Busy, full, incompatible, or damaged authorities return errors. Once joined, a failed authority stops new work while existing physical operations retain their ownership. `HostGovernor::configured` constructs the same policy for an explicit Scan or Tree governor. See the [coordination protocol](rfc/coordination.md) for scope lifetime, identity, and recovery.
+
 Hard limits do not masquerade as eventual convergence. If configured limits make required work impossible, the tree reports `ResourceLimited` rather than promising to finish someday.
 
 ## Specification
