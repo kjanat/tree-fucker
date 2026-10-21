@@ -141,8 +141,7 @@ impl Clock {
         logical_at(raw_base, logical_base, raw)
     }
 
-    /// Continue the retained authority timeline from its last committed time
-    /// after Windows restarts its boot-relative performance counter.
+    /// Align this connection's performance counter with committed logical time.
     pub(crate) fn rebase(&self, logical_now: u64) -> io::Result<()> {
         let raw_now = self.raw_now()?;
         self.logical_base.store(logical_now, Ordering::Relaxed);

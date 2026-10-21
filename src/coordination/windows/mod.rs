@@ -100,7 +100,14 @@ impl Scope {
     }
 
     fn now_at(&self, state: &Authority) -> Result<u64, Error> {
-        Ok(self.clock.now()?.max(state.now()))
+        let clock_now = self.clock.now()?;
+        let committed_now = state.now();
+        if committed_now > clock_now {
+            self.clock.rebase(committed_now)?;
+            Ok(committed_now)
+        } else {
+            Ok(clock_now)
+        }
     }
 
     pub(crate) fn check_context(&self) -> Result<(), Error> {
