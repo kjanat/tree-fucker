@@ -15,9 +15,10 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
-    IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetSecurityDescriptorOwner, GetTokenInformation,
+    IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SE_SELF_RELATIVE,
     SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_STATISTICS, TOKEN_USER, TokenIsAppContainer,
     TokenSessionId, TokenStatistics, TokenUser,
 };
@@ -33,6 +34,21 @@ fn invalid(reason: &'static str) -> io::Error {
     // Unsafe existing state is not simple unavailability: Auto selection must
     // not turn a malformed/broadened authority into an independent budget.
     io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+fn matches_sid(principal: &Principal, bytes: &[u8]) -> bool {
+    if bytes.len() < 8 || bytes[0] != 1 || bytes[1] > 15 {
+        return false;
+    }
+    let length = 8 + usize::from(bytes[1]) * size_of::<u32>();
+    length == bytes.len() && bytes == &principal.sid_bytes[..length]
+}
+
+fn descriptor_region(descriptor: &[u8], pointer: *const c_void) -> Option<&[u8]> {
+    let start = descriptor.as_ptr() as usize;
+    let address = pointer as usize;
+    let offset = address.checked_sub(start)?;
+    descriptor.get(offset..)
 }
 
 struct Local(*mut c_void);
@@ -308,8 +324,9 @@ impl Descriptor {
         let mut present = 0;
         let mut acl: *mut ACL = null_mut();
         // SAFETY: descriptor is a valid Windows-produced allocation. Component
-        // pointers are borrowed only while it remains alive. IsValidAcl and
-        // GetAce validate the variable-size access entry before dereferencing.
+        // pointers are borrowed only while it remains alive. Validate the ACL
+        // with the Windows APIs, obtain its checked size/count, then copy ACE
+        // headers into aligned local values before inspecting them.
         unsafe {
             if GetSecurityDescriptorControl(self.0.0, &mut control, &mut revision) == 0
                 || GetSecurityDescriptorOwner(self.0.0, &mut owner, &mut defaulted) == 0
@@ -317,37 +334,85 @@ impl Descriptor {
             {
                 return Err(io::Error::last_os_error());
             }
-            if control & SE_DACL_PROTECTED == 0 {
+            if control & SE_DACL_PROTECTED == 0 || control & SE_SELF_RELATIVE == 0 {
                 return Err(invalid("coordination DACL is not protected from inherited permissions"));
             }
-            if sid_text(owner)? != principal.sid {
+            let descriptor_length = GetSecurityDescriptorLength(self.0.0) as usize;
+            if descriptor_length == 0 {
+                return Err(invalid("coordination security descriptor has an invalid length"));
+            }
+            // GetSecurityInfo and the SDDL conversion API both return an
+            // allocated self-relative descriptor. Bound every component
+            // against that allocation before reading its bytes.
+            let descriptor_bytes = std::slice::from_raw_parts(self.0.0.cast::<u8>(), descriptor_length);
+            let owner_bytes = descriptor_region(descriptor_bytes, owner.cast())
+                .ok_or_else(|| invalid("coordination owner SID is outside its descriptor"))?;
+            let owner_length =
+                if owner_bytes.len() < 8 { 0 } else { 8 + usize::from(owner_bytes[1]) * size_of::<u32>() };
+            if owner_length == 0
+                || owner_length > owner_bytes.len()
+                || !matches_sid(principal, &owner_bytes[..owner_length])
+            {
                 return Err(invalid("coordination object belongs to another principal"));
             }
-            if present == 0 || acl.is_null() || IsValidAcl(acl) == 0 || (*acl).AceCount != 1 {
+            if present == 0 || acl.is_null() || IsValidAcl(acl) == 0 {
                 return Err(invalid("coordination DACL must contain exactly one explicit owner entry"));
+            }
+            let mut acl_size = ACL_SIZE_INFORMATION::default();
+            if GetAclInformation(
+                acl,
+                (&mut acl_size as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if acl_size.AceCount != 1 || (acl_size.AclBytesInUse as usize) < size_of::<ACL>() {
+                return Err(invalid("coordination DACL must contain exactly one explicit owner entry"));
+            }
+            let acl_bytes = descriptor_region(descriptor_bytes, acl.cast())
+                .ok_or_else(|| invalid("coordination DACL is outside its descriptor"))?;
+            let acl_length = acl_size.AclBytesInUse as usize;
+            if acl_length > acl_bytes.len() {
+                return Err(invalid("coordination DACL extends beyond its descriptor"));
             }
             let mut entry = null_mut();
             if GetAce(acl, 0, &mut entry) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let header = &*entry.cast::<ACE_HEADER>();
+            if entry.is_null() {
+                return Err(invalid("Windows returned a null coordination access entry"));
+            }
+            let entry_address = entry as usize;
+            let acl_address = acl as usize;
+            let entry_offset = entry_address
+                .checked_sub(acl_address)
+                .ok_or_else(|| invalid("coordination access entry precedes its DACL"))?;
+            if entry_offset < size_of::<ACL>() || entry_offset > acl_length {
+                return Err(invalid("coordination access entry begins outside its DACL payload"));
+            }
+            let header_bytes = acl_bytes
+                .get(entry_offset..entry_offset.saturating_add(size_of::<ACE_HEADER>()))
+                .ok_or_else(|| invalid("coordination access entry header is outside its DACL"))?;
+            let ace_size = u16::from_le_bytes([header_bytes[2], header_bytes[3]]) as usize;
+            if ace_size < size_of::<ACCESS_ALLOWED_ACE>() || ace_size > acl_length - size_of::<ACL>() {
+                return Err(invalid("coordination access entry has an invalid size"));
+            }
+            let ace_bytes = acl_bytes
+                .get(entry_offset..entry_offset.saturating_add(ace_size))
+                .ok_or_else(|| invalid("coordination access entry extends beyond its DACL"))?;
             let flags = if directory { OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE } else { 0 };
-            if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
-                || u32::from(header.AceFlags) != flags
-                || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
-            {
+            if u32::from(ace_bytes[0]) != ACCESS_ALLOWED_ACE_TYPE || u32::from(ace_bytes[1]) != flags {
                 return Err(invalid("coordination access entry has an invalid type, inheritance, or size"));
             }
-            let ace = &*entry.cast::<ACCESS_ALLOWED_ACE>();
-            if ace.Mask != FILE_ALL_ACCESS {
+            let mask = u32::from_le_bytes(ace_bytes[4..8].try_into().expect("validated ACE header size"));
+            if mask != FILE_ALL_ACCESS {
                 return Err(invalid("coordination access entry must grant the owner full file access"));
             }
-            let sid = (&ace.SidStart as *const u32).cast_mut().cast();
-            if sid_text(sid)? != principal.sid
-                || GetLengthSid(sid) as usize + std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart)
-                    != usize::from(ace.Header.AceSize)
-            {
-                return Err(invalid("coordination access entry does not name the exact owner SID"));
+            let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            if !matches_sid(principal, &ace_bytes[sid_offset..]) {
+                return Err(invalid("coordination access entry contains a malformed SID"));
             }
         }
         Ok(())

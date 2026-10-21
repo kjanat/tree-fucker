@@ -415,7 +415,7 @@ mod tests {
                     assert_eq!(view.charged_ns, 20_000_000, "cut {limit}");
                     assert_eq!(view.prepared, 0);
                 }
-                other => panic!("unexpected occupancy {other}"),
+                _ => panic!("unexpected occupancy"),
             }
             // Retry after recovery: never charge or occupy a second time.
             recovered.transaction(|authority| authority.authorize(id, 0)).unwrap();
@@ -509,7 +509,7 @@ mod tests {
                     assert_eq!(view.charged_ns, 40_000_000);
                     assert_eq!(view.surcharged_ns, 20_000_000);
                 }
-                other => panic!("unexpected physical count {other}"),
+                _ => panic!("unexpected physical count"),
             }
             recovered.transaction(finish).unwrap();
             let view = recovered.load().unwrap().view();

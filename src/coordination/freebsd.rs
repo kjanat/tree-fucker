@@ -32,5 +32,8 @@ pub(super) fn namespaces() -> Result<[[u8; 16]; 3], Error> {
 
 pub(super) fn is_tmpfs(file: &File) -> Result<bool, Error> {
     let stat = rustix::fs::fstatfs(file)?;
-    Ok(stat.f_fstypename[..5].iter().copied().map(|byte| byte as u8).eq(*b"tmpfs") && stat.f_fstypename[5] == 0)
+    // `c_char` is signed on x86 FreeBSD and unsigned on the aarch64 target.
+    // Compare the fixed kernel byte field through its representation instead.
+    let name = unsafe { std::slice::from_raw_parts(stat.f_fstypename.as_ptr().cast::<u8>(), stat.f_fstypename.len()) };
+    Ok(name.starts_with(b"tmpfs\0"))
 }
