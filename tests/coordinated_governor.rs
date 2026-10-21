@@ -350,6 +350,32 @@ fn public_preparation_commit_composes_shared_admission() {
 }
 
 #[test]
+fn dropping_local_preparation_aborts_before_shared_admission() {
+    let (_root, scope) = fixture();
+    let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+    let prepared = host.try_prepare(request(&host), NOW).unwrap();
+    assert_eq!(host.view(NOW).preparations, 1);
+    assert_eq!(scope.view().unwrap().prepared, 0, "shared admission waits for local commit");
+
+    drop(prepared);
+
+    let local = host.view(NOW);
+    let shared = scope.view().unwrap();
+    assert_eq!(local.preparations, 0);
+    assert_eq!(local.charged, Duration::ZERO);
+    assert_eq!(local.surcharged, Duration::ZERO);
+    assert_eq!((shared.prepared, shared.physical, shared.charged_ns, shared.surcharged_ns), (0, 0, 0, 0));
+
+    // The returned capacity remains usable after cancellation.
+    let reservation = request(&host);
+    let id = reservation.id;
+    host.try_prepare(reservation, NOW).unwrap().commit(NOW).unwrap();
+    host.try_start(id, NOW).unwrap();
+    host.release(id, NOW);
+    assert!(host.coordination_error().is_none());
+}
+
+#[test]
 fn actual_scan_lists_and_reads_under_the_shared_authority() {
     use tree_fucker::{DomainCrossing, LoadAll, Scan, ScanEvent, ScanOptions, SystemClock};
 
