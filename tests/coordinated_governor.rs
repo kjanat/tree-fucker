@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos"))]
+#![cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -151,10 +151,12 @@ fn host_config() -> HostConfig {
 }
 
 fn fixture() -> (tempfile::TempDir, Arc<Scope>) {
-    let root = tempfile::Builder::new()
-        .prefix("tree-fucker-composition-")
-        .tempdir_in(coordination_support::RENDEZVOUS)
-        .unwrap();
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("tree-fucker-composition-");
+    #[cfg(windows)]
+    let root = builder.tempdir().unwrap();
+    #[cfg(not(windows))]
+    let root = builder.tempdir_in(coordination_support::RENDEZVOUS).unwrap();
     let budget = Budget { refill_ns_per_second: 1_000_000_000, burst_ns: 1_000_000_000 };
     let config = Config {
         ownership: Limits { participants: 8, operations: 16, physical: 1 },
@@ -323,6 +325,7 @@ fn memory_change_before_start_does_not_commit_either_reservation() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn replaced_authority_fences_new_work_and_reports_failure() {
     let (root, scope) = fixture();
     let host = HostGovernor::with_coordination(&host_config(), scope).unwrap();
@@ -460,5 +463,4 @@ fn persistent_tree_runs_listing_watch_registration_and_shutdown_with_shared_admi
     assert!(shared.charged_ns > 0);
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos"))]
 mod coordination_support;

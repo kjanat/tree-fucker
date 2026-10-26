@@ -138,10 +138,12 @@ impl FileSystem for ObservedFileSystem {
 }
 
 fn setup(shared: bool) -> (tempfile::TempDir, Arc<ObservedFileSystem>) {
-    let root = tempfile::Builder::new()
-        .prefix("tree-fucker-negotiated-leases-")
-        .tempdir_in(coordination_support::RENDEZVOUS)
-        .unwrap();
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("tree-fucker-negotiated-leases-");
+    #[cfg(windows)]
+    let root = builder.tempdir().unwrap();
+    #[cfg(not(windows))]
+    let root = builder.tempdir_in(coordination_support::RENDEZVOUS).unwrap();
     let local = HostConfig {
         maximum_in_flight: 1,
         per_domain_concurrency: 1,
