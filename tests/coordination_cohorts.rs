@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coordination_support::native::{Completion, Error, Scope};
@@ -16,6 +16,9 @@ use tree_fucker::coordination::protocol::{self, Limits, Work};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const WORKERS: usize = 20;
+// Keep each twenty-process history concurrent within one authority without
+// multiplying the machine's process load by libtest's test-thread count.
+static COHORT: Mutex<()> = Mutex::new(());
 
 fn config() -> Config {
     let budget = Budget { refill_ns_per_second: 1_000_000_000, burst_ns: 10_000_000_000 };
@@ -36,6 +39,13 @@ fn config() -> Config {
 
 fn request(work: Work) -> Request {
     Request { work, origin: Origin::Foreground, domain: None, required: 1, desired: 0, ceiling_ns: u64::MAX }
+}
+
+fn worker_scope(root: &Path, index: usize) -> Arc<Scope> {
+    fs::write(root.join(format!("opening-{index}")), []).unwrap();
+    let scope = retry(|| Scope::open(root.join("scope"), config()));
+    fs::write(root.join(format!("opened-{index}")), []).unwrap();
+    scope
 }
 
 fn retry<T>(mut operation: impl FnMut() -> Result<T, Error>) -> T {
@@ -113,7 +123,7 @@ fn physical_process_fixture() {
     let root = std::env::var_os("TF_COORDINATION_FIXTURE").expect("fixture root");
     let root = Path::new(&root);
     let index: usize = std::env::var("TF_COORDINATION_INDEX").unwrap().parse().unwrap();
-    let scope = retry(|| Scope::open(root.join("scope"), config()));
+    let scope = worker_scope(root, index);
     let client = retry(|| scope.join());
     let work = match index % 3 {
         0 => Work::Bootstrap,
@@ -150,7 +160,7 @@ fn scan_process_fixture() {
     let root = std::env::var_os("TF_COORDINATION_FIXTURE").expect("fixture root");
     let root = Path::new(&root);
     let index: usize = std::env::var("TF_COORDINATION_INDEX").unwrap().parse().unwrap();
-    let scope = retry(|| Scope::open(root.join("scope"), config()));
+    let scope = worker_scope(root, index);
     let host = retry(|| HostGovernor::with_coordination(&HostConfig::default(), scope.clone()));
     let directory = root.join(format!("tree-{index}"));
     fs::create_dir(&directory).unwrap();
@@ -257,7 +267,7 @@ fn mixed_api_process_fixture() {
     let root = std::env::var_os("TF_COORDINATION_FIXTURE").expect("fixture root");
     let root = Path::new(&root);
     let index: usize = std::env::var("TF_COORDINATION_INDEX").unwrap().parse().unwrap();
-    let scope = retry(|| Scope::open(root.join("scope"), config()));
+    let scope = worker_scope(root, index);
     let host = retry(|| HostGovernor::with_coordination(&HostConfig::default(), scope.clone()));
     let filesystem = Arc::new(HeldFilesystem {
         inner: tree_fucker::testing::FakeFileSystem::new(WatcherKind::Recursive),
@@ -340,7 +350,13 @@ impl Children {
             for child in &mut self.0 {
                 assert!(child.try_wait().unwrap().is_none(), "worker exited before {prefix}");
             }
-            assert!(Instant::now() < deadline, "timed out waiting for {count} {prefix} workers");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} {prefix} workers: {} ready, {} opening, {} opened",
+                markers(root, prefix),
+                markers(root, "opening-"),
+                markers(root, "opened-"),
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -387,6 +403,7 @@ fn twenty_applications_share_bootstrap_lazy_read_and_watch_cleanup_capacity() {
 
 #[test]
 fn killing_one_physical_owner_retains_the_other_and_recovers_only_its_slot() {
+    let _cohort = COHORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for fixture in [
         "physical_process_fixture",
         "scan_process_fixture",
@@ -458,6 +475,7 @@ fn spawn_worker(root: &Path, index: usize, fixture: &str) -> Child {
 }
 
 fn twenty_processes(fixture: &str) {
+    let _cohort = COHORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = fixture_root();
     // Children race through initial publication; the controller does not
     // pre-create an authority that would conceal first-join races.

@@ -1,7 +1,4 @@
-#[path = "../../tests/coordination_support/fifo.rs"]
-mod native_fifo;
-
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,6 +14,8 @@ use tree_fucker::coordination::illumos::{Error, Scope};
 use tree_fucker::coordination::linux::{Error, Scope};
 #[cfg(target_os = "macos")]
 use tree_fucker::coordination::macos::{Error, Scope};
+#[cfg(windows)]
+use tree_fucker::coordination::windows::{Error, Scope};
 
 #[cfg(target_os = "linux")]
 const RENDEZVOUS: &str = "/dev/shm";
@@ -193,6 +192,7 @@ struct Sample {
     system_cpu_ns: u64,
 }
 
+#[cfg(unix)]
 fn cpu_time() -> (u64, u64) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: RUSAGE_SELF fills one correctly aligned native rusage value.
@@ -203,6 +203,25 @@ fn cpu_time() -> (u64, u64) {
         u64::try_from(time.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(time.tv_usec).unwrap() * 1_000
     };
     (nanos(usage.ru_utime), nanos(usage.ru_stime))
+}
+
+#[cfg(windows)]
+fn cpu_time() -> (u64, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: the current-process pseudo-handle is valid and all four outputs
+    // point to distinct live FILETIME values. Times include all worker threads.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) };
+    assert_ne!(ok, 0, "cannot read worker CPU time: {}", std::io::Error::last_os_error());
+    let nanos = |time: FILETIME| {
+        (u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)).checked_mul(100).unwrap()
+    };
+    (nanos(user), nanos(kernel))
 }
 
 fn worker(args: &[String], allocations: bool) {
@@ -245,7 +264,7 @@ fn worker(args: &[String], allocations: bool) {
         "slow" => {
             let (scan, entry) = reader.as_mut().unwrap();
             scan.read(entry, |_| {
-                File::open(root.join("gate")).unwrap().read_exact(&mut [0]).unwrap();
+                std::io::stdin().read_exact(&mut [0]).unwrap();
                 Ok(())
             })
             .unwrap();
@@ -322,13 +341,7 @@ fn cohort(scenario: &str, mode: &str, options: &Options, scope: &Path, roots: &[
     let mut readers = Vec::new();
     let (send, receive) = mpsc::channel();
     let iterations = if scenario == "churn" { 1 } else { options.iterations };
-    let mut gates = Vec::new();
     for (index, root) in roots.iter().enumerate() {
-        if scenario == "slow" {
-            let path = root.join("gate");
-            native_fifo::create(&path).unwrap();
-            gates.push(fs::OpenOptions::new().read(true).write(true).open(path).unwrap());
-        }
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--worker")
             .args([scenario, mode])
@@ -366,13 +379,8 @@ fn cohort(scenario: &str, mode: &str, options: &Options, scope: &Path, roots: &[
     }
     if scenario == "idle" || scenario == "slow" {
         std::thread::sleep(Duration::from_millis(options.hold_ms));
-        for gate in &mut gates {
-            gate.write_all(&[1]).unwrap();
-        }
-        if scenario == "idle" {
-            for child in &mut children.0 {
-                child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
-            }
+        for child in &mut children.0 {
+            child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
         }
     }
     let mut samples = Vec::new();
@@ -407,12 +415,6 @@ fn cohort(scenario: &str, mode: &str, options: &Options, scope: &Path, roots: &[
     }
     for reader in readers {
         reader.join().unwrap();
-    }
-    drop(gates);
-    if scenario == "slow" {
-        for root in roots {
-            fs::remove_file(root.join("gate")).unwrap();
-        }
     }
     (elapsed, samples)
 }
@@ -450,7 +452,12 @@ pub fn main(allocations: bool) {
             }
             for mode in modes {
                 let fixture = tempfile::Builder::new().prefix("coordination-workload-").tempdir_in(&artifacts).unwrap();
-                let authority = tempfile::Builder::new().prefix("tree-fucker-bench-").tempdir_in(RENDEZVOUS).unwrap();
+                let mut authority_builder = tempfile::Builder::new();
+                authority_builder.prefix("tree-fucker-bench-");
+                #[cfg(windows)]
+                let authority = authority_builder.tempdir().unwrap();
+                #[cfg(not(windows))]
+                let authority = authority_builder.tempdir_in(RENDEZVOUS).unwrap();
                 let workers = if scenario == "tiny" { 1 } else { options.workers };
                 let roots: Vec<_> = (0..workers)
                     .map(|index| {

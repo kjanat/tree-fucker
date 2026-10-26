@@ -109,7 +109,7 @@ Native correctness tests run with `cargo test --all-features --test coordination
 
 ## Independent-process coordination benchmarks
 
-On Linux, FreeBSD, illumos, and macOS, `coordination_processes` launches separate executables using the real Scan API. Each round compares independent process governors with governors that also join one shared authority. Both use a physical ceiling of two; the shared mode enforces that ceiling across the cohort. Duty allowances are generous so the measurements expose coordination and physical-capacity costs.
+On Linux, FreeBSD, illumos, macOS, and Windows, `coordination_processes` launches separate executables using the real Scan API. Each round compares independent process governors with governors that also join one shared authority. Both use a physical ceiling of two; the shared mode enforces that ceiling across the cohort. Duty allowances are generous so the measurements expose coordination and physical-capacity costs.
 
 ```sh
 cargo bench --bench coordination_processes -- --test
@@ -124,7 +124,7 @@ cargo bench --bench coordination_processes -- \
 | `disjoint`   | Each participant repeatedly scans its own directory, including bootstrap and listing.                             |
 | `contention` | Participants concurrently read the same warm file through `Scan::read`.                                           |
 | `churn`      | Each participant joins, performs one read, and exits; `--waves` cohorts reuse the same authority.                 |
-| `slow`       | Each participant reads a FIFO through `Scan::read`; the controller supplies data after `--hold-ms`.               |
+| `slow`       | Each participant blocks on a kernel pipe read through `Scan::read`; the controller supplies data after `--hold-ms`. |
 | `idle`       | Joined participants wait on their control pipes for `--hold-ms`; authority-access counters must remain unchanged. |
 
 Use `--scenario NAME` and `--mode local|shared|both` to select a workload. Defaults are all scenarios, both modes, eight workers, 100 iterations, 64 files per directory, five measured rounds, one warmup, four churn waves, and 100 ms holds. The tiny case always uses one worker. Local/shared execution order alternates between rounds. Fixtures live under `target/benchmarks`; isolated Linux authority files use tmpfs and are removed after all participants exit.
@@ -137,9 +137,11 @@ The output is TSV with one row per mode, scenario, and measured round:
 - `cohort_ns` measures from releasing ready children until all report completion, summed across churn waves. `wall_ns` additionally includes process creation, joining, fixture verification, and child teardown; fixture creation and final authority inspection are outside it.
 - `worker_p50_ns` and `worker_p95_ns` summarize whole worker workload durations. `join_p95_ns` measures opening the scope and constructing the governor. These are worker durations, not individual-operation percentiles.
 - `lock_attempts`, `lock_acquired`, and `lock_busy` sum connection access counters during the workload, including deferred settlement. Busy results include either the connection mutex or the interprocess lock.
-- `user_cpu_ns` and `system_cpu_ns` sum each worker's `getrusage(RUSAGE_SELF)` deltas across the workload and settlement. They include all worker threads and use the native kernel's accounting resolution. The two resource snapshots are outside the wall-clock interval; joining and initial verification precede both snapshots.
+- `user_cpu_ns` and `system_cpu_ns` sum each worker's CPU deltas across the workload and settlement, using `getrusage(RUSAGE_SELF)` on Unix and [GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes) on Windows. They include all worker threads and use the native kernel's accounting resolution. The two resource snapshots are outside the wall-clock interval; joining and initial verification precede both snapshots.
 
 The separate `coordination_processes_alloc` executable installs the counting allocator. Its allocation fields cover worker workload execution and waiting for pending settlement, excluding setup, joining, and the before/after counter snapshots. Run it with the same options as the timing executable. The ordinary executable uses the system allocator and reports zero in allocation columns.
+
+Native Windows x64/ARM64 and macOS ARM64/Intel CI run both smoke targets, then measure all six scenarios with four workers, 100 iterations, 64 files, one warmup, and three measured rounds. Each job uploads `native-coordination-timing.tsv` and `native-coordination-allocations.tsv` in its `coordination-<runner>` artifact. These reports retain latency, worker CPU, lock attempts, and allocations for every round. Aggregate handles, mappings, and sampled memory remain separate resource-acceptance work.
 
 ### Linux CPU, memory, descriptors, and syscalls
 
@@ -166,7 +168,7 @@ strace -f -c -e trace=flock,openat,newfstatat,statx,read,write,lseek,close \
   2>&1 | envctl redact > target/benchmarks/coordination-syscalls.txt
 ```
 
-`flock` counts native authority and owner-lifetime locking. The other syscall totals include fixture I/O and process control. Repeat with `--mode local` for the corresponding process-only workload. Both Cargo executables have smoke runs in Linux, FreeBSD, and OmniOS CI. Implementation coverage is tracked in [the acceptance ledger](../rfc/coordination-acceptance.md).
+`flock` counts native authority and owner-lifetime locking. The other syscall totals include fixture I/O and process control. Repeat with `--mode local` for the corresponding process-only workload. Both Cargo executables have smoke runs in Linux, FreeBSD, OmniOS, macOS, and Windows CI. Implementation coverage is tracked in [the acceptance ledger](../rfc/coordination-acceptance.md).
 
 ## Local FreeBSD acceptance VM
 

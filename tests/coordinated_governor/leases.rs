@@ -351,7 +351,7 @@ fn tree_allowances(enrichment: bool) {
                         metadata_fields: if enrichment { SIZE } else { MetadataFields::NONE },
                         entries_per_lease: 64,
                         operations_per_lease: 64,
-                        // Keep later periodic rounds outside this test's interval.
+                        // Defer periodic rounds beyond this test.
                         fixed_interval: Some(Duration::from_secs(3600)),
                         ..tree_fucker::Config::default()
                     },

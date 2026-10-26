@@ -54,10 +54,29 @@ jobs:
           sudo install -m 755 "${test_executable}" "${namespace_dir}/coordination_namespaces"
           sudo "${namespace_dir}/coordination_namespaces" namespace_histories --ignored --nocapture
       - name: Coordination process benchmark smoke tests
-        if: startsWith(matrix.os, 'ubuntu-') || startsWith(matrix.os, 'macos-')
+        shell: bash
         run: |
+          set -euo pipefail
           cargo bench --bench coordination_processes -- --test
           cargo bench --bench coordination_processes_alloc -- --test
+      - name: Native coordination measurements
+        if: startsWith(matrix.os, 'windows-') || startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/benchmarks
+          cargo bench --bench coordination_processes -- \
+            --workers 4 --iterations 100 --files 64 --runs 3 --warmups 1 \
+            | tee target/benchmarks/native-coordination-timing.tsv
+          cargo bench --bench coordination_processes_alloc -- \
+            --workers 4 --iterations 100 --files 64 --runs 3 --warmups 1 \
+            | tee target/benchmarks/native-coordination-allocations.tsv
+      - uses: actions/upload-artifact@v7
+        if: startsWith(matrix.os, 'windows-') || startsWith(matrix.os, 'macos-')
+        with:
+          name: coordination-${{ matrix.os }}
+          path: target/benchmarks/native-coordination-*.tsv
+          if-no-files-found: error
       - name: macOS coordination root acceptance
         if: startsWith(matrix.os, 'macos-')
         run: |
