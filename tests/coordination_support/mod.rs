@@ -17,3 +17,6 @@ pub const RENDEZVOUS: &str = "/var/run/tree-fucker";
 pub use tree_fucker::coordination::macos as native;
 #[cfg(target_os = "macos")]
 pub const RENDEZVOUS: &str = "/var/run/tree-fucker";
+
+#[cfg(windows)]
+pub use tree_fucker::coordination::windows as native;
