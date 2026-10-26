@@ -210,6 +210,46 @@ fn bounded_domain_accounts_are_not_evicted_to_forgive_debt() {
 }
 
 #[test]
+fn sparse_snapshots_can_grow_to_domain_capacity_without_losing_live_accounting() {
+    for initial_domains in [0, 1, 5] {
+        let mut config = config();
+        config.domains = 9;
+        let mut authority = Authority::new(Generation([1; 16]), config, 0).unwrap();
+        let participant = authority.join(VERSION).unwrap();
+        let domains: Vec<_> = (0..initial_domains).map(|index| domain(&mut authority, index)).collect();
+        let id = prepare(&mut authority, participant, request(domains.first().copied()), 0);
+        authority.authorize(id, 0).unwrap();
+        let progress = completed(25);
+        authority.report(id, progress, 25).unwrap();
+        let mut restored = Authority::decode(&authority.encode().unwrap()).unwrap();
+        assert_eq!(restored, authority);
+        let charged = restored.view().charged_ns;
+        for index in initial_domains..config.domains as u8 {
+            let added = domain(&mut restored, index);
+            assert_eq!(added.slot, u32::from(index));
+            assert_eq!(restored.view().physical, 1);
+            assert_eq!(restored.view().charged_ns, charged);
+            for (index, expected) in domains.iter().enumerate() {
+                assert_eq!(domain(&mut restored, index as u8), *expected);
+            }
+            restored = Authority::decode(&restored.encode().unwrap()).unwrap();
+        }
+        assert_eq!(
+            restored.register_shared_domain(SharedDomainKey {
+                namespace: [1; 16],
+                filesystem: [99; 16],
+                incarnation: [1; 16],
+            }),
+            Err(Error::DomainCapacity)
+        );
+        restored.settle(id, progress, 25).unwrap();
+        restored.settle(id, progress, 25).unwrap();
+        assert_eq!(restored.view().charged_ns, charged);
+        assert_eq!(restored.view().physical, 0);
+    }
+}
+
+#[test]
 fn retrying_reports_and_settlement_never_double_charges_or_fails_twice() {
     let mut authority = authority();
     let participant = authority.join(VERSION).unwrap();

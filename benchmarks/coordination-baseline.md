@@ -132,6 +132,25 @@ cargo bench --bench coordination_processes_alloc -- \
 
 This change reduces allocation count without changing lock acquisitions. The byte reduction is small because fresh authority decoding and snapshot publication still dominate allocated volume. The journal corruption and interruption tests remain the safety check for the reused buffers.
 
+## Sparse domain storage
+
+Authority snapshots now reserve domain storage for the records present in the payload. Registering another domain grows that table with an explicit fallible reservation bounded by the configured domain limit. Empty and sparsely populated authorities no longer reserve the maximum table on every decode. Domain identities, retained debt, capacity errors, and snapshot fields are unchanged.
+
+The counting-allocator executable ran before the change at `9120068` and after it with one worker, 100 verified reads, two warmups, and seven measured rounds:
+
+```sh
+cargo bench --bench coordination_processes_alloc -- \
+  --scenario tiny --mode shared --workers 1 --iterations 100 --runs 7 --warmups 2
+```
+
+| Metric, median per round | Before sparse storage | After sparse storage |
+| ------------------------ | --------------------: | -------------------: |
+| Allocations              |                 3,629 |                3,633 |
+| Allocated bytes          |            27,256,786 |           10,743,746 |
+| Authority acquisitions   |                   301 |                  301 |
+
+Allocated byte volume falls 60.6%; allocation count and authority acquisitions stay at the same scale. Reports are `target/benchmarks/coordination-domains-{before,after}.tsv`. The sparse-snapshot growth regression retains live accounting while restoring snapshots with zero, one, or five domains, registers up to a non-power-of-two limit of nine, checks stable domain IDs and explicit capacity exhaustion, and settles the retained operation idempotently. Journal byte-interruption and corruption tests pass with this representation.
+
 ## Contention retry intervals
 
 With snapshot validation reuse already enabled, the timing executable compared the fixed 10 ms retry with a 3 ms initial delay for lock and physical-capacity conflicts, doubling repeated denials up to 10 ms. Successful preparation or authorization resets the delay. Budget, bootstrap, and quarantined-domain denials retain 10 ms.

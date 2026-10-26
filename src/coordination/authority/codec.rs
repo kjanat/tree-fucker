@@ -202,6 +202,7 @@ impl Authority {
         if count > config.domains {
             return Err(malformed());
         }
+        authority.domains.try_reserve_exact(count as usize).map_err(|_| protocol::Error::Allocation)?;
         let mut keys = BTreeSet::new();
         for _ in 0..count {
             let key = match r.u8()? {

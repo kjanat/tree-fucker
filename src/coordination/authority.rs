@@ -278,14 +278,12 @@ impl Authority {
         let mut accounts = Vec::new();
         accounts.try_reserve_exact(config.ownership.operations as usize).map_err(|_| protocol::Error::Allocation)?;
         accounts.resize(config.ownership.operations as usize, None);
-        let mut domains = Vec::new();
-        domains.try_reserve_exact(config.domains as usize).map_err(|_| protocol::Error::Allocation)?;
         Ok(Self {
             config,
             ledger,
             background: Bucket::new(config.background),
             foreground: Bucket::new(config.foreground),
-            domains,
+            domains: Vec::new(),
             accounts,
             now,
             charged_ns: 0,
@@ -337,6 +335,13 @@ impl Authority {
             None => {
                 if self.domains.len() == self.config.domains as usize {
                     return Err(Error::DomainCapacity);
+                }
+                if self.domains.len() == self.domains.capacity() {
+                    // Grow only when a domain is registered. Sparse decoded
+                    // authorities must not allocate the configured maximum on
+                    // every bookkeeping transaction.
+                    let additional = self.domains.len().max(1).min(self.config.domains as usize - self.domains.len());
+                    self.domains.try_reserve_exact(additional).map_err(|_| protocol::Error::Allocation)?;
                 }
                 self.domains.push(Domain {
                     key,
