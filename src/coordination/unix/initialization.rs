@@ -149,6 +149,21 @@ fn kill_writer(root: &Path, index: usize, journal: bool) {
     assert!(matches!(Scope::open(root.join("scope"), config()), Err(Error::Busy)));
     writer.0.kill().unwrap();
     assert!(!writer.0.wait().unwrap().success());
+    // Reaping the writer is not the fixture's bookkeeping-release barrier.
+    // Observe native exclusion becoming available before testing the retained
+    // header; a transient Busy result must not be mistaken for header recovery.
+    let parent = File::open(root).unwrap();
+    let anchor =
+        open_file(&parent, OsStr::new("scope.authority.lock"), false, Context::current().unwrap().uid).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match exclusive(&anchor) {
+            Ok(()) => break,
+            Err(Error::Busy) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("cut {index}, journal {journal}: writer exclusion did not release: {error:?}"),
+        }
+    }
+    drop(anchor);
     fs::remove_file(root.join("paused")).unwrap();
 }
 

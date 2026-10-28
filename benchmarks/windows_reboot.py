@@ -92,7 +92,7 @@ def main() -> None:
         "-e",
         "WEB=N",
         "-e",
-        "DISPLAY=none",
+        "DISPLAY=disabled",
         "-v",
         f"{oem}:/oem:ro",
         "-v",

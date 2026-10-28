@@ -12,12 +12,16 @@ if (minimum < 1)
     throw new ArgumentException("MINIMUM_PROCESSES must be positive");
 int controller = Environment.ProcessId;
 var live = new HashSet<int>();
+var threads = new Dictionary<int, int>();
+var scheduled = new Dictionary<int, int>();
 var calls = new Dictionary<ulong, long>();
 int processes = 0;
+long observedSyscalls = 0;
 using var session = new TraceEventSession($"tree-fucker-syscalls-{controller}");
 session.BufferSizeMB = 64;
 session.EnableKernelProvider(KernelTraceEventParser.Keywords.SystemCall |
-    KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
+    KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread |
+    KernelTraceEventParser.Keywords.ContextSwitch);
 var source = session.Source;
 source.Kernel.ProcessStart += data => {
     // Events are consumed in timestamp order on one thread. Retire identities
@@ -28,8 +32,16 @@ source.Kernel.ProcessStart += data => {
     }
 };
 source.Kernel.ProcessStop += data => live.Remove(data.ProcessID);
+source.Kernel.ThreadStart += data => threads[data.ThreadID] = data.ProcessID;
+source.Kernel.ThreadStop += data => threads.Remove(data.ThreadID);
+source.Kernel.ThreadCSwitch += data => scheduled[data.ProcessorNumber] = data.NewThreadID;
 source.Kernel.PerfInfoSysClEnter += data => {
-    if (live.Contains(data.ProcessID))
+    observedSyscalls++;
+    // Classic kernel syscall events may omit PID/TID. Reconstruct the
+    // executing thread from the same timestamp-ordered context-switch stream.
+    int thread = data.ThreadID >= 0 ? data.ThreadID : scheduled.GetValueOrDefault(data.ProcessorNumber, -1);
+    int process = data.ProcessID >= 0 ? data.ProcessID : threads.GetValueOrDefault(thread, -1);
+    if (live.Contains(process))
         calls[data.SysCallAddress] = calls.GetValueOrDefault(data.SysCallAddress) + 1;
 };
 var consumer = Task.Run(() => source.Process());
@@ -56,7 +68,7 @@ try {
 Console.Error.Write(await stdout);
 Console.Error.Write(await stderr);
 if (child.ExitCode != 0 || source.EventsLost != 0 || processes < minimum || calls.Count == 0)
-    throw new InvalidOperationException($"Incomplete trace: exit={child.ExitCode}, lost={source.EventsLost}, processes={processes}, syscall addresses={calls.Count}");
+    throw new InvalidOperationException($"Incomplete trace: exit={child.ExitCode}, lost={source.EventsLost}, processes={processes}, syscall addresses={calls.Count}, observed syscalls={observedSyscalls}");
 Console.WriteLine(JsonSerializer.Serialize(new {
     processes, events_lost = source.EventsLost,
     syscalls = calls.OrderBy(pair => pair.Key).ToDictionary(pair => $"0x{pair.Key:x}", pair => pair.Value),

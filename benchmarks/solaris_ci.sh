@@ -12,7 +12,7 @@ mkdir -p target/native/rust
   expected=$(awk '{print $1}' "$distribution.sha256")
   test "$(digest -a sha256 "$distribution")" = "$expected"
   /usr/gnu/bin/tar -xJf "$distribution"
-  sh rust-nightly-x86_64-pc-solaris/install.sh --prefix=/opt/rust --without=rust-docs
+  bash rust-nightly-x86_64-pc-solaris/install.sh --prefix=/opt/rust --without=rust-docs
 )
 export PATH="/opt/rust/bin:/usr/gcc/14/bin:/usr/gnu/bin:$PATH"
 cargo clippy --all-targets --all-features -- -D warnings

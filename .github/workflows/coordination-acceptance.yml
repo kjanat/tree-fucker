@@ -134,6 +134,9 @@ jobs:
                 2>&1 | envctl redact | tee "target/benchmarks/resources-${scenario}-${mode}-controller.log"
             done
           done
+      - name: Validate and summarize all resource cases
+        shell: bash
+        run: python3 benchmarks/summarize_resources.py target/benchmarks >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -149,7 +152,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     concurrency:
-      group: "coordination-solaris-${{ github.ref }}"
+      group: "coordination-solaris-${{ github.ref }}-${{ github.sha }}"
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
@@ -202,7 +205,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 55
     concurrency:
-      group: "coordination-reboot-${{ github.ref }}"
+      group: "coordination-reboot-${{ github.ref }}-${{ github.sha }}"
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
