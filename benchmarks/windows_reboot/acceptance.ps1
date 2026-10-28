@@ -11,9 +11,9 @@ try {
 } catch {
     $result = @{ status = 'failed'; phase = $phase; error = $_.ToString(); log = (Get-Content $log -Raw -ErrorAction SilentlyContinue) }
 }
-# The Linux controller shares the container's network namespace. QEMU's
-# user-network gateway reaches it without guest credentials or open RDP ports.
-$gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+# QEMU user networking reaches the Linux controller through Docker's bridge
+# gateway without exposing RDP or depending on a guest-agent installation.
+$gateway = (Get-Content C:\OEM\controller.txt -Raw).Trim()
 for ($attempt = 0; $attempt -lt 60; $attempt++) {
     try {
         Invoke-RestMethod -Uri "http://${gateway}:8765/result" -Method Post -ContentType 'application/json' -Body ($result | ConvertTo-Json) | Out-Null

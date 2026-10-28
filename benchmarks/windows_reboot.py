@@ -2,6 +2,7 @@
 
 import argparse
 import http.server
+import ipaddress
 import json
 import shutil
 import subprocess
@@ -21,6 +22,22 @@ def main() -> None:
     oem = root / "oem"
     shutil.copytree(Path(__file__).parent / "windows_reboot", oem)
     shutil.copyfile(args.executable, oem / "coordination_power.exe")
+    gateway = subprocess.run(
+        [
+            "docker",
+            "network",
+            "inspect",
+            "bridge",
+            "--format",
+            "{{(index .IPAM.Config 0).Gateway}}",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    address = redacted(gateway.stdout).strip()
+    ipaddress.IPv4Address(address)
+    (oem / "controller.txt").write_text(address)
     complete = threading.Event()
     outcome = {}
 
@@ -56,8 +73,6 @@ def main() -> None:
         "--rm",
         "--name",
         "coordination-reboot",
-        "--network",
-        "host",
         "--device",
         "/dev/kvm",
         "-e",
@@ -104,9 +119,11 @@ def main() -> None:
                     "Windows did not report reboot acceptance within 45 minutes"
                 )
         finally:
-            subprocess.run(
-                ["docker", "stop", "--time", "30", "coordination-reboot"], check=False
-            )
+            if process.poll() is None:
+                subprocess.run(
+                    ["docker", "stop", "--timeout", "30", "coordination-reboot"],
+                    check=False,
+                )
             process.wait(timeout=60)
             if sanitizer.wait(timeout=60):
                 raise RuntimeError("Guest log redaction failed")

@@ -36,6 +36,7 @@ struct Options {
     warmups: usize,
     waves: usize,
     hold_ms: u64,
+    ready_hold_ms: u64,
 }
 
 impl Options {
@@ -50,6 +51,7 @@ impl Options {
             warmups: 1,
             waves: 4,
             hold_ms: 100,
+            ready_hold_ms: 0,
         };
         if args == ["--test"] {
             return Self { workers: 2, iterations: 2, files: 4, runs: 1, warmups: 0, waves: 2, hold_ms: 20, ..options };
@@ -67,6 +69,7 @@ impl Options {
                 "--warmups" => options.warmups = value.parse().expect("warmups"),
                 "--waves" => options.waves = value.parse().expect("waves"),
                 "--hold-ms" => options.hold_ms = value.parse().expect("hold milliseconds"),
+                "--ready-hold-ms" => options.ready_hold_ms = value.parse().expect("ready hold milliseconds"),
                 other => panic!("unknown option {other}"),
             }
         }
@@ -83,6 +86,7 @@ impl Options {
         }
         assert!(options.warmups <= 100);
         assert!((1..=10_000).contains(&options.hold_ms));
+        assert!(options.ready_hold_ms <= 10_000);
         options
     }
 }
@@ -373,6 +377,10 @@ fn cohort(scenario: &str, mode: &str, options: &Options, scope: &Path, roots: &[
         ready[index] = true;
         assert!(line.unwrap().starts_with("READY "));
     }
+    // Resource collectors need a bounded window in which the whole cohort
+    // exists. Normal timing runs leave this at zero; the cohort timer starts
+    // after the optional sampling hold.
+    std::thread::sleep(Duration::from_millis(options.ready_hold_ms));
     let start = Instant::now();
     for child in &mut children.0 {
         child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
@@ -429,7 +437,8 @@ pub fn main(allocations: bool) {
         println!(
             "Usage: cargo bench --bench coordination_processes -- [--test | OPTIONS]\n\
             --scenario all|tiny|disjoint|contention|churn|slow|idle --mode both|local|shared\n\
-            --workers 8 --iterations 100 --files 64 --runs 5 --warmups 1 --waves 4 --hold-ms 100"
+            --workers 8 --iterations 100 --files 64 --runs 5 --warmups 1 --waves 4 --hold-ms 100\n\
+            --ready-hold-ms 0 (resource sampling only; maximum 10000)"
         );
         return;
     }

@@ -7,6 +7,11 @@ on:
     branches: [master]
     paths-ignore: ["*.md", rfc/**, reports/**, .zed/**]
   workflow_dispatch:
+    inputs:
+      sleep_runner:
+        description: Sleep-capable macOS runner label (hosted runners cannot sleep)
+        type: string
+        required: false
 permissions: { contents: read }
 concurrency:
   group: "coordination-acceptance-${{ github.ref }}"
@@ -16,6 +21,55 @@ env:
   RUSTDOCFLAGS: -D warnings
 
 jobs:
+  resources:
+    name: "Aggregate resources ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-26.04, windows-2025, windows-11-arm, macos-26, macos-26-intel] }
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: kjanat/envctl@v0.7.2
+      - name: Prepare macOS coordination storage
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          sudo mkdir -p /var/run/tree-fucker
+          sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
+          sudo chmod 1777 /var/run/tree-fucker
+      - name: Build resource workload
+        shell: bash
+        run: |
+          mkdir -p target/benchmarks
+          cargo bench --bench coordination_processes --no-run --message-format=json > target/benchmarks/resource-build.jsonl
+          fixture=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_processes") | .executable // empty' target/benchmarks/resource-build.jsonl)
+          echo "RESOURCE_FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Measure complete live cohorts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in local shared; do
+            for scenario in contention idle slow; do
+              uv run benchmarks/native_resources.py --minimum-processes 5 \
+                "target/benchmarks/resources-${scenario}-${mode}.json" \
+                "$RESOURCE_FIXTURE" --scenario "$scenario" --mode "$mode" \
+                --workers 4 --iterations 2000 --ready-hold-ms 500 --hold-ms 3000 --runs 1 --warmups 0 \
+                2>&1 | envctl redact
+            done
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: "aggregate-resources-${{ matrix.os }}"
+          path: |
+            target/benchmarks/resources-*.json
+            target/benchmarks/resources-*.stdout
+          if-no-files-found: error
+
   solaris:
     name: Solaris 11.4 native
     runs-on: ubuntu-26.04
@@ -29,12 +83,20 @@ jobs:
           envs: CARGO_TERM_COLOR RUSTDOCFLAGS
           copyback: false
           prepare: |
+            set -e
             pkg install curl || [ $? -eq 4 ]
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly -c clippy
+            mkdir -p target/native/rust
+            cd target/native/rust
+            distribution=rust-nightly-x86_64-pc-solaris.tar.xz
+            curl --proto '=https' --tlsv1.2 -fsSLO "https://static.rust-lang.org/dist/$distribution"
+            curl --proto '=https' --tlsv1.2 -fsSLO "https://static.rust-lang.org/dist/$distribution.sha256"
+            expected=$(awk '{print $1}' "$distribution.sha256")
+            test "$(digest -a sha256 "$distribution")" = "$expected"
+            /usr/gnu/bin/tar -xJf "$distribution"
+            sh rust-nightly-x86_64-pc-solaris/install.sh --prefix=/opt/rust --without=rust-docs
           run: |
             set -e
-            . "$HOME/.cargo/env"
-            export PATH="/usr/gcc/14/bin:/usr/gnu/bin:$PATH"
+            export PATH="/opt/rust/bin:/usr/gcc/14/bin:/usr/gnu/bin:$PATH"
             cargo clippy --all-targets --all-features -- -D warnings
             cargo test --all-features --no-fail-fast
             cargo test --test coordination_socket_lifetime -- --nocapture
@@ -92,12 +154,10 @@ jobs:
           if-no-files-found: error
 
   macos-sleep:
-    name: "Sleep/wake ${{ matrix.os }}"
-    runs-on: ${{ matrix.os }}
+    name: macOS physical sleep/wake
+    if: vars.COORDINATION_SLEEP_RUNNER != '' || (github.event_name == 'workflow_dispatch' && inputs.sleep_runner != '')
+    runs-on: ${{ inputs.sleep_runner || vars.COORDINATION_SLEEP_RUNNER }}
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix: { os: [macos-26, macos-26-intel] }
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
@@ -115,10 +175,24 @@ jobs:
           fixture=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_power") | .executable // empty' target/power-build.jsonl)
           echo "POWER_FIXTURE=$fixture" >> "$GITHUB_ENV"
       - name: Verify real system sleep and wake
-        run: python3 benchmarks/macos_sleep.py "$POWER_FIXTURE" --allow-system-sleep
+        run: |
+          set -o pipefail
+          python3 benchmarks/macos_sleep.py "$POWER_FIXTURE" --allow-system-sleep 2>&1 | tee target/benchmarks/macos-sleep-controller.log
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: "sleep-wake-${{ matrix.os }}"
-          path: target/benchmarks/macos-sleep/
+          name: sleep-wake
+          path: |
+            target/benchmarks/macos-sleep/
+            target/benchmarks/macos-sleep-controller.log
           if-no-files-found: error
+
+  sleep-runner-requirement:
+    name: Record sleep/wake runner requirement
+    if: vars.COORDINATION_SLEEP_RUNNER == '' && inputs.sleep_runner == ''
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Report the outstanding acceptance gate
+        run: |
+          echo '::notice::Real macOS sleep/wake remains unverified. Configure COORDINATION_SLEEP_RUNNER or dispatch with sleep_runner using a sleep-capable Mac.'
+          echo 'macOS sleep/wake acceptance is **not satisfied**: both hosted Mac architectures were tested and cannot perform the required transition. Configure COORDINATION_SLEEP_RUNNER or dispatch with sleep_runner.' >> "$GITHUB_STEP_SUMMARY"
