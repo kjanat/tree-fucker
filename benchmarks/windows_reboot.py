@@ -17,6 +17,8 @@ def main() -> None:
     parser.add_argument("executable", type=Path)
     args = parser.parse_args()
     redacted("")
+    if shutil.which("guestfish") is None:
+        raise RuntimeError("guestfish is required to recover offline guest evidence")
     root = Path("target/benchmarks/windows-reboot").resolve()
     root.mkdir(parents=True, exist_ok=False)
     oem = root / "oem"
@@ -111,9 +113,38 @@ def main() -> None:
                 if complete.wait(1):
                     break
                 if process.poll() is not None:
-                    raise RuntimeError(
-                        f"Windows guest exited {process.returncode}; see {root / 'guest.log'}"
+                    disks = list((root / "disk").glob("*.img"))
+                    if len(disks) != 1:
+                        raise RuntimeError(
+                            f"Guest exited {process.returncode} without one retained disk"
+                        )
+                    recovered = subprocess.run(
+                        [
+                            "guestfish",
+                            "--ro",
+                            "-a",
+                            str(disks[0]),
+                            "-i",
+                            "cat",
+                            "/coordination-reboot/result.json",
+                        ],
+                        capture_output=True,
+                        timeout=120,
                     )
+                    if recovered.returncode:
+                        (root / "recovery.log").write_text(
+                            redacted(recovered.stderr.decode(errors="replace"))
+                        )
+                        raise RuntimeError(
+                            f"Guest exited {process.returncode} without a readable result"
+                        )
+                    outcome.update(
+                        json.loads(redacted(recovered.stdout.decode("utf-8-sig")))
+                    )
+                    (root / "result.json").write_text(
+                        json.dumps(outcome, indent=2) + "\n"
+                    )
+                    break
             else:
                 raise TimeoutError(
                     "Windows did not report reboot acceptance within 45 minutes"

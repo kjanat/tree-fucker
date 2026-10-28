@@ -159,25 +159,17 @@ jobs:
           release: "11.4-gcc-14"
           envs: CARGO_TERM_COLOR RUSTDOCFLAGS
           copyback: false
-          prepare: |
-            set -e
-            pkg install curl || [ $? -eq 4 ]
-            mkdir -p target/native/rust
-            cd target/native/rust
-            distribution=rust-nightly-x86_64-pc-solaris.tar.xz
-            curl --proto '=https' --tlsv1.2 -fsSLO "https://static.rust-lang.org/dist/$distribution"
-            curl --proto '=https' --tlsv1.2 -fsSLO "https://static.rust-lang.org/dist/$distribution.sha256"
-            expected=$(awk '{print $1}' "$distribution.sha256")
-            test "$(digest -a sha256 "$distribution")" = "$expected"
-            /usr/gnu/bin/tar -xJf "$distribution"
-            sh rust-nightly-x86_64-pc-solaris/install.sh --prefix=/opt/rust --without=rust-docs
-          run: |
-            set -e
-            export PATH="/opt/rust/bin:/usr/gcc/14/bin:/usr/gnu/bin:$PATH"
-            cargo clippy --all-targets --all-features -- -D warnings
-            cargo test --all-features --no-fail-fast
-            cargo test --test coordination_socket_lifetime -- --nocapture
-            cargo doc --no-deps --all-features
+      - name: Native Solaris acceptance
+        run: |
+          set -euo pipefail
+          mkdir -p target/benchmarks
+          ssh solaris 'cd "$GITHUB_WORKSPACE" && sh benchmarks/solaris_ci.sh' 2>&1 | tee target/benchmarks/solaris-native.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: solaris-native-evidence
+          path: target/benchmarks/solaris-native.log
+          if-no-files-found: error
 
   windows-reboot-binary:
     name: Build Windows reboot fixture
@@ -222,6 +214,8 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+          sudo apt-get update
+          sudo apt-get install -y libguestfs-tools
       - name: Reboot with live ownership
         run: python3 benchmarks/windows_reboot.py target/power/coordination_power.exe
       - uses: actions/upload-artifact@v7

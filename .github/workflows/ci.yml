@@ -38,6 +38,12 @@ jobs:
         run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --no-fail-fast
+      - name: Repeat native interrupted initialization
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          for iteration in {1..20}; do
+            cargo test --lib coordination::unix::initialization::killed_initializers_recover_pinned_authority_or_reject_partial_anchor -- --exact
+          done
       - name: Layer probe correctness
         run: cargo bench:layers --test;
           cargo bench:alloc --test

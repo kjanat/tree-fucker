@@ -85,7 +85,12 @@ def inspect(process: psutil.Process) -> dict:
         process.num_handles() if sys.platform == "win32" else process.num_fds()
     )
     if sys.platform == "win32":
-        raw["regions"] = windows_regions(process.pid)
+        try:
+            raw["regions"] = windows_regions(process.pid)
+        except PermissionError as error:
+            # VirtualQueryEx can lose access when the process exits between
+            # regions. Use the same bounded exit verification as psutil reads.
+            raise psutil.AccessDenied(process.pid) from error
     raw["same_identity"] = process.is_running()
     # Redact before selecting fields, aggregating, logging, or persisting.
     return json.loads(redacted(json.dumps(raw)))

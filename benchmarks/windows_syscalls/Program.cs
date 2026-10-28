@@ -16,6 +16,8 @@ var calls = new Dictionary<ulong, long>();
 int processes = 0;
 using var session = new TraceEventSession($"tree-fucker-syscalls-{controller}");
 session.BufferSizeMB = 64;
+session.EnableKernelProvider(KernelTraceEventParser.Keywords.SystemCall |
+    KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
 var source = session.Source;
 source.Kernel.ProcessStart += data => {
     // Events are consumed in timestamp order on one thread. Retire identities
@@ -30,8 +32,6 @@ source.Kernel.PerfInfoSysClEnter += data => {
     if (live.Contains(data.ProcessID))
         calls[data.SysCallAddress] = calls.GetValueOrDefault(data.SysCallAddress) + 1;
 };
-session.EnableKernelProvider(KernelTraceEventParser.Keywords.SystemCall |
-    KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Thread);
 var consumer = Task.Run(() => source.Process());
 var start = new ProcessStartInfo(args[1]) {
     UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true

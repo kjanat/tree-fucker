@@ -172,7 +172,13 @@ fn crash_initialization(journal: bool) {
         let state_identity = identity(&fs::metadata(&state_path).unwrap());
         if !before.is_empty() && before.len() < HEADER_SIZE {
             for _ in 0..2 {
-                assert!(matches!(Scope::open(root.join("scope"), config()), Err(Error::Replaced)));
+                let result = Scope::open(root.join("scope"), config());
+                assert!(
+                    matches!(result, Err(Error::Replaced)),
+                    "cut {index}, journal {journal}, {} anchor bytes: {:?}",
+                    before.len(),
+                    result.err()
+                );
                 assert_eq!(fs::read(&anchor_path).unwrap(), before);
                 assert_eq!(fs::metadata(&state_path).unwrap().len(), 0);
             }

@@ -12,6 +12,7 @@ try {
 catch {
 	$result = @{ status = 'failed'; phase = $phase; error = $_.ToString(); log = (Get-Content $log -Raw -ErrorAction SilentlyContinue) }
 }
+$result | ConvertTo-Json | Set-Content -Encoding UTF8 "$env:TF_POWER_ROOT\result.json"
 # QEMU user networking reaches the Linux controller through Docker's bridge
 # gateway without exposing RDP or depending on a guest-agent installation.
 $gateway = (Get-Content C:\OEM\controller.txt -Raw).Trim()
@@ -23,4 +24,6 @@ for ($attempt = 0; $attempt -lt 60; $attempt++) {
 	}
 	catch { Start-Sleep -Seconds 2 }
 }
-throw 'Could not deliver acceptance result to the CI controller'
+# Preserve evidence even if guest-to-host delivery fails. A clean shutdown
+# lets the controller read the result from the retained NTFS disk.
+shutdown.exe /s /t 0 /f
