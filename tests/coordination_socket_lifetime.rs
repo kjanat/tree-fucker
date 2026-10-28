@@ -26,9 +26,7 @@ fn alive(path: &Path) -> bool {
     match probe.connect(path) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => false,
-        // OmniOS and Solaris 11.4 return this for a retained pathname after its last
-        // endpoint description closes. The histories below verify the live,
-        // duplicated, inherited, and final-close cases independently.
+        // Solaris and OmniOS return this after the last owner closes.
         #[cfg(any(target_os = "illumos", target_os = "solaris"))]
         Err(error) if error.raw_os_error() == Some(libc::EDESTADDRREQ) => false,
         Err(error) => panic!("socket lifetime is unknown: {error}"),
