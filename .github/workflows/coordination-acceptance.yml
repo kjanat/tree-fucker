@@ -1,0 +1,124 @@
+---
+name: Coordination acceptance
+on:
+  pull_request:
+    paths-ignore: ["*.md", rfc/**, reports/**, .zed/**]
+  push:
+    branches: [master]
+    paths-ignore: ["*.md", rfc/**, reports/**, .zed/**]
+  workflow_dispatch:
+permissions: { contents: read }
+concurrency:
+  group: "coordination-acceptance-${{ github.ref }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  solaris:
+    name: Solaris 11.4 native
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: vmactions/solaris-vm@v1
+        with:
+          release: "11.4-gcc-14"
+          envs: CARGO_TERM_COLOR RUSTDOCFLAGS
+          copyback: false
+          prepare: |
+            pkg install curl || [ $? -eq 4 ]
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly -c clippy
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            export PATH="/usr/gcc/14/bin:/usr/gnu/bin:$PATH"
+            cargo clippy --all-targets --all-features -- -D warnings
+            cargo test --all-features --no-fail-fast
+            cargo test --test coordination_socket_lifetime -- --nocapture
+            cargo doc --no-deps --all-features
+
+  windows-reboot-binary:
+    name: Build Windows reboot fixture
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Build standalone fixture
+        shell: pwsh
+        env: { RUSTFLAGS: "-C target-feature=+crt-static" }
+        run: |
+          cargo test --release --test coordination_power --no-run --message-format=json > build.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $artifact = Get-Content build.jsonl | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'coordination_power' -and $_.executable }
+          if (@($artifact).Count -ne 1) { throw 'Expected exactly one power fixture' }
+          New-Item -ItemType Directory -Path target/power -Force | Out-Null
+          Copy-Item $artifact.executable target/power/coordination_power.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-reboot-fixture
+          path: target/power/coordination_power.exe
+          if-no-files-found: error
+
+  windows-reboot:
+    name: Windows real reboot
+    needs: windows-reboot-binary
+    runs-on: ubuntu-26.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: kjanat/envctl@v0.7.2
+      - uses: actions/download-artifact@v8
+        with: { name: windows-reboot-fixture, path: target/power }
+      - name: Prepare guest storage
+        run: |
+          test -c /dev/kvm
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+      - name: Reboot with live ownership
+        run: python3 benchmarks/windows_reboot.py target/power/coordination_power.exe
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-reboot-evidence
+          path: |
+            target/benchmarks/windows-reboot/*.json
+            target/benchmarks/windows-reboot/*.log
+          if-no-files-found: error
+
+  macos-sleep:
+    name: "Sleep/wake ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: { os: [macos-26, macos-26-intel] }
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare retained coordination storage
+        run: |
+          sudo mkdir -p /var/run/tree-fucker
+          sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
+          sudo chmod 1777 /var/run/tree-fucker
+      - name: Build power fixture
+        run: |
+          mkdir -p target
+          cargo test --test coordination_power --no-run --message-format=json > target/power-build.jsonl
+          fixture=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_power") | .executable // empty' target/power-build.jsonl)
+          echo "POWER_FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Verify real system sleep and wake
+        run: python3 benchmarks/macos_sleep.py "$POWER_FIXTURE" --allow-system-sleep
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: "sleep-wake-${{ matrix.os }}"
+          path: target/benchmarks/macos-sleep/
+          if-no-files-found: error
