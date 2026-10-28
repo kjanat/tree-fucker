@@ -9,6 +9,7 @@
 pub mod authority;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
 mod client;
+mod clock_binding;
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
 #[cfg(target_os = "illumos")]

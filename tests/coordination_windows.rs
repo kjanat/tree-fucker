@@ -1,10 +1,13 @@
 //! Windows authority primitives, exercised through independent processes.
 #![cfg(windows)]
 
+#[path = "../src/coordination/clock_binding.rs"]
+mod clock_binding;
 #[path = "../src/coordination/windows/handles.rs"]
 mod handles;
 #[path = "../src/coordination/windows/clock.rs"]
 mod native_clock;
+use clock_binding::ClockBinding;
 #[path = "../src/coordination/windows/relative.rs"]
 mod relative;
 #[path = "../src/coordination/windows/security.rs"]

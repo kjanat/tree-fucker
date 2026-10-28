@@ -6,6 +6,7 @@ use crate::coordination::wire::{MAX_STATE_BYTES, Reader, Writer, checksum};
 
 const MAGIC: &[u8; 8] = b"TFCSTATE";
 const FORMAT: u32 = 2;
+const CLOCK_FORMAT: u32 = 3;
 
 fn malformed() -> Error {
     protocol::Error::MalformedState.into()
@@ -113,10 +114,14 @@ impl Authority {
             + self.accounts.iter().flatten().count() * 128;
         let mut w = Writer::new(capacity)?;
         w.bytes(MAGIC);
-        w.u32(FORMAT);
+        w.u32(if self.clock_binding.is_some() { CLOCK_FORMAT } else { FORMAT });
         w.u32(protocol::VERSION);
         self.config.write(&mut w);
         w.u64(self.now);
+        if let Some(binding) = self.clock_binding {
+            w.bytes(&binding.epoch);
+            w.bytes(&binding.offset_ns.to_le_bytes());
+        }
         self.background.write(&mut w);
         self.foreground.write(&mut w);
         w.u128(self.charged_ns);
@@ -180,11 +185,17 @@ impl Authority {
         if &r.bytes::<8>()? != MAGIC {
             return Err(malformed());
         }
-        if r.u32()? != FORMAT || r.u32()? != protocol::VERSION {
+        let format = r.u32()?;
+        if !matches!(format, FORMAT | CLOCK_FORMAT) || r.u32()? != protocol::VERSION {
             return Err(protocol::Error::IncompatibleVersion.into());
         }
         let config = Config::read(&mut r)?;
         let now = r.u64()?;
+        let clock_binding = if format == CLOCK_FORMAT {
+            Some(ClockBinding::checked(r.bytes()?, i64::from_le_bytes(r.bytes()?)).map_err(|_| malformed())?)
+        } else {
+            None
+        };
         let background = Bucket::read(&mut r, config.background)?;
         let foreground = Bucket::read(&mut r, config.foreground)?;
         let charged_ns = r.u128()?;
@@ -194,6 +205,7 @@ impl Authority {
             return Err(malformed());
         }
         let mut authority = Self::with_ledger(ledger, config, now)?;
+        authority.clock_binding = clock_binding;
         authority.background = background;
         authority.foreground = foreground;
         authority.charged_ns = charged_ns;
@@ -391,5 +403,45 @@ mod tests {
         let sum = checksum(&bytes[..payload]);
         bytes[payload..].copy_from_slice(&sum.to_le_bytes());
         assert_eq!(Authority::decode(&bytes), Err(protocol::Error::IncompatibleVersion.into()));
+    }
+
+    #[test]
+    fn retained_clock_roundtrips_with_live_ownership_and_debt() {
+        let mut authority = fixture();
+        let original = authority.clone();
+        let bytes = authority.encode().unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), FORMAT);
+        assert_eq!(Authority::decode(&bytes).unwrap(), original);
+        for offset in [i64::MIN, -38_000, 0, 11_075, i64::MAX] {
+            let binding = ClockBinding::checked([1; 32], offset).unwrap();
+            authority.bind_clock(binding);
+            let bytes = authority.encode().unwrap();
+            assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), CLOCK_FORMAT);
+            let decoded = Authority::decode(&bytes).unwrap();
+            assert_eq!(decoded, authority);
+            assert_eq!(decoded.clock_binding(), Some(binding));
+            assert_eq!(decoded.view(), original.view());
+        }
+    }
+
+    #[test]
+    fn malformed_or_truncated_clock_binding_cannot_hide_behind_a_checksum() {
+        let mut authority = fixture();
+        authority.bind_clock(ClockBinding::checked([1; 32], -38_000).unwrap());
+        let bytes = authority.encode().unwrap();
+        // The binding follows the fixed configuration and logical timestamp.
+        let start = 16 + 116 + 8;
+        for cut in 0..40 {
+            let mut truncated = bytes[..start + cut].to_vec();
+            let sum = checksum(&truncated);
+            truncated.extend_from_slice(&sum.to_le_bytes());
+            assert!(Authority::decode(&truncated).is_err(), "cut {cut}");
+        }
+        let mut empty_epoch = bytes;
+        empty_epoch[start..start + 32].fill(0);
+        let payload = empty_epoch.len() - 8;
+        let sum = checksum(&empty_epoch[..payload]);
+        empty_epoch[payload..].copy_from_slice(&sum.to_le_bytes());
+        assert!(Authority::decode(&empty_epoch).is_err());
     }
 }

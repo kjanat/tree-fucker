@@ -541,4 +541,44 @@ mod tests {
         let authority = journal.load().unwrap();
         assert!(matches!(Journal::create(Cursor::new(bytes), &authority), Err(Error::Malformed)));
     }
+
+    #[test]
+    fn every_byte_of_clock_publication_retains_whole_mapping_and_accounting() {
+        use crate::coordination::clock_binding::ClockBinding;
+
+        let (bytes, id) = fixture();
+        let mut seed = Journal::open(Cursor::new(bytes)).unwrap();
+        seed.transaction(|authority| authority.authorize(id, 0)).unwrap();
+        let first = ClockBinding::from_origin([1; 32], 50_000, 0).unwrap();
+        let second = ClockBinding::from_origin([2; 32], 925, 0).unwrap();
+        // First publication upgrades a counter-only snapshot. The second
+        // changes boot epoch while reusing a previously committed journal slot.
+        for binding in [first, second] {
+            let before = seed.load().unwrap();
+            let mut after = before.clone();
+            after.bind_clock(binding);
+            let bytes = seed.storage.get_ref().clone();
+            let device = Device { bytes: Cursor::new(bytes.clone()), remaining: usize::MAX, written: 0 };
+            let mut complete = Journal::open(device).unwrap();
+            let publish = |state: &mut Authority| {
+                state.bind_clock(binding);
+                Ok(())
+            };
+            complete.transaction(publish).unwrap();
+            let total = complete.into_inner().written;
+            for cut in 0..total {
+                let device = Device { bytes: Cursor::new(bytes.clone()), remaining: cut, written: 0 };
+                let mut interrupted = Journal::open(device).unwrap();
+                assert!(interrupted.transaction(publish).is_err(), "cut {cut}");
+                let mut recovered = Journal::open(interrupted.into_inner().bytes).unwrap();
+                let state = recovered.load().unwrap_or_else(|error| panic!("cut {cut}: {error}"));
+                assert!(state == before || state == after, "cut {cut}");
+                assert_eq!(state.view().physical, 1);
+                assert_eq!(state.view().charged_ns, 20_000_000);
+                recovered.transaction(publish).unwrap();
+                assert_eq!(recovered.load().unwrap(), after, "retry cut {cut}");
+            }
+            seed.transaction(publish).unwrap();
+        }
+    }
 }

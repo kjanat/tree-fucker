@@ -24,6 +24,7 @@ use super::authority::{self, Authority, Config, View};
 pub(crate) use super::client::Physical;
 use super::client::{Cleanup, Pending};
 pub use super::client::{Client, Completion, Prepared};
+use super::clock_binding::ClockBinding;
 use super::journal::Journal;
 pub use super::native_error::Error;
 use super::protocol::{self, Generation, VERSION};
@@ -72,6 +73,7 @@ pub struct Diagnostics {
     pub config: Config,
     pub user: String,
     pub clock: [u8; 32],
+    pub clock_offset_ns: i64,
     pub volume: u64,
     pub root: [u8; 16],
     pub pending_settlements: usize,
@@ -100,14 +102,9 @@ impl Scope {
     }
 
     fn now_at(&self, state: &Authority) -> Result<u64, Error> {
-        let clock_now = self.clock.now()?;
-        let committed_now = state.now();
-        if committed_now > clock_now {
-            self.clock.rebase(committed_now)?;
-            Ok(committed_now)
-        } else {
-            Ok(clock_now)
-        }
+        // Cross-thread QPC readings can differ by a tick. Clamp this reading,
+        // keeping every connection on the same persisted counter mapping.
+        Ok(self.clock.now()?.max(state.now()))
     }
 
     pub(crate) fn check_context(&self) -> Result<(), Error> {
@@ -136,14 +133,14 @@ impl Scope {
 
     fn open_for(path: PathBuf, config: Config, principal: Principal) -> Result<Arc<Self>, Error> {
         principal.check().map_err(|_| Error::Incompatible)?;
-        let clock = Clock::current()?;
+        let mut clock = Clock::current()?;
         let root_name = path.file_name().ok_or(Error::InvalidScope)?.to_os_string();
         let parent = relative::Directory::open(path.parent().ok_or(Error::InvalidScope)?)?;
         let mut anchor_name = root_name.clone();
         anchor_name.push(".authority.lock");
         let anchor = principal.open_at(parent.handle(), &anchor_name, true, SHARED, false)?;
         let lock = Bookkeeping::try_lock(&anchor).map_err(lock_error)?;
-        let (root, mut journal) = initialization::open(&parent, &root_name, &anchor, &principal, &clock, config)?;
+        let (root, mut journal) = initialization::open(&parent, &root_name, &anchor, &principal, &mut clock, config)?;
         let root_id = directory_identity(&root)?;
         let generation = journal.load()?.ledger().generation();
         lock.unlock()?;
@@ -243,6 +240,9 @@ impl Scope {
     }
 
     fn recover(&self, state: &mut Authority, cursor: &mut u32, pins: &mut Vec<(u32, File)>) -> Result<(), Error> {
+        if state.clock_binding() != Some(self.clock.binding()) {
+            return Err(Error::Incompatible);
+        }
         let count = self.config.ownership.participants;
         let mut remaining = RECOVERY_BATCH;
         for _ in 0..RECOVERY_BATCH.min(count as usize) {
@@ -327,6 +327,7 @@ impl Scope {
             config: self.config,
             user: self.principal.sid.clone(),
             clock: self.clock.epoch.encode(),
+            clock_offset_ns: self.clock.binding().offset_ns,
             volume: self.root_id.volume,
             root: self.root_id.file,
             pending_settlements,

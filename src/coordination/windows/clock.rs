@@ -1,11 +1,12 @@
 //! Boot-qualified performance-counter time for cooperating processes.
 
 use std::io;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
 use windows_sys::Wdk::System::SystemServices::KUSER_SHARED_DATA;
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+use super::ClockBinding;
 
 const BOOT_ENVIRONMENT: i32 = 90;
 
@@ -77,7 +78,7 @@ impl Epoch {
 
 pub(crate) struct Clock {
     pub epoch: Epoch,
-    logical_offset: AtomicI64,
+    binding: ClockBinding,
 }
 
 impl Clock {
@@ -116,7 +117,8 @@ impl Clock {
         }
         let frequency = u64::try_from(frequency)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative performance counter frequency"))?;
-        Ok(Self { epoch: Epoch::checked(information.entry, sequence, frequency)?, logical_offset: AtomicI64::new(0) })
+        let epoch = Epoch::checked(information.entry, sequence, frequency)?;
+        Ok(Self { epoch, binding: ClockBinding::checked(epoch.encode(), 0)? })
     }
 
     fn raw_now(&self) -> io::Result<u64> {
@@ -131,27 +133,42 @@ impl Clock {
 
     pub(crate) fn now(&self) -> io::Result<u64> {
         let raw = self.raw_now()?;
-        logical_at(self.logical_offset.load(Ordering::Acquire), raw)
+        self.binding.at(raw)
     }
 
-    /// Align this connection's performance counter with committed logical time.
-    pub(crate) fn rebase(&self, logical_now: u64) -> io::Result<()> {
-        let raw_now = self.raw_now()?;
-        let offset = rebase_offset(self.logical_offset.load(Ordering::Acquire), raw_now, logical_now)?;
-        self.logical_offset.store(offset, Ordering::Release);
+    pub(crate) fn binding(&self) -> ClockBinding {
+        self.binding
+    }
+
+    /// Choose once under bookkeeping exclusion, then publish in the journal.
+    pub(crate) fn retained_binding(
+        &self,
+        retained: Option<ClockBinding>,
+        creation_epoch: Epoch,
+        logical_now: u64,
+    ) -> io::Result<ClockBinding> {
+        let epoch = match retained {
+            Some(binding) => Epoch::decode(binding.epoch)?,
+            None => creation_epoch,
+        };
+        self.epoch.require_counter(epoch)?;
+        if epoch == self.epoch {
+            Ok(retained.unwrap_or(self.binding))
+        } else {
+            ClockBinding::from_origin(self.epoch.encode(), self.raw_now()?, logical_now)
+        }
+    }
+
+    /// Bind before the connection is shared. Transactions never move its
+    /// origin.
+    pub(crate) fn bind(&mut self, binding: ClockBinding) -> io::Result<()> {
+        if Epoch::decode(binding.epoch)? != self.epoch {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "coordination clock epoch changed"));
+        }
+        binding.at(self.raw_now()?)?;
+        self.binding = binding;
         Ok(())
     }
-}
-
-fn logical_at(offset: i64, raw_now: u64) -> io::Result<u64> {
-    u64::try_from(i128::from(raw_now) + i128::from(offset))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock is out of range"))
-}
-
-fn rebase_offset(current_offset: i64, raw_now: u64, logical_minimum: u64) -> io::Result<i64> {
-    let current = logical_at(current_offset, raw_now)?;
-    i64::try_from(i128::from(logical_minimum.max(current)) - i128::from(raw_now))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows logical clock offset is out of range"))
 }
 
 #[cfg(test)]
@@ -213,21 +230,17 @@ mod tests {
 
     #[test]
     fn native_clock_rebase_continues_from_retained_logical_time() {
-        let clock = Clock::current().unwrap();
+        let mut clock = Clock::current().unwrap();
         let retained = clock.now().unwrap().saturating_add(60_000_000_000);
-        clock.rebase(retained).unwrap();
+        let binding = ClockBinding::from_origin(clock.epoch.encode(), clock.raw_now().unwrap(), retained).unwrap();
+        clock.bind(binding).unwrap();
         assert!(clock.now().unwrap() >= retained);
+        assert_eq!(clock.binding(), binding);
+        assert_eq!(clock.retained_binding(Some(binding), clock.epoch, 0).unwrap(), binding);
     }
 
     #[test]
-    fn reboot_rebase_preserves_the_retained_timeline_without_refilling_downtime() {
-        assert_eq!(logical_at(11_100, 925).unwrap(), 12_025);
-        assert_eq!(logical_at(0, 50_000).unwrap(), 50_000);
-        assert!(logical_at(-1, 0).is_err());
-        assert!(logical_at(1, u64::MAX).is_err());
-        assert_eq!(rebase_offset(100, 1_000, 1_050).unwrap(), 100);
-        assert_eq!(rebase_offset(100, 1_000, 1_200).unwrap(), 200);
-
+    fn boot_sequence_changes_preserve_counter_compatibility() {
         let previous = Epoch::checked([1; 16], 7, 10_000_000).unwrap();
         let rebooted = Epoch { sequence: 8, ..previous };
         rebooted.require_counter(previous).unwrap();

@@ -4,6 +4,7 @@
 //! with no participants. A backend must persist the whole transaction, not
 //! only the ownership ledger, before publishing an admission decision.
 
+use super::clock_binding::ClockBinding;
 use super::protocol::{self, Generation, Ledger, Limits, OperationId, Participant, Phase, Progress, Work};
 use crate::HostConfig;
 
@@ -261,6 +262,7 @@ pub struct Authority {
     domains: Vec<Domain>,
     accounts: Vec<Option<Account>>,
     now: u64,
+    clock_binding: Option<ClockBinding>,
     charged_ns: u128,
     surcharged_ns: u128,
 }
@@ -286,6 +288,7 @@ impl Authority {
             domains: Vec::new(),
             accounts,
             now,
+            clock_binding: None,
             charged_ns: 0,
             surcharged_ns: 0,
         })
@@ -303,6 +306,16 @@ impl Authority {
     #[cfg(windows)]
     pub(crate) fn now(&self) -> u64 {
         self.now
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn clock_binding(&self) -> Option<ClockBinding> {
+        self.clock_binding
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn bind_clock(&mut self, binding: ClockBinding) {
+        self.clock_binding = Some(binding);
     }
 
     pub fn join(&mut self, version: u32) -> Result<Participant, Error> {
