@@ -1,5 +1,7 @@
 # Layer benchmarks and profiles
 
+Native shared-coordination acceptance, resource collection, and syscall jobs are documented in [Native coordination CI](ci-acceptance.md).
+
 Run from the repository root. These are Cargo `[[bench]]` targets with `harness = false`, using the optimized bench profile and a custom in-process measurement harness. They complement the CLI and Criterion benchmarks. Each repository builds against its own dependency graph: fsql measures its pinned tree-fucker revision; tree-fucker measures its local library. No sibling checkout or temporary source package is required.
 
 ```sh
@@ -118,14 +120,14 @@ cargo bench --bench coordination_processes -- \
   --workers 8 --iterations 100 --files 64 --runs 5 --warmups 1
 ```
 
-| Scenario     | Work performed                                                                                                    |
-| ------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `tiny`       | One participant repeatedly reads a warm file through `Scan::read`.                                                |
-| `disjoint`   | Each participant repeatedly scans its own directory, including bootstrap and listing.                             |
-| `contention` | Participants concurrently read the same warm file through `Scan::read`.                                           |
-| `churn`      | Each participant joins, performs one read, and exits; `--waves` cohorts reuse the same authority.                 |
+| Scenario     | Work performed                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `tiny`       | One participant repeatedly reads a warm file through `Scan::read`.                                                  |
+| `disjoint`   | Each participant repeatedly scans its own directory, including bootstrap and listing.                               |
+| `contention` | Participants concurrently read the same warm file through `Scan::read`.                                             |
+| `churn`      | Each participant joins, performs one read, and exits; `--waves` cohorts reuse the same authority.                   |
 | `slow`       | Each participant blocks on a kernel pipe read through `Scan::read`; the controller supplies data after `--hold-ms`. |
-| `idle`       | Joined participants wait on their control pipes for `--hold-ms`; authority-access counters must remain unchanged. |
+| `idle`       | Joined participants wait on their control pipes for `--hold-ms`; authority-access counters must remain unchanged.   |
 
 Use `--scenario NAME` and `--mode local|shared|both` to select a workload. Defaults are all scenarios, both modes, eight workers, 100 iterations, 64 files per directory, five measured rounds, one warmup, four churn waves, and 100 ms holds. The tiny case always uses one worker. Local/shared execution order alternates between rounds. Fixtures live under `target/benchmarks`; isolated Linux authority files use tmpfs and are removed after all participants exit.
 
