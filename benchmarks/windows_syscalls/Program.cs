@@ -39,8 +39,8 @@ source.Kernel.PerfInfoSysClEnter += data => {
     observedSyscalls++;
     // Classic kernel syscall events may omit PID/TID. Reconstruct the
     // executing thread from the same timestamp-ordered context-switch stream.
-    int thread = data.ThreadID >= 0 ? data.ThreadID : scheduled.GetValueOrDefault(data.ProcessorNumber, -1);
-    int process = data.ProcessID >= 0 ? data.ProcessID : threads.GetValueOrDefault(thread, -1);
+    int thread = data.ThreadID > 0 ? data.ThreadID : scheduled.GetValueOrDefault(data.ProcessorNumber, -1);
+    int process = data.ProcessID > 0 ? data.ProcessID : threads.GetValueOrDefault(thread, -1);
     if (live.Contains(process))
         calls[data.SysCallAddress] = calls.GetValueOrDefault(data.SysCallAddress) + 1;
 };

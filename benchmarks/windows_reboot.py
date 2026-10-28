@@ -120,6 +120,9 @@ def main() -> None:
                         )
                     recovered = subprocess.run(
                         [
+                            "sudo",
+                            "env",
+                            "LIBGUESTFS_BACKEND=direct",
                             "guestfish",
                             "--ro",
                             "-a",

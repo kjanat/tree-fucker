@@ -380,7 +380,9 @@ fn cohort(scenario: &str, mode: &str, options: &Options, scope: &Path, roots: &[
     // Resource collectors need a bounded window in which the whole cohort
     // exists. Normal timing runs leave this at zero; the cohort timer starts
     // after the optional sampling hold.
-    std::thread::sleep(Duration::from_millis(options.ready_hold_ms));
+    if options.ready_hold_ms != 0 {
+        std::thread::sleep(Duration::from_millis(options.ready_hold_ms));
+    }
     let start = Instant::now();
     for child in &mut children.0 {
         child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
