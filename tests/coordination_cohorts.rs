@@ -177,11 +177,23 @@ fn scan_process_fixture() {
     let ScanEvent::Entry(entry) = scan.next().unwrap().unwrap() else { panic!("root observation") };
     fs::write(root.join(format!("joined-{index}")), []).unwrap();
     wait_for(root, "dispatch", 1);
-    scan.read(&entry, |_| {
-        held_read(root, index);
-        Ok(())
-    })
-    .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match scan.read(&entry, |_| {
+            held_read(root, index);
+            Ok(())
+        }) {
+            Ok(()) => break,
+            Err(tree_fucker::Error::Stuck) if Instant::now() < deadline => {
+                // A scan reports shared quarantine instead of waiting forever.
+                // The caller may explicitly retry after the stuck owner
+                // settles.
+                fs::write(root.join(format!("quarantined-{index}")), []).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("scan read failed: {error}"),
+        }
+    }
     assert!(host.coordination_error().is_none());
 }
 
@@ -488,6 +500,12 @@ fn twenty_processes(fixture: &str) {
     assert_eq!(counts(root.path(), 0), (2, 2));
     // A stuck timeout cannot free the two physical pipe reads.
     std::thread::sleep(Duration::from_millis(1100));
+    #[cfg(target_os = "linux")]
+    if fixture == "scan_process_fixture" {
+        // These native scans share a mount identity. Every waiting caller
+        // must observe quarantine while the two original reads retain slots.
+        children.wait_for(root.path(), "quarantined-", WORKERS - 2);
+    }
     assert_eq!(retry(|| scope.view()).physical, 2);
     assert_eq!(counts(root.path(), 0), (2, 2));
     for child in &mut children.0 {

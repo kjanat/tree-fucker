@@ -11,6 +11,9 @@ use tree_fucker::{HostConfig, HostGovernor, RelativePath, ThrottleCause};
 
 const NOW: MonotonicTime = MonotonicTime::ZERO;
 
+#[path = "coordinated_governor/denials.rs"]
+mod denials;
+
 #[path = "coordinated_governor/leases.rs"]
 mod leases;
 

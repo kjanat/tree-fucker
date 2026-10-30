@@ -48,10 +48,16 @@ impl State {
                 self.retry = Some(Retry { at: now + delay, delay });
                 ThrottleCause::Coordination
             }
-            native::Error::Authority(
-                authority::Error::Budget | authority::Error::Bootstrap | authority::Error::Quarantined,
-            ) => {
-                // Debt and stuck work need longer than a bookkeeping lock.
+            native::Error::Authority(authority::Error::Quarantined) => {
+                self.retry = None;
+                ThrottleCause::StuckWorker
+            }
+            native::Error::Authority(authority::Error::Ceiling { minimum_ns }) => {
+                self.retry = None;
+                ThrottleCause::CommandCeiling { required: Duration::from_nanos(minimum_ns) }
+            }
+            native::Error::Authority(authority::Error::Budget | authority::Error::Bootstrap) => {
+                // Debt needs longer than a bookkeeping lock.
                 self.retry = Some(Retry { at: now + MAX_RETRY, delay: MAX_RETRY });
                 ThrottleCause::Coordination
             }

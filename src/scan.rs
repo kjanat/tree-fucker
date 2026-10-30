@@ -643,6 +643,14 @@ impl Scan {
             };
             match (cause, need.domain) {
                 (ThrottleCause::StuckWorker, Some(domain)) => return Ok(Admission::Quarantined(domain)),
+                (ThrottleCause::CommandCeiling { required }, _) => {
+                    return Err(self.limited(
+                        ResourceLimit::CommandWorkerTime,
+                        nanos(self.options.ceiling),
+                        nanos(self.admitted_cost().saturating_add(required)),
+                        need.domain,
+                    ));
+                }
                 (ThrottleCause::ForegroundCeiling, _)
                     if remaining < self.governor.cost_of(need.domain, need.reads + need.operations.min(1)) =>
                 {
@@ -687,10 +695,11 @@ impl Scan {
             {
                 return Ok(Admission::Quarantined(domain));
             }
-            if self.governor.try_start(id, now).is_ok() {
-                break;
+            match (self.governor.try_start(id, now), need.domain) {
+                (Ok(()), _) => break,
+                (Err(ThrottleCause::StuckWorker), Some(domain)) => return Ok(Admission::Quarantined(domain)),
+                (Err(_), _) => self.wait(seen, now),
             }
-            self.wait(seen, now);
         }
         Ok(Admission::Granted(Granted { held, operations: admitted.operations }))
     }

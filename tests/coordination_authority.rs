@@ -372,3 +372,50 @@ fn narrowing_to_required_work_still_round_trips() {
     assert_eq!(authority.narrow(id, 0).unwrap().operations, 1);
     assert_eq!(Authority::decode(&authority.encode().unwrap()).unwrap(), authority);
 }
+
+#[test]
+fn caller_ceiling_is_distinct_from_refillable_debt_for_bootstrap_and_domains() {
+    for known_domain in [false, true] {
+        let mut authority = authority();
+        let domain = known_domain.then(|| domain(&mut authority, 1));
+        let participant = authority.join(VERSION).unwrap();
+        let id = authority.ledger().next_operation(participant).unwrap();
+        let too_small = Request { ceiling_ns: 5, ..request(domain) };
+        for now in [0, 1_000_000_000] {
+            assert_eq!(authority.prepare(id, too_small, now), Err(Error::Ceiling { minimum_ns: 10 }));
+            let view = authority.view();
+            assert_eq!((view.prepared, view.physical, view.charged_ns), (0, 0, 0));
+        }
+        let exact = Request { ceiling_ns: 10, ..request(domain) };
+        assert_eq!(authority.prepare(id, exact, 1_000_000_000).unwrap().cost_ns, 10);
+        authority.authorize(id, 1_000_000_000).unwrap();
+        // Consume the bucket; domain observations also raise its estimate.
+        authority
+            .settle(id, Progress { revision: 1, operations: 0, elapsed_ns: 200, failed: false }, 1_000_000_200)
+            .unwrap();
+        let next = authority.ledger().next_operation(participant).unwrap();
+        assert_eq!(
+            authority.prepare(next, too_small, 1_000_000_200),
+            Err(Error::Ceiling { minimum_ns: if known_domain { 100 } else { 10 } })
+        );
+        let sufficient = Request { ceiling_ns: 100, ..exact };
+        assert_eq!(authority.prepare(next, sufficient, 1_000_000_200), Err(Error::Budget));
+        assert!(authority.prepare(next, sufficient, 201_000_000_200).is_ok(), "refill repairs debt");
+    }
+}
+
+#[test]
+fn caller_ceiling_uses_the_capacity_capped_minimum_and_exempts_cleanup() {
+    let mut config = config();
+    config.initial_estimate_ns = 200;
+    let mut authority = Authority::new(Generation([1; 16]), config, 0).unwrap();
+    let participant = authority.join(VERSION).unwrap();
+    let id = authority.ledger().next_operation(participant).unwrap();
+    let request = Request { ceiling_ns: 100, ..request(None) };
+    assert_eq!(authority.prepare(id, request, 0).unwrap().cost_ns, 100);
+    authority.cancel(id, 0).unwrap();
+    let id = authority.ledger().next_operation(participant).unwrap();
+    let cleanup = Request { work: Work::WatchRelease, ceiling_ns: 0, ..request };
+    assert!(authority.prepare(id, cleanup, 0).is_ok());
+    assert!(authority.authorize(id, 0).is_ok());
+}

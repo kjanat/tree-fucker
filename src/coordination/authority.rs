@@ -147,6 +147,10 @@ pub enum Error {
     DomainCapacity,
     UnknownDomain,
     Budget,
+    /// The minimum lease exceeds the caller limit; refill cannot admit it.
+    Ceiling {
+        minimum_ns: u64,
+    },
     Bootstrap,
     Quarantined,
     DomainPhysical,
@@ -167,6 +171,9 @@ impl std::fmt::Display for Error {
             Self::DomainCapacity => f.write_str("shared domain table is full"),
             Self::UnknownDomain => f.write_str("domain does not belong to this authority"),
             Self::Budget => f.write_str("shared duty allowance is exhausted"),
+            Self::Ceiling { minimum_ns } => {
+                write!(f, "shared admission minimum of {minimum_ns} ns exceeds the caller ceiling")
+            }
             Self::Bootstrap => f.write_str("shared bootstrap allowance is occupied"),
             Self::Quarantined => f.write_str("shared domain has stuck physical work"),
             Self::DomainPhysical => f.write_str("shared domain physical capacity is occupied"),
@@ -473,6 +480,9 @@ impl Authority {
         let (available, capacity) = self.available(request, None);
         let cleanup = request.work == Work::WatchRelease;
         let floor = estimate.saturating_mul(u64::from(minimum)).min(capacity);
+        if !cleanup && floor > request.ceiling_ns {
+            return Err(Error::Ceiling { minimum_ns: floor });
+        }
         if !cleanup && floor > available {
             return Err(Error::Budget);
         }
