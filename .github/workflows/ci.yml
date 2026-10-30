@@ -28,13 +28,67 @@ jobs:
         with: { components: "rustfmt, clippy, rust-src, rust-analyzer" }
       - uses: Swatinem/rust-cache@v2
         with: { save-if: "${{ github.event_name != 'pull_request' }}" }
+      - name: Prepare macOS coordination storage
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          sudo mkdir -p /var/run/tree-fucker
+          sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
+          sudo chmod 1777 /var/run/tree-fucker
       - if: matrix.os == 'ubuntu-26.04'
         run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --no-fail-fast
+      - name: Repeat native interrupted initialization
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          for iteration in {1..20}; do
+            cargo test --lib coordination::unix::initialization::killed_initializers_recover_pinned_authority_or_reject_partial_anchor -- --exact
+          done
       - name: Layer probe correctness
         run: cargo bench:layers --test;
           cargo bench:alloc --test
+      - name: Coordination protocol benchmark smoke test
+        run: cargo bench --bench coordination -- --test
+      - name: Coordination namespace acceptance
+        if: startsWith(matrix.os, 'ubuntu-')
+        shell: bash
+        run: |
+          cargo test --test coordination_namespaces --no-run --message-format=json > target/namespace-build.jsonl
+          test_executable=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_namespaces") | .executable // empty' target/namespace-build.jsonl)
+          namespace_dir=$(mktemp -d /tmp/tree-fucker-coordination-namespaces.XXXXXX)
+          chmod 755 "${namespace_dir}"
+          sudo install -m 755 "${test_executable}" "${namespace_dir}/coordination_namespaces"
+          sudo "${namespace_dir}/coordination_namespaces" namespace_histories --ignored --nocapture
+      - name: Coordination process benchmark smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --bench coordination_processes -- --test
+          cargo bench --bench coordination_processes_alloc -- --test
+      - name: Native coordination measurements
+        if: startsWith(matrix.os, 'windows-') || startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/benchmarks
+          cargo bench --bench coordination_processes -- \
+            --workers 4 --iterations 100 --files 64 --runs 3 --warmups 1 \
+            | tee target/benchmarks/native-coordination-timing.tsv
+          cargo bench --bench coordination_processes_alloc -- \
+            --workers 4 --iterations 100 --files 64 --runs 3 --warmups 1 \
+            | tee target/benchmarks/native-coordination-allocations.tsv
+      - uses: actions/upload-artifact@v7
+        if: startsWith(matrix.os, 'windows-') || startsWith(matrix.os, 'macos-')
+        with:
+          name: coordination-${{ matrix.os }}
+          path: target/benchmarks/native-coordination-*.tsv
+          if-no-files-found: error
+      - name: macOS coordination root acceptance
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          cargo test --test coordination_macos --no-run --message-format=json > target/macos-coordination-build.jsonl
+          test_executable=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_macos") | .executable // empty' target/macos-coordination-build.jsonl)
+          sudo "${test_executable}" privileged_ --ignored --nocapture
       - run: cargo doc --no-deps --all-features
 
   freebsd:
@@ -51,6 +105,8 @@ jobs:
           envs: CARGO_TERM_COLOR CARGO_UNSTABLE_HINT_MSRV RUSTDOCFLAGS
           copyback: false
           prepare: |
+            mkdir -p /var/run/tree-fucker
+            mount -t tmpfs -o mode=1777 tmpfs /var/run/tree-fucker
             pkg install -y curl
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly -c rustfmt -c clippy -c rust-src -c rust-analyzer
           run: |
@@ -58,6 +114,10 @@ jobs:
             . "$HOME/.cargo/env"
             cargo clippy --all-targets --all-features -- -D warnings
             cargo test --all-features --no-fail-fast
+            cargo test --test coordination_freebsd privileged_ -- --ignored
+            cargo bench --bench coordination -- --test
+            cargo bench --bench coordination_processes -- --test
+            cargo bench --bench coordination_processes_alloc -- --test
             cargo doc --no-deps --all-features
 
   illumos:
@@ -74,13 +134,20 @@ jobs:
           envs: CARGO_TERM_COLOR CARGO_UNSTABLE_HINT_MSRV RUSTDOCFLAGS
           copyback: false
           prepare: |
+            mkdir -p /var/run/tree-fucker
+            chmod 1777 /var/run/tree-fucker
             pkg install build-essential curl || [ $? -eq 4 ]
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly -c rustfmt -c clippy -c rust-src -c rust-analyzer
           run: |
             set -e
             . "$HOME/.cargo/env"
+            sh benchmarks/omnios_zone.sh
             cargo clippy --all-targets --all-features -- -D warnings
             cargo test --all-features --no-fail-fast
+            cargo test --test coordination_illumos privileged_ -- --ignored
+            cargo bench --bench coordination -- --test
+            cargo bench --bench coordination_processes -- --test
+            cargo bench --bench coordination_processes_alloc -- --test
             cargo doc --no-deps --all-features
 
   cross:

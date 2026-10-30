@@ -10,7 +10,16 @@ use crate::domain::StorageDomainId;
 use crate::entry::{LoadState, Shape};
 use crate::fs::{CancellationToken, Lease};
 use crate::ids::*;
-use crate::update::{RoundResult, ShutdownState};
+use crate::update::{RoundResult, ShutdownState, ThrottleCause};
+
+fn governed_work(need: ReadNeed) -> crate::coordination::protocol::Work {
+    use crate::coordination::protocol::Work;
+    match need {
+        ReadNeed::Domain => Work::DomainDiscovery,
+        ReadNeed::Listing => Work::Listing,
+        ReadNeed::Metadata | ReadNeed::Enrichment(_) => Work::Enrichment,
+    }
+}
 
 impl Coordinator {
     pub(super) fn maybe_dispatch(&mut self) {
@@ -101,7 +110,6 @@ impl Coordinator {
             ReadNeed::Metadata | ReadNeed::Listing | ReadNeed::Enrichment(_) => entry.and_then(|e| self.domain_of(e)),
         };
         let origin = self.origin_of(entry, barriers);
-        let now = self.now;
         let reservation = Reservation {
             id: self.job_grant(id),
             path: path.clone(),
@@ -114,7 +122,7 @@ impl Coordinator {
             origin,
             listing: need == ReadNeed::Listing,
         };
-        match self.governor.try_admit(reservation, now) {
+        match self.admit_with_command_ceiling(reservation, governed_work(need), barriers) {
             Ok(admitted) => {
                 self.next_job_id = id.next();
                 Ok(JobGrant { id, registration, domain, origin, cost: admitted.cost, operations: admitted.operations })
@@ -150,11 +158,11 @@ impl Coordinator {
         need: ReadNeed,
         scope: &EnrichmentScope,
         cursor: usize,
-        starved: bool,
+        needs_operations: bool,
     ) -> u32 {
         let maximum = u32::try_from(self.config.operations_per_lease).unwrap_or(u32::MAX).max(1);
         match need {
-            ReadNeed::Listing => match starved || self.observation_costs_per_child(entry) {
+            ReadNeed::Listing => match needs_operations || self.observation_costs_per_child(entry) {
                 true => maximum,
                 false => 0,
             },
@@ -164,6 +172,27 @@ impl Coordinator {
                 maximum.min(remaining.max(1))
             }
             ReadNeed::Metadata | ReadNeed::Domain => 0,
+        }
+    }
+
+    fn admit_with_command_ceiling(
+        &mut self,
+        mut reservation: Reservation,
+        work: crate::coordination::protocol::Work,
+        barriers: &[CommandId],
+    ) -> Result<super::governor::Admitted, ThrottleCause> {
+        loop {
+            let result = self.governor.try_admit_work(reservation.clone(), work, self.now);
+            let Err(ThrottleCause::CommandCeiling { required }) = result else { return result };
+            self.finish_commands_below_cost(barriers, required, reservation.domain);
+            let Some(remaining) = self.command_ceiling(barriers) else { return result };
+            // A coalesced command with more budget can still fund this work.
+            // Retry only after removing a stricter command actually raised
+            // the ceiling, so an unchanged denial cannot spin.
+            if Some(remaining) <= reservation.ceiling {
+                return result;
+            }
+            reservation.ceiling = Some(remaining);
         }
     }
 
@@ -193,7 +222,6 @@ impl Coordinator {
                 self.finish_job(id, JobOutcome::Stale);
                 continue;
             }
-            let now = self.now;
             let lease = job.leases;
             let domain = job.domain;
             let cursor = job.enrichment.as_ref().map(|progress| progress.cursor).unwrap_or(0);
@@ -203,14 +231,19 @@ impl Coordinator {
                 path: job.path.clone(),
                 reads: 1,
                 registrations: 0,
-                operations: self.requested_operations(job.entry(), job.need, &scope, cursor, job.starved),
+                operations: if job.confirming {
+                    0
+                } else {
+                    self.requested_operations(job.entry(), job.need, &scope, cursor, job.needs_operations)
+                },
                 ceiling: self.command_ceiling(&job.barriers),
                 lease,
                 domain,
                 origin: job.origin,
-                listing: job.need == ReadNeed::Listing,
+                listing: job.need == ReadNeed::Listing && !job.confirming,
             };
-            let admitted = match self.governor.try_admit(reservation, now) {
+            let work = if job.confirming { governed_work(ReadNeed::Metadata) } else { governed_work(job.need) };
+            let admitted = match self.admit_with_command_ceiling(reservation, work, &job.barriers) {
                 Ok(admitted) => admitted,
                 Err(_) => continue,
             };
@@ -232,6 +265,9 @@ impl Coordinator {
     }
 
     fn work_for(&self, job: &ActiveJob) -> Work {
+        if job.confirming {
+            return Work::Metadata;
+        }
         match job.need {
             ReadNeed::Listing => Work::Listing(ListingWork {
                 lease: Lease {
@@ -767,8 +803,9 @@ impl Coordinator {
             cancel: CancellationToken::new(),
             leases: 1,
             permitted: grant.operations,
-            starved: false,
+            needs_operations: false,
             session_open: false,
+            confirming: false,
             registration,
             enrichment: match request.need {
                 ReadNeed::Enrichment(_) => Some(EnrichmentProgress::default()),
@@ -883,7 +920,10 @@ impl Coordinator {
                 continue;
             }
             let now = self.now;
-            self.governor.start(self.job_grant(id), now);
+            if self.governor.try_start(self.job_grant(id), now).is_err() {
+                deferred.push(id);
+                continue;
+            }
             let registration = self.jobs.get_mut(&id).and_then(|job| job.registration.take());
             match registration {
                 Some(scope) => self.register_before_listing(id, scope, now),
@@ -893,7 +933,7 @@ impl Coordinator {
                     };
                     let work = self.work_for(job);
                     if let Some(job) = self.jobs.get_mut(&id) {
-                        job.phase = JobPhase::Running(now);
+                        job.phase = if job.confirming { JobPhase::Confirming(now) } else { JobPhase::Running(now) };
                     }
                     self.dispatch_job(id, work);
                 }

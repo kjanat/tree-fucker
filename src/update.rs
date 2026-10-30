@@ -101,7 +101,13 @@ pub enum ThrottleCause {
     Concurrency,
     Memory,
     ForegroundCeiling,
+    /// The minimum lease exceeds the command allowance even after refill.
+    CommandCeiling {
+        required: std::time::Duration,
+    },
     StuckWorker,
+    Coordination,
+    CoordinationFailed,
 }
 
 impl fmt::Display for ThrottleCause {
@@ -111,7 +117,10 @@ impl fmt::Display for ThrottleCause {
             ThrottleCause::Concurrency => f.write_str("concurrency window"),
             ThrottleCause::Memory => f.write_str("accounted memory"),
             ThrottleCause::ForegroundCeiling => f.write_str("foreground allowance"),
+            ThrottleCause::CommandCeiling { required } => write!(f, "command allowance below required {required:?}"),
             ThrottleCause::StuckWorker => f.write_str("stuck worker"),
+            ThrottleCause::Coordination => f.write_str("shared admission"),
+            ThrottleCause::CoordinationFailed => f.write_str("shared authority unavailable after joining"),
         }
     }
 }

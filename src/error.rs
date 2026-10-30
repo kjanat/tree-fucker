@@ -27,6 +27,7 @@ pub enum Error {
     AncestorNotDirectory,
     InitialScanDegraded(BTreeSet<RelativePath>),
     Cancelled,
+    Coordination(String),
     Io(FsError),
 }
 
@@ -55,6 +56,7 @@ impl fmt::Display for Error {
                 write!(f, "initial scan degraded for {} paths", paths.len())
             }
             Error::Cancelled => f.write_str("cancelled"),
+            Error::Coordination(message) => write!(f, "coordination failed: {message}"),
             Error::Io(e) => write!(f, "filesystem error: {e}"),
         }
     }

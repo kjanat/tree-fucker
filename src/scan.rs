@@ -10,6 +10,7 @@ mod executor;
 pub use executor::ListingExecutor;
 
 use crate::config::Config;
+use crate::coordination::protocol::Work as GovernedWork;
 use crate::core::{
     GrantId, HostGovernor, MonotonicTime, Reported, Reservation, TreeNumber, WorkOrigin, host_governor,
     requires_crossing_decision,
@@ -278,13 +279,14 @@ struct Listing {
     carried: Option<Granted>,
     session: Box<dyn ListingSession>,
     lease: u32,
-    starved: bool,
+    needs_operations: bool,
     // Bytes already emitted are no longer live, but remain part of the
     // whole-directory observation used to admit later full listings.
     emitted_bytes: u64,
 }
 
 struct Need {
+    work: GovernedWork,
     reads: u32,
     operations: u32,
     lease: u32,
@@ -455,14 +457,15 @@ impl Scan {
             accounting: None,
         };
         let given = scan.root.clone();
-        let (canonical, _) = scan.bootstrap(|fs| fs.canonicalize(&given))?;
+        let (canonical, _) = scan.bootstrap(GovernedWork::Bootstrap, |fs| fs.canonicalize(&given))?;
         scan.root = canonical;
         let root = scan.root.clone();
-        let (info, _) = scan.bootstrap(|fs| fs.metadata(&root, &RelativePath::root()))?;
+        let (info, _) = scan.bootstrap(GovernedWork::Bootstrap, |fs| fs.metadata(&root, &RelativePath::root()))?;
         if info.kind != EntryKind::Directory {
             return Err(Error::NotDirectory);
         }
-        let (probe, grant) = scan.bootstrap(|fs| fs.resolve_domain(&root, &RelativePath::root(), None))?;
+        let (probe, grant) =
+            scan.bootstrap(GovernedWork::DomainDiscovery, |fs| fs.resolve_domain(&root, &RelativePath::root(), None))?;
         scan.stats.resolutions += 1;
         let domain = scan.bind(&probe, None);
         let now = scan.now();
@@ -522,7 +525,14 @@ impl Scan {
         self.accounting
             .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
         let id = self.next_grant();
-        let need = Need { reads: 1, operations: 0, lease: 0, domain: Some(entry.domain), listing: false };
+        let need = Need {
+            work: GovernedWork::LazyRead,
+            reads: 1,
+            operations: 0,
+            lease: 0,
+            domain: Some(entry.domain),
+            listing: false,
+        };
         let granted = match self.admit(id, &entry.path.path(), need)? {
             Admission::Granted(granted) => granted,
             Admission::Quarantined(_) => return Err(Error::Stuck),
@@ -605,6 +615,9 @@ impl Scan {
     fn admit(&mut self, id: GrantId, path: &RelativePath, need: Need) -> Result<Admission> {
         let admitted = loop {
             self.check_cancelled()?;
+            if let Some(error) = self.governor.coordination_error() {
+                return Err(Error::Coordination(error));
+            }
             self.governor.account_and_quarantine(self.now());
             let remaining = self.options.ceiling.saturating_sub(self.admitted_cost());
             if remaining.is_zero() {
@@ -624,12 +637,20 @@ impl Scan {
                 origin: WorkOrigin::Foreground,
                 listing: need.listing,
             };
-            let cause = match self.governor.try_admit(reservation, now) {
+            let cause = match self.governor.try_admit_work(reservation, need.work, now) {
                 Ok(admitted) => break admitted,
                 Err(cause) => cause,
             };
             match (cause, need.domain) {
                 (ThrottleCause::StuckWorker, Some(domain)) => return Ok(Admission::Quarantined(domain)),
+                (ThrottleCause::CommandCeiling { required }, _) => {
+                    return Err(self.limited(
+                        ResourceLimit::CommandWorkerTime,
+                        nanos(self.options.ceiling),
+                        nanos(self.admitted_cost().saturating_add(required)),
+                        need.domain,
+                    ));
+                }
                 (ThrottleCause::ForegroundCeiling, _)
                     if remaining < self.governor.cost_of(need.domain, need.reads + need.operations.min(1)) =>
                 {
@@ -655,6 +676,9 @@ impl Scan {
         let held = Held { id, governor: self.governor.clone(), clock: self.clock.clone(), base: self.base };
         loop {
             self.check_cancelled()?;
+            if let Some(error) = self.governor.coordination_error() {
+                return Err(Error::Coordination(error));
+            }
             let seen = self.governor.changes();
             let now = self.now();
             self.governor.account_and_quarantine(now);
@@ -671,12 +695,11 @@ impl Scan {
             {
                 return Ok(Admission::Quarantined(domain));
             }
-            if self.governor.try_start(id, now).is_ok() {
-                break;
+            match (self.governor.try_start(id, now), need.domain) {
+                (Ok(()), _) => break,
+                (Err(ThrottleCause::StuckWorker), Some(domain)) => return Ok(Admission::Quarantined(domain)),
+                (Err(_), _) => self.wait(seen, now),
             }
-            let started = self.clock.now();
-            self.clock.wait_for_change(&self.governor, seen, LONGEST_WAIT);
-            self.stats.throttled += self.clock.now().saturating_duration_since(started);
         }
         Ok(Admission::Granted(Granted { held, operations: admitted.operations }))
     }
@@ -711,10 +734,11 @@ impl Scan {
 
     fn bootstrap<T>(
         &mut self,
+        work_kind: GovernedWork,
         work: impl FnOnce(&dyn FileSystem) -> std::result::Result<T, FsError>,
     ) -> Result<(T, Held)> {
         let id = GrantId::Bootstrap(self.governor.next_bootstrap());
-        let need = Need { reads: 1, operations: 0, lease: 0, domain: None, listing: false };
+        let need = Need { work: work_kind, reads: 1, operations: 0, lease: 0, domain: None, listing: false };
         let granted = match self.admit(id, &RelativePath::root(), need)? {
             Admission::Granted(granted) => granted,
             Admission::Quarantined(_) => return Err(Error::Stuck),
@@ -774,13 +798,14 @@ impl Scan {
         beneath: Option<&Anchor>,
         listing_allowed: bool,
     ) -> Result<Option<(Arc<Located>, Option<Granted>)>> {
-        let (probe, parent, granted) = match site {
+        let (probe, parent, mut granted) = match site {
             Site::Located(located) => return Ok(Some((located, None))),
             Site::Probed { probe, parent } => (*probe, parent, None),
             Site::Beneath(parent) => {
                 let separate = self.listing_executor.is_some() || !listing_allowed;
                 let operations = if separate { 0 } else { self.lease_operations(&parent.probe, false) };
                 let need = Need {
+                    work: GovernedWork::DomainDiscovery,
                     reads: if separate { 1 } else { 2 },
                     operations,
                     lease: 0,
@@ -823,11 +848,20 @@ impl Scan {
                 return Ok(None);
             }
         }
+        if domain != parent.domain
+            && let Some(discovery) = granted.take()
+        {
+            // Discovery was authorized against the parent. Its permission
+            // cannot cover listing a newly resolved domain: settle it before
+            // resume_listing acquires a grant against the destination.
+            self.settle(discovery, Some(Reported { blocking: None, operations: 1 }), Some(domain));
+            self.record_success(Some(domain));
+        }
         Ok(Some((Arc::new(Located { domain, probe }), granted)))
     }
 
-    fn lease_operations(&self, probe: &ProbeResult, starved: bool) -> u32 {
-        match starved || costs_per_child(probe) {
+    fn lease_operations(&self, probe: &ProbeResult, needs_operations: bool) -> u32 {
+        match needs_operations || costs_per_child(probe) {
             true => self.maximum_operations(),
             false => 0,
         }
@@ -995,14 +1029,23 @@ impl Scan {
             carried,
             session,
             lease: 0,
-            starved: false,
+            needs_operations: false,
             emitted_bytes: 0,
         })
     }
 
     fn resume_listing(&mut self, listing: Listing) -> Result<()> {
-        let Listing { path, context, located, id, mut carried, mut session, mut lease, mut starved, mut emitted_bytes } =
-            listing;
+        let Listing {
+            path,
+            context,
+            located,
+            id,
+            mut carried,
+            mut session,
+            mut lease,
+            mut needs_operations,
+            mut emitted_bytes,
+        } = listing;
         let domain = located.domain;
         let outcome = loop {
             let worker = if let Some(executor) = &self.listing_executor {
@@ -1029,8 +1072,15 @@ impl Scan {
             let granted = match carried.take() {
                 Some(granted) => granted,
                 None => {
-                    let operations = self.lease_operations(&located.probe, starved);
-                    let need = Need { reads: 1, operations, lease, domain: Some(domain), listing: true };
+                    let operations = self.lease_operations(&located.probe, needs_operations);
+                    let need = Need {
+                        work: GovernedWork::Listing,
+                        reads: 1,
+                        operations,
+                        lease,
+                        domain: Some(domain),
+                        listing: true,
+                    };
                     match self.admit(id, &path, need) {
                         Ok(Admission::Granted(granted)) => granted,
                         Ok(Admission::Quarantined(quarantined)) => {
@@ -1071,7 +1121,7 @@ impl Scan {
             drop(memory);
             match continuation {
                 Continuation::Suspended(mut next) => {
-                    starved = cost.entries_enumerated == 0;
+                    needs_operations = cost.entries_enumerated == 0 || cost.per_child_operations() > 0;
                     lease += 1;
                     if self.options.streaming
                         && let Some(chunk) = next.take_chunk()
@@ -1086,7 +1136,7 @@ impl Scan {
                             carried: None,
                             session: next,
                             lease,
-                            starved,
+                            needs_operations,
                             emitted_bytes,
                         }));
                         let before = self.stack.len();
@@ -1193,7 +1243,14 @@ impl Scan {
         while cursor < names.len() {
             let remaining = u32::try_from(names.len() - cursor).unwrap_or(u32::MAX);
             let operations = self.maximum_operations().min(remaining);
-            let need = Need { reads: 1, operations, lease, domain: Some(domain), listing: false };
+            let need = Need {
+                work: GovernedWork::Enrichment,
+                reads: 1,
+                operations,
+                lease,
+                domain: Some(domain),
+                listing: false,
+            };
             let granted = match self.admit(id, path, need)? {
                 Admission::Granted(granted) => granted,
                 Admission::Quarantined(quarantined) => {

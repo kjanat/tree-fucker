@@ -2752,6 +2752,16 @@ Abstract
    system mechanisms to bound their aggregate; the library reports its
    own accounting so that such mechanisms can be configured.
 
+15.9.1.  Opt-In Coordination Extension
+
+   The cross-process extension is specified in coordination.md beside
+   this RFC. It defines a separate shared admission authority while
+   preserving the process-only default and the ownership rules in
+   Sections 10, 13.5, and 15.1 through 15.4. Its acceptance evidence
+   extends the observability and test requirements in Sections 16 and
+   17.5. The extension is under implementation; this reference does not
+   claim that a shared backend or platform support has shipped.
+
 
 16.  Observability
 

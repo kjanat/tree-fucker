@@ -1,0 +1,282 @@
+---
+name: Coordination acceptance
+on:
+  pull_request:
+    paths-ignore: ["*.md", rfc/**, reports/**, .zed/**]
+  push:
+    branches: [master]
+    paths-ignore: ["*.md", rfc/**, reports/**, .zed/**]
+  workflow_dispatch:
+    inputs:
+      sleep_runner:
+        description: Sleep-capable macOS runner label (hosted runners cannot sleep)
+        type: string
+        required: false
+permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  syscalls:
+    name: "Syscalls ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    concurrency:
+      group: "coordination-syscalls-${{ github.ref }}-${{ matrix.os }}"
+      cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-26.04, windows-2025, windows-11-arm, macos-26, macos-26-intel] }
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: kjanat/envctl@v0.7.2
+      - uses: actions/setup-dotnet@v5
+        if: startsWith(matrix.os, 'windows-')
+        with: { dotnet-version: "10.0.x" }
+      - name: Install Linux tracer
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+      - name: Prepare macOS coordination storage
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          sudo mkdir -p /var/run/tree-fucker
+          sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
+          sudo chmod 1777 /var/run/tree-fucker
+      - name: Build trace workload
+        shell: bash
+        run: |
+          mkdir -p target/benchmarks
+          cargo bench --bench coordination_processes --no-run --message-format=json > target/benchmarks/trace-build.jsonl
+          fixture=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_processes") | .executable // empty' target/benchmarks/trace-build.jsonl)
+          echo "TRACE_FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Build Windows realtime ETW collector
+        if: startsWith(matrix.os, 'windows-')
+        run: dotnet build benchmarks/windows_syscalls/windows_syscalls.csproj --configuration Release --nologo -p:BaseIntermediateOutputPath=../../target/windows-syscalls/obj/
+      - name: Collect Windows syscall counts
+        if: startsWith(matrix.os, 'windows-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in local shared; do
+            dotnet target/windows-syscalls/bin/Release/net10.0/windows_syscalls.dll 5 \
+              "$TRACE_FIXTURE" --scenario contention --mode "$mode" --workers 4 \
+              --iterations 20 --runs 1 --warmups 0 \
+              2>&1 | envctl redact > "target/benchmarks/syscalls-${mode}.log"
+          done
+      - name: Collect Unix syscall counts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for mode in local shared; do
+            bash benchmarks/trace_coordination.sh "$TRACE_FIXTURE" "$mode" "target/benchmarks/syscalls-${mode}.log"
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: "syscalls-${{ matrix.os }}"
+          path: target/benchmarks/syscalls-*.log
+          if-no-files-found: error
+
+  resources:
+    name: "Aggregate resources ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    concurrency:
+      group: "coordination-resources-${{ github.ref }}-${{ matrix.os }}"
+      cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-26.04, windows-2025, windows-11-arm, macos-26, macos-26-intel] }
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: kjanat/envctl@v0.7.2
+      - name: Prepare macOS coordination storage
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          sudo mkdir -p /var/run/tree-fucker
+          sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
+          sudo chmod 1777 /var/run/tree-fucker
+      - name: Test resource collector exit handling
+        run: uv run --with psutil python -m unittest discover -s benchmarks -p test_native_resources.py
+      - name: Build resource workload
+        shell: bash
+        run: |
+          mkdir -p target/benchmarks
+          cargo bench --bench coordination_processes --no-run --message-format=json > target/benchmarks/resource-build.jsonl
+          fixture=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_processes") | .executable // empty' target/benchmarks/resource-build.jsonl)
+          echo "RESOURCE_FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Measure complete live cohorts
+        shell: bash
+        run: |
+          set -euo pipefail
+          measure=(uv run benchmarks/native_resources.py)
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            measure=(sudo env "PATH=$PATH" "UV_CACHE_DIR=$RUNNER_TEMP/uv-root" uv run benchmarks/native_resources.py)
+          fi
+          for mode in local shared; do
+            for scenario in tiny disjoint contention churn slow idle; do
+              processes=5
+              iterations=2000
+              if [[ "$scenario" == tiny ]]; then processes=2; fi
+              if [[ "$scenario" == disjoint ]]; then iterations=100; fi
+              "${measure[@]}" --minimum-processes "$processes" \
+                "target/benchmarks/resources-${scenario}-${mode}.json" \
+                "$RESOURCE_FIXTURE" --scenario "$scenario" --mode "$mode" \
+                --workers 4 --iterations "$iterations" --ready-hold-ms 500 --hold-ms 3000 --runs 1 --warmups 0 \
+                2>&1 | envctl redact | tee "target/benchmarks/resources-${scenario}-${mode}-controller.log"
+            done
+          done
+      - name: Validate and summarize all resource cases
+        shell: bash
+        run: python3 benchmarks/summarize_resources.py target/benchmarks >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: "aggregate-resources-${{ matrix.os }}"
+          path: |
+            target/benchmarks/resources-*.json
+            target/benchmarks/resources-*.stdout
+            target/benchmarks/resources-*-controller.log
+          if-no-files-found: error
+
+  solaris:
+    name: Solaris 11.4 native
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    concurrency:
+      group: "coordination-solaris-${{ github.ref }}-${{ github.sha }}"
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: vmactions/solaris-vm@v1
+        with:
+          release: "11.4-gcc-14"
+          envs: CARGO_TERM_COLOR RUSTDOCFLAGS
+          copyback: false
+      - name: Native Solaris acceptance
+        run: |
+          set -euo pipefail
+          mkdir -p target/benchmarks
+          ssh solaris 'cd "$GITHUB_WORKSPACE" && sh benchmarks/solaris_ci.sh' 2>&1 | tee target/benchmarks/solaris-native.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: solaris-native-evidence
+          path: target/benchmarks/solaris-native.log
+          if-no-files-found: error
+
+  windows-reboot-binary:
+    name: Build Windows reboot fixture
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Build standalone fixture
+        shell: pwsh
+        env: { RUSTFLAGS: "-C target-feature=+crt-static" }
+        run: |
+          cargo test --release --test coordination_power --no-run --message-format=json > build.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $artifact = Get-Content build.jsonl | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'coordination_power' -and $_.executable }
+          if (@($artifact).Count -ne 1) { throw 'Expected exactly one power fixture' }
+          New-Item -ItemType Directory -Path target/power -Force | Out-Null
+          Copy-Item $artifact.executable target/power/coordination_power.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-reboot-fixture
+          path: target/power/coordination_power.exe
+          if-no-files-found: error
+
+  windows-reboot:
+    name: Windows real reboot
+    needs: windows-reboot-binary
+    runs-on: ubuntu-26.04
+    timeout-minutes: 55
+    concurrency:
+      group: "coordination-reboot-${{ github.ref }}-${{ github.sha }}"
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: kjanat/envctl@v0.7.2
+      - uses: actions/download-artifact@v8
+        with: { name: windows-reboot-fixture, path: target/power }
+      - name: Prepare guest storage
+        run: |
+          test -c /dev/kvm
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+          sudo apt-get update
+          sudo apt-get install -y libguestfs-tools
+      - name: Reboot with live ownership
+        run: python3 benchmarks/windows_reboot.py target/power/coordination_power.exe
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-reboot-evidence
+          path: |
+            target/benchmarks/windows-reboot/*.json
+            target/benchmarks/windows-reboot/*.log
+          if-no-files-found: error
+
+  macos-sleep:
+    name: macOS physical sleep/wake
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (vars.COORDINATION_SLEEP_RUNNER != '' || inputs.sleep_runner != '')
+    runs-on: ${{ inputs.sleep_runner || vars.COORDINATION_SLEEP_RUNNER }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare retained coordination storage
+        run: |
+          sudo mkdir -p /var/run/tree-fucker
+          sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
+          sudo chmod 1777 /var/run/tree-fucker
+      - name: Build power fixture
+        run: |
+          mkdir -p target
+          cargo test --test coordination_power --no-run --message-format=json > target/power-build.jsonl
+          fixture=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_power") | .executable // empty' target/power-build.jsonl)
+          echo "POWER_FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Verify real system sleep and wake
+        run: |
+          set -o pipefail
+          mkdir -p target/benchmarks
+          python3 benchmarks/macos_sleep.py "$POWER_FIXTURE" --allow-system-sleep 2>&1 | tee target/benchmarks/macos-sleep-controller.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sleep-wake
+          path: |
+            target/benchmarks/macos-sleep/
+            target/benchmarks/macos-sleep-controller.log
+          if-no-files-found: error
+
+  sleep-runner-requirement:
+    name: Record sleep/wake runner requirement
+    needs: macos-sleep
+    if: always() && needs.macos-sleep.result == 'skipped'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Report the outstanding acceptance gate
+        run: |
+          echo '::notice::Physical macOS sleep/wake did not run. It requires a sleep-capable runner and a push or manual dispatch on the default branch.'
+          echo 'This run supplies **no physical macOS sleep/wake evidence**. Pull requests and non-default refs cannot use the sleep runner. Configure COORDINATION_SLEEP_RUNNER or dispatch with sleep_runner on the default branch using a sleep-capable Mac.' >> "$GITHUB_STEP_SUMMARY"
