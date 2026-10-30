@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use tree_fucker::core::{Command, JobResult};
 use tree_fucker::testing::{CostScope, FakeFileSystem, FakeOp, Harness, Ticket};
 use tree_fucker::{
@@ -16,7 +18,11 @@ fn setup(
         per_domain_concurrency: 2,
         background_burst: Duration::from_secs(1),
         domain_background_burst: Duration::from_secs(1),
-        domain_foreground_burst: Duration::from_secs(1),
+        // Estimator setup measures real time, including scheduler delays.
+        // Its ten-second deadline can include two simultaneous physical calls.
+        // Keep duty capacity separate from the small command ceiling tested.
+        foreground_burst: Duration::from_secs(60),
+        domain_foreground_burst: Duration::from_secs(60),
         ..host_config()
     };
     let config = Config::from_host(&local, 8, 16, 16).unwrap();
@@ -63,19 +69,37 @@ fn setup(
 }
 
 fn raise_shared_minimum(host: &HostGovernor, domain: StorageDomainId, now: MonotonicTime) {
+    prime_shared_minimum(host, domain, now, Duration::from_millis(10));
+}
+
+fn prime_shared_minimum(host: &HostGovernor, domain: StorageDomainId, now: MonotonicTime, hold: Duration) {
     // Native accounting measures actual elapsed time; local accounting uses
     // the harness clock. Fill the shared estimator's history while leaving
     // the local estimate unchanged, including when a Tree lease is live.
+    let deadline = Instant::now() + Duration::from_secs(10);
     for _ in 0..32 {
+        assert!(Instant::now() < deadline, "shared estimator setup exceeded ten seconds");
         let mut reservation = request(host);
         reservation.domain = Some(domain);
         let id = reservation.id;
-        host.try_admit(reservation, now).unwrap();
-        host.try_start(id, now).unwrap();
-        std::thread::sleep(Duration::from_millis(10));
+        retry_setup(deadline, || host.try_admit(reservation.clone(), now));
+        retry_setup(deadline, || host.try_start(id, now));
+        std::thread::sleep(hold);
         host.release(id, now);
     }
     assert!(host.cost_of(Some(domain), 1) < Duration::from_millis(5));
+}
+
+fn retry_setup<T>(deadline: Instant, mut operation: impl FnMut() -> Result<T, ThrottleCause>) -> T {
+    loop {
+        match operation() {
+            Ok(value) => return value,
+            Err(ThrottleCause::Coordination) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(cause) => panic!("shared estimator setup admission failed: {cause}"),
+        }
+    }
 }
 
 fn command(load: bool) -> Command {
@@ -149,4 +173,34 @@ fn a_coalesced_refresh_with_enough_budget_survives_an_older_commands_ceiling() {
     assert_eq!(harness.result(fresh), Some(Ok(())));
     harness.command(Command::Shutdown);
     assert_eq!(scope.view().unwrap().prepared, 0);
+}
+
+#[test]
+fn tree_ceiling_setup_tolerates_slow_native_samples() {
+    for resumed in [false, true] {
+        let (_root, scope, host, mut harness, domain) = setup(Duration::from_millis(5), Duration::from_millis(10));
+        let pending = resumed.then(|| {
+            let ticket = harness.command(command(false));
+            let job = harness.pending_job_for("").unwrap();
+            (ticket, job.id)
+        });
+        prime_shared_minimum(&host, domain, harness.now(), Duration::from_millis(50));
+        let ticket = match pending {
+            Some((ticket, id)) => {
+                assert!(harness.complete_job_with(
+                    id,
+                    JobResult::Listing(SessionStep::suspended(SessionCost {
+                        listing_operations: 1,
+                        ..SessionCost::default()
+                    }))
+                ));
+                ticket
+            }
+            None => harness.command(command(false)),
+        };
+        assert_limited(&harness, ticket, domain);
+        harness.command(Command::Shutdown);
+        let view = scope.view().unwrap();
+        assert_eq!((view.prepared, view.physical), (0, 0));
+    }
 }
