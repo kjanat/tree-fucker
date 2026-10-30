@@ -72,15 +72,43 @@ def windows_regions(pid: int) -> list[dict[str, int]]:
     return regions
 
 
+def exited(process: psutil.Process) -> bool:
+    """Boundedly verify exit using the identity captured before inspection."""
+    for attempt in range(10):
+        try:
+            running = json.loads(redacted(json.dumps(process.is_running())))
+            if not running:
+                return True
+            state = json.loads(redacted(json.dumps(process.status())))
+        except psutil.NoSuchProcess:
+            return True
+        if state in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+            return True
+        if attempt < 9:
+            time.sleep(0.01)
+    return False
+
+
 def inspect(process: psutil.Process) -> dict:
     # Retain the Process identity across reads; is_running rejects PID reuse.
     raw = {"created": process.create_time(), "pid": process.pid}
-    if hasattr(process, "memory_footprint"):
-        raw["memory"] = (
-            process.memory_info()._asdict() | process.memory_footprint()._asdict()
-        )
-    else:
-        raw["memory"] = process.memory_full_info()._asdict()
+    try:
+        if hasattr(process, "memory_footprint"):
+            raw["memory"] = (
+                process.memory_info()._asdict() | process.memory_footprint()._asdict()
+            )
+        else:
+            raw["memory"] = process.memory_full_info()._asdict()
+    except RuntimeError as error:
+        # macOS can lose the task's address space during USS enumeration.
+        # Discard the whole sample only after confirming this identity exited.
+        if (
+            sys.platform != "darwin"
+            or str(error) != "mach_vm_region(VM_REGION_TOP_INFO) syscall failed"
+            or not exited(process)
+        ):
+            raise
+        raise psutil.NoSuchProcess(process.pid) from error
     raw["handles"] = (
         process.num_handles() if sys.platform == "win32" else process.num_fds()
     )

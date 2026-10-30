@@ -106,6 +106,8 @@ jobs:
           sudo mkdir -p /var/run/tree-fucker
           sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
           sudo chmod 1777 /var/run/tree-fucker
+      - name: Test resource collector exit handling
+        run: uv run --with psutil python -m unittest discover -s benchmarks -p test_native_resources.py
       - name: Build resource workload
         shell: bash
         run: |
