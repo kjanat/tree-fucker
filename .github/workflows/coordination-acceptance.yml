@@ -232,7 +232,10 @@ jobs:
 
   macos-sleep:
     name: macOS physical sleep/wake
-    if: vars.COORDINATION_SLEEP_RUNNER != '' || (github.event_name == 'workflow_dispatch' && inputs.sleep_runner != '')
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (vars.COORDINATION_SLEEP_RUNNER != '' || inputs.sleep_runner != '')
     runs-on: ${{ inputs.sleep_runner || vars.COORDINATION_SLEEP_RUNNER }}
     timeout-minutes: 20
     steps:
@@ -266,10 +269,11 @@ jobs:
 
   sleep-runner-requirement:
     name: Record sleep/wake runner requirement
-    if: vars.COORDINATION_SLEEP_RUNNER == '' && inputs.sleep_runner == ''
+    needs: macos-sleep
+    if: always() && needs.macos-sleep.result == 'skipped'
     runs-on: ubuntu-26.04
     steps:
       - name: Report the outstanding acceptance gate
         run: |
-          echo '::notice::Real macOS sleep/wake remains unverified. Configure COORDINATION_SLEEP_RUNNER or dispatch with sleep_runner using a sleep-capable Mac.'
-          echo 'macOS sleep/wake acceptance is **not satisfied**: both hosted Mac architectures were tested and cannot perform the required transition. Configure COORDINATION_SLEEP_RUNNER or dispatch with sleep_runner.' >> "$GITHUB_STEP_SUMMARY"
+          echo '::notice::Physical macOS sleep/wake did not run. It requires a sleep-capable runner and a push or manual dispatch on the default branch.'
+          echo 'This run supplies **no physical macOS sleep/wake evidence**. Pull requests and non-default refs cannot use the sleep runner. Configure COORDINATION_SLEEP_RUNNER or dispatch with sleep_runner on the default branch using a sleep-capable Mac.' >> "$GITHUB_STEP_SUMMARY"
