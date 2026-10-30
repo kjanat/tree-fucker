@@ -6,7 +6,7 @@ use crate::entry::{LoadState, Shape};
 use crate::error::Error;
 use crate::ids::*;
 use crate::path::RelativePath;
-use crate::update::{ShutdownState, UpdateEvent};
+use crate::update::{ResourceLimit, ResourceLimited, ShutdownState, UpdateEvent};
 
 enum WalkStep {
     Done,
@@ -329,6 +329,28 @@ impl Coordinator {
         self.outputs.push(Output::Publish(Box::new(UpdateEvent::Terminal { health })));
         self.outputs.push(Output::CommandFinished { id, result: Ok(()) });
         self.outputs.push(Output::Stopped(TerminalOutcome::ShutDown));
+    }
+
+    pub(super) fn finish_commands_below_cost(
+        &mut self,
+        barriers: &[CommandId],
+        required: Duration,
+        domain: Option<crate::domain::StorageDomainId>,
+    ) {
+        let ceiling = self.config.foreground_ceiling_per_command;
+        for id in barriers {
+            let Some(command) = self.commands.get(id) else { continue };
+            if !command.draws_on_foreground() || ceiling.saturating_sub(command.admitted) >= required {
+                continue;
+            }
+            let limited = ResourceLimited {
+                limit: ResourceLimit::CommandWorkerTime,
+                configured: u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX),
+                observed: u64::try_from(command.admitted.saturating_add(required).as_nanos()).unwrap_or(u64::MAX),
+                domain,
+            };
+            self.finish_command(*id, Err(Error::ResourceLimited(limited)));
+        }
     }
 
     pub(super) fn finish_command(&mut self, id: CommandId, result: Result<(), Error>) {

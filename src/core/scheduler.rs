@@ -10,7 +10,7 @@ use crate::domain::StorageDomainId;
 use crate::entry::{LoadState, Shape};
 use crate::fs::{CancellationToken, Lease};
 use crate::ids::*;
-use crate::update::{RoundResult, ShutdownState};
+use crate::update::{RoundResult, ShutdownState, ThrottleCause};
 
 fn governed_work(need: ReadNeed) -> crate::coordination::protocol::Work {
     use crate::coordination::protocol::Work;
@@ -110,7 +110,6 @@ impl Coordinator {
             ReadNeed::Metadata | ReadNeed::Listing | ReadNeed::Enrichment(_) => entry.and_then(|e| self.domain_of(e)),
         };
         let origin = self.origin_of(entry, barriers);
-        let now = self.now;
         let reservation = Reservation {
             id: self.job_grant(id),
             path: path.clone(),
@@ -123,7 +122,7 @@ impl Coordinator {
             origin,
             listing: need == ReadNeed::Listing,
         };
-        match self.governor.try_admit_work(reservation, governed_work(need), now) {
+        match self.admit_with_command_ceiling(reservation, governed_work(need), barriers) {
             Ok(admitted) => {
                 self.next_job_id = id.next();
                 Ok(JobGrant { id, registration, domain, origin, cost: admitted.cost, operations: admitted.operations })
@@ -176,6 +175,27 @@ impl Coordinator {
         }
     }
 
+    fn admit_with_command_ceiling(
+        &mut self,
+        mut reservation: Reservation,
+        work: crate::coordination::protocol::Work,
+        barriers: &[CommandId],
+    ) -> Result<super::governor::Admitted, ThrottleCause> {
+        loop {
+            let result = self.governor.try_admit_work(reservation.clone(), work, self.now);
+            let Err(ThrottleCause::CommandCeiling { required }) = result else { return result };
+            self.finish_commands_below_cost(barriers, required, reservation.domain);
+            let Some(remaining) = self.command_ceiling(barriers) else { return result };
+            // A coalesced command with more budget can still fund this work.
+            // Retry only after removing a stricter command actually raised
+            // the ceiling, so an unchanged denial cannot spin.
+            if Some(remaining) <= reservation.ceiling {
+                return result;
+            }
+            reservation.ceiling = Some(remaining);
+        }
+    }
+
     fn command_ceiling(&self, barriers: &[CommandId]) -> Option<Duration> {
         let limit = self.config.foreground_ceiling_per_command;
         barriers
@@ -202,7 +222,6 @@ impl Coordinator {
                 self.finish_job(id, JobOutcome::Stale);
                 continue;
             }
-            let now = self.now;
             let lease = job.leases;
             let domain = job.domain;
             let cursor = job.enrichment.as_ref().map(|progress| progress.cursor).unwrap_or(0);
@@ -224,7 +243,7 @@ impl Coordinator {
                 listing: job.need == ReadNeed::Listing && !job.confirming,
             };
             let work = if job.confirming { governed_work(ReadNeed::Metadata) } else { governed_work(job.need) };
-            let admitted = match self.governor.try_admit_work(reservation, work, now) {
+            let admitted = match self.admit_with_command_ceiling(reservation, work, &job.barriers) {
                 Ok(admitted) => admitted,
                 Err(_) => continue,
             };

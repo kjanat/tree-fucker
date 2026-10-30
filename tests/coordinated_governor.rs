@@ -14,6 +14,9 @@ const NOW: MonotonicTime = MonotonicTime::ZERO;
 #[path = "coordinated_governor/denials.rs"]
 mod denials;
 
+#[path = "coordinated_governor/tree_denials.rs"]
+mod tree_denials;
+
 #[path = "coordinated_governor/leases.rs"]
 mod leases;
 

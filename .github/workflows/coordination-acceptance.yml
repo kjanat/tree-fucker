@@ -259,6 +259,7 @@ jobs:
       - name: Verify real system sleep and wake
         run: |
           set -o pipefail
+          mkdir -p target/benchmarks
           python3 benchmarks/macos_sleep.py "$POWER_FIXTURE" --allow-system-sleep 2>&1 | tee target/benchmarks/macos-sleep-controller.log
       - uses: actions/upload-artifact@v7
         if: always()
