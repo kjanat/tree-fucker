@@ -24,7 +24,7 @@ Build the optimized benchmark and obtain its executable from Cargo's artifact ou
 
 ```sh
 mkdir -p target/benchmarks
-cargo bench --bench coordination_processes --no-run --message-format=json > target/benchmarks/resource-build.jsonl
+cargo bench --bench coordination_processes --no-run --message-format=json >target/benchmarks/resource-build.jsonl
 binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_processes") | .executable // empty' target/benchmarks/resource-build.jsonl)
 uv run benchmarks/native_resources.py --minimum-processes 5 \
   target/benchmarks/resources-contention-shared.json "$binary" \

@@ -789,7 +789,7 @@ impl Scan {
         beneath: Option<&Anchor>,
         listing_allowed: bool,
     ) -> Result<Option<(Arc<Located>, Option<Granted>)>> {
-        let (probe, parent, granted) = match site {
+        let (probe, parent, mut granted) = match site {
             Site::Located(located) => return Ok(Some((located, None))),
             Site::Probed { probe, parent } => (*probe, parent, None),
             Site::Beneath(parent) => {
@@ -838,6 +838,15 @@ impl Scan {
                 self.pending.push_back(ScanEvent::Boundary { path: path.clone(), mode, domain });
                 return Ok(None);
             }
+        }
+        if domain != parent.domain
+            && let Some(discovery) = granted.take()
+        {
+            // Discovery was authorized against the parent. Its permission
+            // cannot cover listing a newly resolved domain: settle it before
+            // resume_listing acquires a grant against the destination.
+            self.settle(discovery, Some(Reported { blocking: None, operations: 1 }), Some(domain));
+            self.record_success(Some(domain));
         }
         Ok(Some((Arc::new(Located { domain, probe }), granted)))
     }

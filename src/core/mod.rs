@@ -1843,6 +1843,13 @@ impl Coordinator {
             }
         }
         self.pending_releases = deferred;
+        if self.is_stopped() && self.governor.coordination_error().is_some() {
+            // A release attempt may discover permanent authority failure.
+            // It forbids dispatching even cleanup I/O. Abandon undispatched
+            // watch IDs so they cannot retain the terminal actor. Dispatched
+            // workers keep their grants and drain before the actor exits.
+            self.pending_releases.clear();
+        }
     }
 
     fn start_release(&mut self, pending: &PendingRelease) -> bool {

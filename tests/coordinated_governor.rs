@@ -253,6 +253,79 @@ fn shared_start_denial_releases_local_physical_hold_without_charging() {
 }
 
 #[test]
+fn shared_start_rechecks_local_budget_after_another_operation_overruns() {
+    use tree_fucker::{DomainCapabilities, StorageDomainId};
+    for origin in [WorkOrigin::Background, WorkOrigin::Foreground] {
+        for known_domain in [false, true] {
+            let (_root, scope) = fixture();
+            let config = HostConfig {
+                background_duty: 0.01,
+                domain_background_duty: 0.01,
+                foreground_duty: 0.01,
+                domain_foreground_duty: 0.01,
+                background_burst: Duration::from_millis(10),
+                domain_background_burst: Duration::from_millis(10),
+                foreground_burst: Duration::from_millis(10),
+                domain_foreground_burst: Duration::from_millis(10),
+                stuck_threshold: Duration::from_secs(60),
+                ..host_config()
+            };
+            let host = HostGovernor::with_coordination(&config, scope.clone()).unwrap();
+            let domain = known_domain.then(StorageDomainId::fresh);
+            if let Some(domain) = domain {
+                host.register_domain(domain, &DomainCapabilities::default(), NOW);
+            }
+            let mut running = request(&host);
+            running.origin = origin;
+            running.domain = domain;
+            let running_id = running.id;
+            host.try_admit(running, NOW).unwrap();
+            host.try_start(running_id, NOW).unwrap();
+            let mut waiting = request(&host);
+            waiting.origin = origin;
+            waiting.domain = domain;
+            let waiting_id = waiting.id;
+            host.try_admit(waiting, NOW).unwrap();
+            assert!(matches!(
+                host.try_start(waiting_id, NOW),
+                Err(ThrottleCause::Coordination | ThrottleCause::Concurrency)
+            ));
+            let later = NOW + Duration::from_millis(40);
+            host.release(running_id, later);
+            let local_before = host.view(later);
+            let shared_before = scope.view().unwrap();
+            let expected = match origin {
+                WorkOrigin::Background => ThrottleCause::DutyBudget,
+                WorkOrigin::Foreground => ThrottleCause::ForegroundCeiling,
+            };
+            assert_eq!(host.try_start(waiting_id, later), Err(expected), "origin={origin:?}, domain={domain:?}");
+            assert_eq!(host.view(later).charged, local_before.charged);
+            assert_eq!(host.view(later).preparations, 1);
+            assert_eq!(scope.view().unwrap().charged_ns, shared_before.charged_ns);
+            assert_eq!(scope.view().unwrap().physical, 0);
+            let refilled = later + Duration::from_secs(5);
+            host.try_start(waiting_id, refilled).unwrap();
+            host.release(waiting_id, refilled);
+        }
+    }
+}
+
+#[test]
+fn shared_start_excludes_its_own_preparation_from_local_affordability() {
+    let (_root, scope) = fixture();
+    let host = HostGovernor::with_coordination(
+        &HostConfig { foreground_burst: Duration::from_millis(1), ..host_config() },
+        scope,
+    )
+    .unwrap();
+    let reservation = request(&host);
+    let id = reservation.id;
+    host.try_admit(reservation, NOW).unwrap();
+    host.try_start(id, NOW).unwrap();
+    host.release(id, NOW);
+}
+
+#[test]
 fn shared_budget_denials_keep_the_longer_retry_without_spending_local_budget() {
     use tree_fucker::coordination::authority::{Origin, Request};
     use tree_fucker::coordination::protocol::Work;
@@ -464,3 +537,59 @@ fn persistent_tree_runs_listing_watch_registration_and_shutdown_with_shared_admi
 }
 
 mod coordination_support;
+
+#[test]
+#[cfg(not(windows))]
+fn terminal_coordination_failure_does_not_retain_the_tree_actor_for_undispatchable_unwatch() {
+    use std::future::Future;
+
+    use tree_fucker::testing::{DeterministicRuntime, FakeFileSystem, HoldingRuntime};
+    use tree_fucker::{LoadAll, Tree, WatcherKind};
+    for (held_worker, fail_before_shutdown) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (root, scope) = fixture();
+        let host = HostGovernor::with_coordination(&host_config(), scope).unwrap();
+        let inner = Arc::new(DeterministicRuntime::new());
+        let runtime = Arc::new(HoldingRuntime::new(inner.clone()));
+        let filesystem = Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive));
+        let (handle, _stream) = inner
+            .block_on(Tree::open_outside_host_governor(
+                filesystem.clone(),
+                filesystem.root().to_path_buf(),
+                Arc::new(LoadAll),
+                tree_fucker::Config::default(),
+                runtime.clone(),
+                host.clone(),
+            ))
+            .unwrap();
+        inner.block_on(handle.initial_scan_complete()).unwrap();
+        assert_eq!(filesystem.watch_count(), 1);
+        let mut refresh = std::pin::pin!(handle.refresh(vec![RelativePath::root()]));
+        if held_worker {
+            runtime.hold_next(1);
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(refresh.as_mut().poll(&mut context).is_pending());
+            inner.run_until_stalled();
+            assert_eq!(runtime.held(), 1);
+            assert_eq!(host.view(NOW).in_flight, 1);
+        }
+        std::fs::rename(root.path().join("scope"), root.path().join("old")).unwrap();
+        if fail_before_shutdown {
+            assert_eq!(host.try_admit(request(&host), NOW), Err(ThrottleCause::CoordinationFailed));
+        }
+        inner.block_on(handle.shutdown()).unwrap();
+        inner.run_until_stalled();
+        assert_eq!(host.view(NOW).watch_release_grants, 0, "failed authority cannot authorize new cleanup I/O");
+        if held_worker {
+            assert_eq!(host.view(NOW).in_flight, 1, "terminal cleanup must retain dispatched ownership");
+            assert!(Arc::strong_count(&filesystem) > 1);
+            runtime.release();
+            inner.run_until_stalled();
+        }
+        assert_eq!(host.view(NOW).in_flight, 0);
+        assert_eq!(
+            Arc::strong_count(&filesystem),
+            1,
+            "terminal actor must release its filesystem after dispatched workers finish"
+        );
+    }
+}

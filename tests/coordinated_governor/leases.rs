@@ -27,14 +27,24 @@ struct ObservedSession {
     inner: Box<dyn ListingSession>,
     observer: ObservedFileSystem,
     initial: bool,
+    path: RelativePath,
 }
 
 impl ListingSession for ObservedSession {
     fn resume(self: Box<Self>, lease: Lease) -> (Continuation, SessionCost) {
-        let Self { inner, observer, initial } = *self;
+        let Self { inner, observer, initial, path } = *self;
         let grants: Vec<_> = observer.host.grants().into_iter().filter(|grant| grant.started.is_some()).collect();
         assert_eq!(grants.len(), 1, "one physical listing lease");
         assert!(grants[0].listing);
+        let expected_domain =
+            tree_fucker::StorageDomainId::of(&FakeFileSystem::domain_key(observer.inner.domain_of(&path)));
+        if !path.is_root() {
+            assert_eq!(
+                grants[0].domain,
+                Some(expected_domain),
+                "listing must hold permission for its resolved domain: {path}"
+            );
+        }
         assert_eq!(lease.operations, grants[0].operations as usize, "adapter must receive the negotiated allowance");
         if let Some(scope) = &observer.scope {
             assert_eq!(scope.view().unwrap().physical, 1);
@@ -53,7 +63,9 @@ impl ListingSession for ObservedSession {
             }
         }
         let continuation = match continuation {
-            Continuation::Suspended(inner) => Continuation::Suspended(Box::new(Self { inner, observer, initial })),
+            Continuation::Suspended(inner) => {
+                Continuation::Suspended(Box::new(Self { inner, observer, initial, path }))
+            }
             finished => finished,
         };
         (continuation, cost)
@@ -101,6 +113,7 @@ impl FileSystem for ObservedFileSystem {
             inner: self.inner.open_listing(root, path, ceilings, cancel),
             observer: self.clone(),
             initial: self.listings.fetch_add(1, Ordering::Relaxed) == 0,
+            path: path.clone(),
         })
     }
 
@@ -409,5 +422,37 @@ fn tree_allowances(enrichment: bool) {
         } else {
             verify(&filesystem, shared);
         }
+    }
+}
+
+#[test]
+fn inline_scan_reacquires_listing_permission_for_a_new_domain() {
+    for shared in [false, true] {
+        let (_root, filesystem) = setup(shared);
+        filesystem.inner.report_inline_domains(false);
+        filesystem.inner.mkdir("mounted");
+        filesystem.inner.create_file("mounted/leaf", 1);
+        filesystem.inner.set_domain("mounted", tree_fucker::testing::DomainId::new(42));
+        let scan = Scan::open_outside_host_governor(
+            filesystem.clone(),
+            filesystem.inner.root().to_path_buf(),
+            Arc::new(LoadAll),
+            ScanOptions {
+                crossing: DomainCrossing::Follow,
+                streaming: false,
+                ceiling: Duration::MAX,
+                ..ScanOptions::default()
+            },
+            filesystem.host.clone(),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        let paths: Vec<_> = scan
+            .map(|event| match event.unwrap() {
+                ScanEvent::Entry(entry) => entry.path.path().to_string(),
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert!(paths.iter().any(|path| path == "mounted/leaf"));
     }
 }

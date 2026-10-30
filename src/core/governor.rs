@@ -928,7 +928,13 @@ impl Governor {
         }
     }
 
-    fn affordable(&self, domain: Option<StorageDomainId>, origin: WorkOrigin, ceiling: Option<Duration>) -> i128 {
+    fn affordable(
+        &self,
+        domain: Option<StorageDomainId>,
+        origin: WorkOrigin,
+        ceiling: Option<Duration>,
+        excluding: Option<GrantId>,
+    ) -> i128 {
         let global = match origin {
             WorkOrigin::Background => self.global.level,
             WorkOrigin::Foreground => self.foreground.level,
@@ -940,7 +946,7 @@ impl Governor {
                 WorkOrigin::Foreground => state.foreground.level,
             })
             .unwrap_or(global);
-        let (global_held, domain_held) = self.prepared_costs(domain, origin);
+        let (global_held, domain_held) = self.prepared_costs_excluding(domain, origin, excluding);
         let mut level = (global - global_held).min(local - domain_held).min(nanos(self.capacity_for(domain, origin)));
         if let Some(ceiling) = ceiling {
             level = level.min(nanos(ceiling));
@@ -949,7 +955,19 @@ impl Governor {
     }
 
     fn prepared_costs(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> (i128, i128) {
-        let held = self.prepared.values().filter(|prepared| prepared.reservation.origin == origin);
+        self.prepared_costs_excluding(domain, origin, None)
+    }
+
+    fn prepared_costs_excluding(
+        &self,
+        domain: Option<StorageDomainId>,
+        origin: WorkOrigin,
+        excluding: Option<GrantId>,
+    ) -> (i128, i128) {
+        let held = self
+            .prepared
+            .values()
+            .filter(|prepared| prepared.reservation.origin == origin && Some(prepared.reservation.id) != excluding);
         let global = held.clone().map(|prepared| nanos(prepared.admitted.cost)).sum();
         let local = held.filter(|prepared| prepared.reservation.domain == domain).map(|p| nanos(p.admitted.cost)).sum();
         (global, local)
@@ -989,7 +1007,7 @@ impl Governor {
         let estimate = self.estimate_of(domain);
         let capacity = self.capacity_for(domain, origin);
         let required = reads + registrations;
-        let affordable = self.affordable(domain, origin, ceiling);
+        let affordable = self.affordable(domain, origin, ceiling, None);
         let minimum = required + operations.min(1);
         let floor_cost = estimate.saturating_mul(minimum).min(capacity);
         if !cleanup && nanos(floor_cost) > affordable {

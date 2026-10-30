@@ -189,6 +189,21 @@ impl Binding {
             {
                 return Err(ThrottleCause::Memory);
             }
+            // Running work can consume the remaining duty budget while
+            // this preparation waits for shared capacity. Its own hold is
+            // already reserved, but other preparations must remain charged.
+            if id.release().is_none()
+                && nanos(local.admitted.cost)
+                    > governor.affordable(domain, local.reservation.origin, local.reservation.ceiling, Some(id))
+            {
+                let cause = match local.reservation.origin {
+                    WorkOrigin::Background => ThrottleCause::DutyBudget,
+                    WorkOrigin::Foreground => ThrottleCause::ForegroundCeiling,
+                };
+                let cost = local.admitted.cost;
+                governor.deny(cause, domain, cost, now);
+                return Err(cause);
+            }
             governor.may_start(domain)?;
             governor.prepared.get_mut(&id).expect("local preparation").physical = true;
             *governor.running.entry(domain).or_insert(0) += 1;
@@ -215,7 +230,10 @@ impl Binding {
     }
 
     pub(super) fn release(&self, host: &HostGovernor, id: GrantId, now: MonotonicTime) -> bool {
-        if self.scope.check_context().is_err() {
+        // Failed authority state still permits releasing completed local
+        // ownership. check_context checks process/security identity before
+        // returning Failed, so inherited or incompatible contexts stay fenced.
+        if !matches!(self.scope.check_context(), Ok(()) | Err(native::Error::Failed)) {
             return false;
         }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
