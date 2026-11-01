@@ -203,6 +203,7 @@ fn a_running_worker_is_charged_its_occupancy_before_it_completes() {
         h.pending_jobs().iter().any(|job| job.id == started.id),
         "the ten hour listing returned, so there is no running occupancy to account"
     );
+    h.command(Command::InitialScanComplete);
 
     let view = h.governor();
     assert!(
@@ -1629,6 +1630,7 @@ fn a_failing_foreground_read_surcharges_the_foreground_allowance_alone() {
     let host = HostConfig { failure_surcharge: SURCHARGE, ..Default::default() };
     let mut h = scanned_under(fs.clone(), host, follow());
     fs.fail("media/inner", FakeOp::ReadDir, FailureMode::Once(FsError::Transient("blip".into())));
+    h.command(Command::InitialScanComplete);
 
     let before = domain_stat(&h, MEDIA);
     let surcharged = h.governor().surcharged;
@@ -1766,6 +1768,7 @@ fn per_domain_statistics_report_window_bucket_latency_and_counts() {
     fs.set_cost(CostScope::Domain(MEDIA), FakeOp::ReadDir, Duration::from_secs(20));
     let mut h = scanned_under(fs.clone(), stuck_after(Duration::from_secs(3600)), follow());
     h.run_jobs_until(h.now() + Duration::from_secs(300));
+    h.command(Command::InitialScanComplete);
 
     for stat in h.stats().domains {
         assert!(stat.window >= 1 && stat.window <= stat.ceiling, "RFC 16: {stat:?}");
@@ -2159,19 +2162,20 @@ fn a_governor_denial_changes_no_obligation_cursor_barrier_or_retry_state() {
     }
     assert_eq!(h.result(first), Some(Ok(())), "the fixture's foreground read never completed");
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    h.command(Command::InitialScanComplete);
     assert!(h.governor().debt > Duration::ZERO, "the fixture repaid the background bucket");
     assert!(h.governor().foreground_debt > Duration::ZERO, "the fixture left the foreground bucket solvent");
 
-    let ticket = h.command(Command::Refresh(vec![path("b")]));
     let before = h.stats();
     let denials_before = before.governor.denials;
     let throttled_at = h.now();
+    let ticket = h.command(Command::Refresh(vec![path("b")]));
     let resume = h.governor().next_admissible.expect("a throttled governor names its resume time");
     let half = throttled_at + (resume.saturating_sub(throttled_at) / 2);
     h.run_jobs_until(half);
     let after = h.stats();
 
-    let admitted: Vec<Admission> = h.admissions().into_iter().filter(|a| a.at > throttled_at).collect();
+    let admitted: Vec<Admission> = h.admissions().into_iter().filter(|a| a.at >= throttled_at).collect();
     assert!(
         admitted.is_empty(),
         "RFC 15.3: no admission may occur while both buckets are in debt, {} were",
@@ -2199,6 +2203,146 @@ fn a_governor_denial_changes_no_obligation_cursor_barrier_or_retry_state() {
         }
     }
     assert_eq!(h.result(ticket), Some(Ok(())), "RFC 5.2: the deferred command completes once capacity returns");
+}
+
+#[test]
+fn a_foreground_refill_wakes_the_tree_before_the_background_bucket_recovers() {
+    let fs = tree(&["a", "b"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let host = HostConfig {
+        foreground_duty: 0.5,
+        domain_foreground_duty: 0.5,
+        stuck_threshold: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let mut h = scanned_under(fs.clone(), host, Config::default());
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_secs(60));
+    h.run_jobs_until(h.now() + Duration::from_secs(1200));
+    assert!(h.governor().debt > Duration::ZERO, "the fixture left the background bucket solvent");
+    let first = h.command(Command::Refresh(vec![path("a")]));
+    for _ in 0..20 {
+        h.run_jobs_until(h.now() + Duration::from_secs(60));
+        if h.result(first).is_some() {
+            break;
+        }
+    }
+    assert_eq!(h.result(first), Some(Ok(())), "the fixture's foreground read never completed");
+    assert!(h.governor().foreground_debt > Duration::ZERO, "the fixture left the foreground bucket solvent");
+
+    let issued = h.now();
+    let background = h.governor().next_admissible.expect("a background bucket in debt names its refill time");
+    let ticket = h.command(Command::Refresh(vec![path("b")]));
+    for _ in 0..200 {
+        h.run_jobs_until(h.now() + Duration::from_secs(60));
+        if h.result(ticket).is_some() {
+            break;
+        }
+    }
+    let admitted = h
+        .admissions()
+        .into_iter()
+        .find(|a| a.at >= issued && a.entry == path("b") && a.origin == WorkOrigin::Foreground)
+        .expect("RFC 15.4: the foreground refresh is admitted once its own bucket refills");
+    assert!(
+        admitted.at < background,
+        "RFC 15.4: the foreground buckets have their own rate and capacity; the refresh issued at {issued:?} was \
+         admitted at {:?}, at or after the background refill at {background:?}",
+        admitted.at
+    );
+}
+
+#[test]
+fn an_exhausted_foreground_allowance_withholds_no_background_admission() {
+    let fs = tree(&["a", "b", "z"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let host = HostConfig {
+        foreground_duty: 0.001,
+        domain_foreground_duty: 0.001,
+        stuck_threshold: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let config = Config { fixed_interval: Some(Duration::from_secs(30)), ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, config);
+    fs.set_cost(CostScope::path("z"), FakeOp::ReadDir, Duration::from_secs(60));
+    let first = h.command(Command::Refresh(vec![path("z")]));
+    h.run_jobs_until(h.now() + Duration::from_secs(1));
+    fs.set_cost(CostScope::path("z"), FakeOp::ReadDir, Duration::from_millis(10));
+    for _ in 0..20 {
+        h.run_jobs_until(h.now() + Duration::from_secs(10));
+        if h.result(first).is_some() {
+            break;
+        }
+    }
+    assert_eq!(h.result(first), Some(Ok(())), "the fixture's foreground read never completed");
+    assert!(h.governor().foreground_debt > Duration::ZERO, "the fixture left the foreground bucket solvent");
+    assert_eq!(h.governor().debt, Duration::ZERO, "the fixture left the background bucket in debt");
+
+    let issued = h.now();
+    let ticket = h.command(Command::Refresh(vec![path("a")]));
+    h.run_jobs_until(issued + Duration::from_secs(600));
+    assert_eq!(h.result(ticket), None, "the fixture's foreground refresh was admitted");
+    let background: BTreeSet<RelativePath> = h
+        .admissions()
+        .into_iter()
+        .filter(|a| a.at >= issued && a.origin == WorkOrigin::Background)
+        .map(|a| a.entry)
+        .collect();
+    assert!(
+        background.contains(&path("b")) && background.contains(&path("z")),
+        "RFC 15.4: the foreground buckets have their own rate and capacity; with the foreground refresh of a denied, \
+         the background listings admitted were {background:?}"
+    );
+}
+
+#[test]
+fn a_background_refill_admits_background_listings_while_a_foreground_refresh_waits() {
+    let fs = tree(&["a", "b", "c"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let host = HostConfig {
+        foreground_duty: 0.001,
+        domain_background_duty: 1.0,
+        domain_foreground_duty: 1.0,
+        stuck_threshold: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let mut h = scanned_under(fs.clone(), host, Config::default());
+    fs.set_cost(CostScope::path("a"), FakeOp::ReadDir, Duration::from_secs(60));
+    let first = h.command(Command::Refresh(vec![path("a")]));
+    h.run_jobs_until(h.now() + Duration::from_secs(1));
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_secs(60));
+    for _ in 0..20 {
+        h.run_jobs_until(h.now() + Duration::from_secs(60));
+        if h.result(first).is_some() && h.governor().debt > Duration::ZERO {
+            break;
+        }
+    }
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    assert_eq!(h.result(first), Some(Ok(())), "the fixture's foreground read never completed");
+    assert!(h.governor().debt > Duration::ZERO, "the fixture left the background bucket solvent");
+    assert!(h.governor().foreground_debt > Duration::ZERO, "the fixture left the foreground bucket solvent");
+
+    let issued = h.now();
+    let ticket = h.command(Command::Refresh(vec![path("b")]));
+    for _ in 0..200 {
+        h.run_jobs_until(h.now() + Duration::from_secs(600));
+        if h.result(ticket).is_some() {
+            break;
+        }
+    }
+    assert_eq!(h.result(ticket), Some(Ok(())), "RFC 5.2: the deferred command completes once capacity returns");
+    let after: Vec<Admission> = h.admissions().into_iter().filter(|a| a.at >= issued).collect();
+    let refreshed = after
+        .iter()
+        .find(|a| a.entry == path("b") && a.origin == WorkOrigin::Foreground)
+        .expect("the refresh of b was admitted");
+    let background: Vec<&Admission> =
+        after.iter().filter(|a| a.origin == WorkOrigin::Background && a.at < refreshed.at).collect();
+    assert!(
+        !background.is_empty(),
+        "RFC 15.4: the background bucket refills at its own rate; no background listing was admitted between the \
+         refresh at {issued:?} and its admission at {:?}",
+        refreshed.at
+    );
 }
 
 fn local_nvme() -> DomainCapabilities {

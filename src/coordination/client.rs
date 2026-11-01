@@ -214,9 +214,17 @@ impl Cleanup {
         }
         queue.running = true;
         let worker_scope = scope.clone();
+        #[cfg(windows)]
+        let caller = super::native::Caller::current();
         if std::thread::Builder::new()
             .name("tree-fucker-coordination".into())
-            .spawn(move || Self::flush(worker_scope))
+            .spawn(move || {
+                #[cfg(windows)]
+                if caller.and_then(|caller| caller.enter()).is_err() {
+                    worker_scope.fail();
+                }
+                Self::flush(worker_scope)
+            })
             .is_err()
         {
             scope.fail();

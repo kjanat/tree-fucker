@@ -79,6 +79,77 @@ fn native_scope_reuses_final_closed_owner_without_releasing_recovery_exclusion()
 }
 
 #[test]
+fn deferred_settlement_runs_under_the_impersonated_caller_context() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, RevertToSelf, SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+        TokenImpersonation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
+
+    std::thread::spawn(|| {
+        let mut source = std::ptr::null_mut();
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: current process pseudo-handle, live output slots, and
+        // individually owned token handles closed by OwnedHandle.
+        let duplicate = unsafe {
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut source), 0);
+            let source = OwnedHandle::from_raw_handle(source);
+            assert_ne!(
+                DuplicateTokenEx(
+                    source.as_raw_handle(),
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut duplicate
+                ),
+                0
+            );
+            OwnedHandle::from_raw_handle(duplicate)
+        };
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                // SAFETY: restores this dedicated test thread's process token.
+                assert_ne!(unsafe { RevertToSelf() }, 0);
+            }
+        }
+        // SAFETY: null selects only the current dedicated test thread.
+        assert_ne!(unsafe { SetThreadToken(std::ptr::null(), duplicate.as_raw_handle()) }, 0);
+        let _revert = Revert;
+
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope::open(root.path().join("scope"), authority().config()).unwrap();
+        let client = scope.join().unwrap();
+        let prepared = client
+            .prepare(Request {
+                work: Work::LazyRead,
+                origin: Origin::Foreground,
+                domain: None,
+                required: 1,
+                desired: 0,
+                ceiling_ns: u64::MAX,
+            })
+            .unwrap();
+        assert_eq!(scope.view().unwrap().prepared, 1);
+        let anchor = open_bookkeeping(&root.path().join("scope.authority.lock"), false).unwrap();
+        let lock = Bookkeeping::try_lock(&anchor).unwrap();
+        drop(prepared);
+        assert_eq!(scope.diagnostics().unwrap().pending_settlements, 1);
+        lock.unlock().unwrap();
+        wait_until(|| scope.diagnostics().unwrap().pending_settlements == 0);
+        let diagnostics = scope.diagnostics().unwrap();
+        assert!(!diagnostics.failed, "the cleanup worker must keep the caller's token");
+        assert_eq!(scope.view().unwrap().prepared, 0);
+        drop(client);
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
 fn native_scope_rejects_replacement_and_configuration_disagreement() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("scope");

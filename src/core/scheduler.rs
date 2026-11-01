@@ -21,6 +21,11 @@ fn governed_work(need: ReadNeed) -> crate::coordination::protocol::Work {
     }
 }
 
+fn exhaust(exhausted: &mut BTreeSet<WorkOrigin>, origin: WorkOrigin) -> bool {
+    exhausted.insert(origin);
+    [WorkOrigin::Background, WorkOrigin::Foreground].iter().all(|origin| exhausted.contains(origin))
+}
+
 impl Coordinator {
     pub(super) fn maybe_dispatch(&mut self) {
         if self.shutdown != ShutdownState::Running || self.batch.is_some() {
@@ -52,15 +57,16 @@ impl Coordinator {
         if contended {
             self.dispatch_rotation = self.dispatch_rotation.wrapping_add(1);
         }
+        let mut exhausted: BTreeSet<WorkOrigin> = BTreeSet::new();
         let mut granting = true;
         if baseline_first && baseline_slots > 0 {
-            granting = self.admit_baseline(baseline_slots, &mut members);
+            granting = self.admit_baseline(baseline_slots, &mut members, &mut exhausted);
         }
         if granting && expedited_slots > 0 {
-            granting = self.admit_expedited(expedited_slots, expedited, &mut members);
+            granting = self.admit_expedited(expedited_slots, expedited, &mut members, &mut exhausted);
         }
         if granting && !baseline_first && baseline_slots > 0 {
-            self.admit_baseline(baseline_slots, &mut members);
+            self.admit_baseline(baseline_slots, &mut members, &mut exhausted);
         }
         if periodic {
             self.baseline_due = false;
@@ -128,7 +134,7 @@ impl Coordinator {
                 Ok(JobGrant { id, registration, domain, origin, cost: admitted.cost, operations: admitted.operations })
             }
             Err(_) => match self.governor.global_exhausted(domain, origin) {
-                true => Err(Denied::Globally),
+                true => Err(Denied::Globally(origin)),
                 false => Err(Denied::OnDomain(domain)),
             },
         }
@@ -245,6 +251,10 @@ impl Coordinator {
             let work = if job.confirming { governed_work(ReadNeed::Metadata) } else { governed_work(job.need) };
             let admitted = match self.admit_with_command_ceiling(reservation, work, &job.barriers) {
                 Ok(admitted) => admitted,
+                Err(ThrottleCause::StuckWorker) => {
+                    self.cancel_job(id);
+                    continue;
+                }
                 Err(_) => continue,
             };
             let barriers = job.barriers.clone();
@@ -458,7 +468,12 @@ impl Coordinator {
         self.round = Some(Round { generation, barrier, obligations, index, cursor: 0, started: self.now });
     }
 
-    fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) -> bool {
+    fn admit_baseline(
+        &mut self,
+        slots: usize,
+        members: &mut HashSet<JobId>,
+        exhausted: &mut BTreeSet<WorkOrigin>,
+    ) -> bool {
         let mut remaining = slots;
         let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
         let mut quarantined: std::collections::HashMap<Option<StorageDomainId>, bool> =
@@ -556,10 +571,16 @@ impl Coordinator {
             }
             let barriers =
                 self.pending.get(&obligation.entry).map(|request| request.barriers.clone()).unwrap_or_default();
+            if exhausted.contains(&self.origin_of(Some(obligation.entry), &barriers)) {
+                continue;
+            }
             let grant = match self.try_grant_on(Some(obligation.entry), ReadNeed::Listing, &obligation.path, &barriers)
             {
                 Ok(grant) => grant,
-                Err(Denied::Globally) => return false,
+                Err(Denied::Globally(origin)) => match exhaust(exhausted, origin) {
+                    true => return false,
+                    false => continue,
+                },
                 Err(Denied::OnDomain(domain)) => {
                     denied.insert(domain);
                     continue;
@@ -600,7 +621,13 @@ impl Coordinator {
         }
     }
 
-    fn admit_expedited(&mut self, slots: usize, ready: Vec<Ready>, members: &mut HashSet<JobId>) -> bool {
+    fn admit_expedited(
+        &mut self,
+        slots: usize,
+        ready: Vec<Ready>,
+        members: &mut HashSet<JobId>,
+        exhausted: &mut BTreeSet<WorkOrigin>,
+    ) -> bool {
         let mut by_class: [Vec<Ready>; 5] = Default::default();
         for candidate in ready {
             let id = candidate.entry();
@@ -708,12 +735,17 @@ impl Coordinator {
                     continue;
                 };
                 let id = candidate.entry();
-                if denied.contains(&self.domain_of(id)) {
+                if denied.contains(&self.domain_of(id))
+                    || exhausted.contains(&self.origin_of(Some(id), &request.barriers))
+                {
                     continue;
                 }
                 let grant = match self.try_grant_on(Some(id), request.need, &request.path, &request.barriers) {
                     Ok(grant) => grant,
-                    Err(Denied::Globally) => return false,
+                    Err(Denied::Globally(origin)) => match exhaust(exhausted, origin) {
+                        true => return false,
+                        false => continue,
+                    },
                     Err(Denied::OnDomain(domain)) => {
                         denied.insert(domain);
                         continue;
@@ -920,9 +952,16 @@ impl Coordinator {
                 continue;
             }
             let now = self.now;
-            if self.governor.try_start(self.job_grant(id), now).is_err() {
-                deferred.push(id);
-                continue;
+            match self.governor.try_start(self.job_grant(id), now) {
+                Ok(()) => {}
+                Err(ThrottleCause::StuckWorker) => {
+                    self.cancel_job(id);
+                    continue;
+                }
+                Err(_) => {
+                    deferred.push(id);
+                    continue;
+                }
             }
             let registration = self.jobs.get_mut(&id).and_then(|job| job.registration.take());
             match registration {
@@ -1061,7 +1100,7 @@ type RelativePathOwned = crate::path::RelativePath;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Denied {
-    Globally,
+    Globally(WorkOrigin),
     OnDomain(Option<StorageDomainId>),
 }
 

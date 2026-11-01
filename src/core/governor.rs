@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -1428,7 +1428,22 @@ impl Governor {
     }
 
     pub fn resume_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
-        self.throttle(now).and_then(|(_, resume)| resume)
+        match self.throttle(now)? {
+            (ThrottleCause::DutyBudget | ThrottleCause::ForegroundCeiling, _) => {
+                let foreground = self
+                    .denied_foreground
+                    .and_then(|(domain, cost)| self.budget_wait(domain, WorkOrigin::Foreground, cost, now).flatten());
+                self.background_resume_at(now).into_iter().chain(foreground).min()
+            }
+            (_, resume) => resume,
+        }
+    }
+
+    pub fn background_resume_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
+        match self.throttle(now)? {
+            (ThrottleCause::DutyBudget, resume) => resume,
+            _ => None,
+        }
     }
 
     pub fn domain_health(
@@ -1569,6 +1584,11 @@ pub struct HostGovernor {
 struct Changes {
     generation: u64,
     waiters: usize,
+    wakers: Vec<Weak<dyn ChangeWaker>>,
+}
+
+pub(crate) trait ChangeWaker: Send + Sync {
+    fn wake(&self);
 }
 
 static PROCESS_GOVERNOR: OnceLock<HostGovernor> = OnceLock::new();
@@ -1730,12 +1750,22 @@ impl HostGovernor {
         held.generation
     }
 
+    pub(crate) fn on_change(&self, waker: Weak<dyn ChangeWaker>) {
+        guard_changes(&self.changes.0).wakers.push(waker);
+    }
+
     fn changed(&self) {
         let (lock, signal) = &*self.changes;
         let mut held = guard_changes(lock);
         held.generation = held.generation.wrapping_add(1);
         if held.waiters > 0 {
             signal.notify_all();
+        }
+        held.wakers.retain(|waker| waker.strong_count() > 0);
+        let wakers: Vec<_> = held.wakers.iter().filter_map(Weak::upgrade).collect();
+        drop(held);
+        for waker in wakers {
+            waker.wake();
         }
     }
 
@@ -2110,9 +2140,20 @@ impl HostGovernor {
         None
     }
 
-    pub fn timer_hints(&self, now: MonotonicTime) -> (Option<MonotonicTime>, Option<MonotonicTime>) {
+    fn coordination_quarantined(&self) -> BTreeSet<StorageDomainId> {
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.shared {
+            return shared.quarantined();
+        }
+        BTreeSet::new()
+    }
+
+    pub fn timer_hints(
+        &self,
+        now: MonotonicTime,
+    ) -> (Option<MonotonicTime>, Option<MonotonicTime>, Option<MonotonicTime>) {
         let governor = guard(&self.inner);
-        (governor.resume_at(now), governor.next_stuck_deadline())
+        (governor.resume_at(now), governor.background_resume_at(now), governor.next_stuck_deadline())
     }
 
     pub fn domain_health_map(
@@ -2121,9 +2162,14 @@ impl HostGovernor {
         queued: &std::collections::BTreeSet<StorageDomainId>,
         into: &mut BTreeMap<StorageDomainId, crate::update::ResourceHealth>,
     ) {
+        let shared = self.coordination_quarantined();
         let governor = guard(&self.inner);
         for (id, slot) in into.iter_mut() {
-            *slot = match governor.domain_health(*id, now, queued.contains(id)) {
+            let health = match shared.contains(id) {
+                true => Some((ThrottleCause::StuckWorker, None)),
+                false => governor.domain_health(*id, now, queued.contains(id)),
+            };
+            *slot = match health {
                 Some((cause, resume)) => crate::update::ResourceHealth::Throttled { cause, resume },
                 None => crate::update::ResourceHealth::Nominal,
             };

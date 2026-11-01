@@ -12,8 +12,8 @@ use futures_util::StreamExt;
 
 use crate::config::{Config, LagMode};
 use crate::core::{
-    Command, Coordinator, GrantId, HostGovernor, Input, JobResult, MonotonicTime, Output, Reservation, Stats,
-    TerminalOutcome, Work, WorkOrigin, WorkerLoss, host_governor,
+    ChangeWaker, Command, Coordinator, GrantId, HostGovernor, Input, JobResult, MonotonicTime, Output, Reservation,
+    Stats, TerminalOutcome, Work, WorkOrigin, WorkerLoss, host_governor,
 };
 use crate::error::{Error, Result};
 use crate::fs::{Continuation, FileSystem, FsError, ListingSession, SessionStep, WatcherEvent, WatcherSink};
@@ -27,6 +27,7 @@ use crate::update::{Health, RecoverableError, StreamError, UpdateEvent};
 enum Message {
     Input(Box<Input>),
     WatcherReady,
+    GovernorChanged,
 }
 
 enum RunPhase {
@@ -192,6 +193,19 @@ impl WatcherSink for Sink {
     }
 }
 
+struct GovernorWake {
+    signalled: AtomicBool,
+    tx: mpsc::UnboundedSender<Message>,
+}
+
+impl ChangeWaker for GovernorWake {
+    fn wake(&self) {
+        if !self.signalled.swap(true, Ordering::SeqCst) {
+            let _ = self.tx.unbounded_send(Message::GovernorChanged);
+        }
+    }
+}
+
 struct WorkerGuard {
     loss: WorkerLoss,
     tx: Option<mpsc::UnboundedSender<Message>>,
@@ -222,6 +236,7 @@ struct Actor {
     rx: mpsc::UnboundedReceiver<Message>,
     shared: Arc<Shared>,
     sink: Arc<Sink>,
+    governor_wake: Arc<GovernorWake>,
     fs: Arc<dyn FileSystem>,
     runtime: Arc<dyn Runtime>,
     root: Arc<PathBuf>,
@@ -279,6 +294,12 @@ impl Actor {
             return self.handle(Input::Watcher(WatcherEvent::Dropped { count: dropped }));
         }
         None
+    }
+
+    fn governor_changed(&mut self) -> Option<TerminalOutcome> {
+        self.governor_wake.signalled.store(false, Ordering::SeqCst);
+        let outputs = self.coordinator.observe(self.now());
+        self.execute(outputs)
     }
 
     fn execute(&mut self, outputs: Vec<Output>) -> Option<TerminalOutcome> {
@@ -427,6 +448,7 @@ impl Actor {
         match message {
             Message::Input(input) => self.handle(*input),
             Message::WatcherReady => self.drain_watcher(),
+            Message::GovernorChanged => self.governor_changed(),
         }
     }
 
@@ -501,8 +523,10 @@ impl Tree {
             bootstrap(&runtime, &governor, base, &config, move || fs.metadata(&root, &RelativePath::root())).await?
         };
         let now = MonotonicTime(runtime.now().saturating_duration_since(base));
-        let mut coordinator = Coordinator::new(config.clone(), policy, caps, root_info, now, governor)?;
         let (tx, rx) = mpsc::unbounded();
+        let governor_wake = Arc::new(GovernorWake { signalled: AtomicBool::new(false), tx: tx.clone() });
+        governor.on_change(Arc::<GovernorWake>::downgrade(&governor_wake));
+        let mut coordinator = Coordinator::new(config.clone(), policy, caps, root_info, now, governor)?;
         let stream = Arc::new(Mutex::new(StreamInner {
             queue: VecDeque::new(),
             closed: false,
@@ -534,6 +558,7 @@ impl Tree {
             rx,
             shared: shared.clone(),
             sink,
+            governor_wake,
             fs: filesystem,
             runtime: runtime.clone(),
             root,
@@ -548,14 +573,7 @@ impl Tree {
             let Some(message) = actor.rx.next().await else {
                 return Err(Error::Shutdown);
             };
-            match message {
-                Message::Input(input) => {
-                    let _ = actor.handle(*input);
-                }
-                Message::WatcherReady => {
-                    let _ = actor.drain_watcher();
-                }
-            }
+            let _ = actor.dispatch(message);
         }
         if let Some(Err(err)) = actor.coordinator.open_gate() {
             return Err(err);

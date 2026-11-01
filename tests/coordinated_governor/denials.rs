@@ -49,16 +49,19 @@ fn scan_reports_a_shared_estimate_above_its_bootstrap_ceiling() {
 
 #[cfg(target_os = "linux")]
 mod quarantine {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use rustix::fs::{FlockOperation, flock};
     use tree_fucker::domain::{DeclaredProbe, LinuxProbe};
     use tree_fucker::testing::FakeOp;
     use tree_fucker::{
-        CancellationToken, Ceilings, DomainCapabilities, DomainCrossing, DomainIdentity, DomainProbe, Enrichment,
-        EnrichmentBatch, EntryInfo, FileSystem, FsCapabilities, FsError, ListingSession, ProbeResult, ScanEvent,
-        ScanFailure, StorageDomainId, WatchId, WatcherSink,
+        CancellationToken, Ceilings, DomainCapabilities, DomainCrossing, DomainIdentity, DomainKey, DomainProbe,
+        Enrichment, EnrichmentBatch, EntryInfo, FileSystem, FsCapabilities, FsError, ListingSession, ProbeResult,
+        ResourceHealth, ScanEvent, ScanFailure, StorageDomainId, WatchId, WatcherSink,
     };
 
     use super::*;
@@ -221,5 +224,98 @@ mod quarantine {
     #[test]
     fn scan_skips_shared_quarantine_between_preparation_and_start() {
         scan_with_stuck_peer(true);
+    }
+
+    fn hold_bookkeeping(root: &tempfile::TempDir) -> std::fs::File {
+        let anchor =
+            OpenOptions::new().read(true).write(true).open(root.path().join("quarantine.authority.lock")).unwrap();
+        flock(&anchor, FlockOperation::LockExclusive).unwrap();
+        anchor
+    }
+
+    fn stuck_peer() -> (tempfile::TempDir, HostGovernor, HostGovernor, Reservation, GrantId) {
+        let (root, _) = fixture();
+        let local = HostConfig { domain_foreground_burst: Duration::from_secs(1), ..host_config() };
+        let mut config = Config::from_host(&local, 8, 16, 16).unwrap();
+        config.stuck_after_ns = 1;
+        let scope = Scope::open(root.path().join("quarantine"), config).unwrap();
+        let peer = HostGovernor::with_coordination(&local, scope.clone()).unwrap();
+        let host = HostGovernor::with_coordination(&local, scope).unwrap();
+        let stuck = LinuxProbe::new().probe(Path::new("/dev/shm"), None).unwrap().identity;
+        let domain = StorageDomainId::of(stuck.key().unwrap());
+        peer.register_domain(domain, &DomainCapabilities::inline(), NOW);
+        host.register_domain(domain, &DomainCapabilities::inline(), NOW);
+        let mut held = request(&peer);
+        held.domain = Some(domain);
+        let id = held.id;
+        peer.try_admit(held, NOW).unwrap();
+        peer.try_start(id, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        let mut reservation = request(&host);
+        reservation.domain = Some(domain);
+        (root, peer, host, reservation, id)
+    }
+
+    #[test]
+    fn shared_quarantine_retry_doubles_to_its_cap_and_resets_on_admission() {
+        let (root, peer, host, reservation, held) = stuck_peer();
+        let healthy = StorageDomainId::of(&DomainKey::declared(902));
+        host.register_domain(healthy, &DomainCapabilities::inline(), NOW);
+        let mut now = NOW;
+        for delay_ms in [10, 20, 40, 80, 160, 320, 640, 1000, 1000] {
+            assert_eq!(host.try_admit(reservation.clone(), now), Err(ThrottleCause::StuckWorker));
+            let retry = now + Duration::from_millis(delay_ms);
+            assert_eq!(host.coordination_retry_at(now), Some(retry), "delay={delay_ms}ms");
+            if delay_ms == 10 {
+                let anchor = hold_bookkeeping(&root);
+                assert_eq!(
+                    host.try_admit(reservation.clone(), now),
+                    Err(ThrottleCause::StuckWorker),
+                    "a backing-off domain is refused without a shared attempt"
+                );
+                flock(&anchor, FlockOperation::Unlock).unwrap();
+                let mut other = request(&host);
+                other.domain = Some(healthy);
+                let id = other.id;
+                host.try_admit(other, now).expect("another domain proceeds during the quarantine backoff");
+                host.release(id, now);
+                assert_eq!(host.coordination_retry_at(now), Some(retry));
+            }
+            now = retry;
+        }
+        peer.release(held, NOW);
+        host.try_admit(reservation.clone(), now).unwrap();
+        host.try_start(reservation.id, now).unwrap();
+        assert_eq!(host.coordination_retry_at(now), None);
+        host.release(reservation.id, now);
+        assert_eq!(host.coordination_retry_at(now), None);
+    }
+
+    #[test]
+    fn busy_shared_denial_keeps_the_quarantine_health_report_and_delay() {
+        let (root, peer, host, reservation, held) = stuck_peer();
+        let domain = reservation.domain.unwrap();
+        let health = || {
+            let mut health = BTreeMap::from([(domain, ResourceHealth::Nominal)]);
+            host.domain_health_map(NOW, &BTreeSet::new(), &mut health);
+            health[&domain].cause()
+        };
+        let mut now = NOW;
+        for delay_ms in [10, 20, 40] {
+            assert_eq!(host.try_admit(reservation.clone(), now), Err(ThrottleCause::StuckWorker));
+            let retry = now + Duration::from_millis(delay_ms);
+            assert_eq!(host.coordination_retry_at(now), Some(retry));
+            now = retry;
+        }
+        assert_eq!(health(), Some(ThrottleCause::StuckWorker));
+        let anchor = hold_bookkeeping(&root);
+        assert_eq!(host.try_admit(reservation.clone(), now), Err(ThrottleCause::Coordination));
+        assert_eq!(host.coordination_retry_at(now), Some(now + Duration::from_millis(3)));
+        assert_eq!(health(), Some(ThrottleCause::StuckWorker));
+        flock(&anchor, FlockOperation::Unlock).unwrap();
+        now = now + Duration::from_millis(3);
+        assert_eq!(host.try_admit(reservation.clone(), now), Err(ThrottleCause::StuckWorker));
+        assert_eq!(host.coordination_retry_at(now), Some(now + Duration::from_millis(80)));
+        peer.release(held, NOW);
     }
 }

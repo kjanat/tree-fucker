@@ -359,10 +359,11 @@ fn shared_budget_denials_keep_the_longer_retry_without_spending_local_budget() {
         assert_eq!(view.charged, Duration::ZERO);
     }
     drop(prepared);
-    host.try_admit(reservation.clone(), NOW).unwrap();
-    host.try_start(reservation.id, NOW).unwrap();
-    assert_eq!(host.coordination_retry_at(NOW), None);
-    host.release(reservation.id, NOW);
+    let now = NOW + Duration::from_millis(10);
+    host.try_admit(reservation.clone(), now).unwrap();
+    host.try_start(reservation.id, now).unwrap();
+    assert_eq!(host.coordination_retry_at(now), None);
+    host.release(reservation.id, now);
 }
 
 #[test]
@@ -414,6 +415,24 @@ fn replaced_authority_fences_new_work_and_reports_failure() {
     assert_eq!(host.view(NOW).preparations, 0);
     assert_eq!(host.view(NOW).charged, Duration::ZERO);
     assert_eq!(host.try_admit(request(&host), NOW), Err(ThrottleCause::CoordinationFailed));
+}
+
+#[test]
+#[cfg(not(windows))]
+fn replaced_authority_fails_a_tree_open_waiting_for_its_root_watch() {
+    use tree_fucker::testing::{FakeFileSystem, Harness};
+    use tree_fucker::{Error, LoadAll, WatcherKind};
+    let (root, scope) = fixture();
+    let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+    std::fs::rename(root.path().join("scope"), root.path().join("old")).unwrap();
+    let opened = Harness::open_under(
+        Arc::new(FakeFileSystem::new(WatcherKind::NonRecursive)),
+        Arc::new(LoadAll),
+        tree_fucker::Config::default(),
+        host.clone(),
+    );
+    assert!(matches!(opened, Err(Error::Coordination(_))), "the open gate must fail instead of waiting forever");
+    assert_eq!(host.view(NOW).preparations, 0);
 }
 
 #[test]

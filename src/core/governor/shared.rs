@@ -7,6 +7,7 @@ use crate::coordination::protocol::{self, Work};
 
 const FIRST_RETRY: Duration = Duration::from_millis(3);
 const MAX_RETRY: Duration = Duration::from_millis(10);
+const MAX_QUARANTINE_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 struct Retry {
@@ -23,6 +24,7 @@ enum Ownership {
 struct State {
     entries: BTreeMap<GrantId, Ownership>,
     domains: BTreeMap<StorageDomainId, DomainId>,
+    quarantined: BTreeMap<StorageDomainId, Retry>,
     failure: Option<String>,
     retry: Option<Retry>,
 }
@@ -35,8 +37,19 @@ pub(super) struct Binding {
 }
 
 impl State {
-    fn deny(&mut self, error: native::Error, now: MonotonicTime) -> ThrottleCause {
-        match error {
+    fn refusal(&self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Option<ThrottleCause> {
+        if self.retry.is_some_and(|retry| retry.at > now) {
+            return Some(ThrottleCause::Coordination);
+        }
+        match domain.and_then(|domain| self.quarantined.get(&domain)) {
+            Some(retry) if retry.at > now => Some(ThrottleCause::StuckWorker),
+            _ => None,
+        }
+    }
+
+    fn deny(&mut self, error: native::Error, domain: Option<StorageDomainId>, now: MonotonicTime) -> ThrottleCause {
+        let busy = matches!(error, native::Error::Busy);
+        let cause = match error {
             native::Error::Busy
             | native::Error::Authority(
                 authority::Error::DomainPhysical | authority::Error::Protocol(protocol::Error::PhysicalCapacity),
@@ -50,7 +63,14 @@ impl State {
             }
             native::Error::Authority(authority::Error::Quarantined) => {
                 self.retry = None;
-                ThrottleCause::StuckWorker
+                if let Some(domain) = domain {
+                    let delay = self
+                        .quarantined
+                        .get(&domain)
+                        .map_or(MAX_RETRY, |retry| retry.delay.saturating_mul(2).min(MAX_QUARANTINE_RETRY));
+                    self.quarantined.insert(domain, Retry { at: now + delay, delay });
+                }
+                return ThrottleCause::StuckWorker;
             }
             native::Error::Authority(authority::Error::Ceiling { minimum_ns }) => {
                 self.retry = None;
@@ -65,6 +85,19 @@ impl State {
                 self.failure.get_or_insert_with(|| error.to_string());
                 ThrottleCause::CoordinationFailed
             }
+        };
+        if let Some(domain) = domain
+            && !busy
+        {
+            self.quarantined.remove(&domain);
+        }
+        cause
+    }
+
+    fn admitted(&mut self, domain: Option<StorageDomainId>) {
+        self.retry = None;
+        if let Some(domain) = domain {
+            self.quarantined.remove(&domain);
         }
     }
 }
@@ -101,6 +134,9 @@ impl Binding {
         let mut state = self.lock()?;
         if state.failure.is_some() {
             return Err(ThrottleCause::CoordinationFailed);
+        }
+        if let Some(cause) = state.refusal(reservation.domain, now) {
+            return Err(cause);
         }
         let id = reservation.id;
         let local = guard(&host.inner).try_prepare(reservation.clone(), now)?;
@@ -158,13 +194,13 @@ impl Binding {
                 );
                 let admitted = local.admitted;
                 state.entries.insert(id, Ownership::Prepared(prepared));
-                state.retry = None;
+                state.admitted(reservation.domain);
                 Ok(admitted)
             }
             Err(error) => {
                 guard(&host.inner).prepared.remove(&id);
                 host.changed();
-                Err(state.deny(error, now))
+                Err(state.deny(error, reservation.domain, now))
             }
         }
     }
@@ -173,6 +209,16 @@ impl Binding {
         let mut state = self.lock()?;
         if state.failure.is_some() {
             return Err(ThrottleCause::CoordinationFailed);
+        }
+        let domain = match state.entries.get(&id) {
+            None => return Err(ThrottleCause::Concurrency),
+            Some(Ownership::Physical(_)) => return Ok(()),
+            Some(Ownership::Prepared(_)) => {
+                guard(&host.inner).prepared.get(&id).expect("local preparation").reservation.domain
+            }
+        };
+        if let Some(cause) = state.refusal(domain, now) {
+            return Err(cause);
         }
         let Some(ownership) = state.entries.get_mut(&id) else {
             return Err(ThrottleCause::Concurrency);
@@ -228,10 +274,10 @@ impl Binding {
                 governor.record_admission(local.reservation, local.admitted, now);
                 governor.start(id, now);
                 *ownership = Ownership::Physical(physical);
-                state.retry = None;
+                state.admitted(domain);
                 Ok(())
             }
-            Err(error) => Err(state.deny(error, now)),
+            Err(error) => Err(state.deny(error, domain, now)),
         }
     }
 
@@ -248,6 +294,7 @@ impl Binding {
         let stuck = governor.grants.get(&id).is_some_and(|grant| grant.stuck);
         let failed = stuck || governor.grants.get(&id).is_some_and(|grant| grant.failed);
         let operations = governor.grants.get(&id).map_or(0, |grant| grant.performed.unwrap_or(grant.required));
+        let domain = governor.grants.get(&id).and_then(|grant| grant.domain);
         governor.prepared.remove(&id);
         governor.release(id, now);
         drop(governor);
@@ -255,7 +302,7 @@ impl Binding {
         match ownership {
             Some(Ownership::Physical(physical)) => {
                 if let Err(error) = physical.finish(operations, failed) {
-                    self.state.lock().unwrap_or_else(|error| error.into_inner()).deny(error, now);
+                    self.state.lock().unwrap_or_else(|error| error.into_inner()).deny(error, domain, now);
                 }
             }
             other => drop(other),
@@ -274,22 +321,31 @@ impl Binding {
         }
     }
 
+    pub(super) fn quarantined(&self) -> BTreeSet<StorageDomainId> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).quarantined.keys().copied().collect()
+    }
+
     pub(super) fn retry_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
         match self.lock() {
-            Ok(state)
-                if state.failure.is_none()
-                    && (state.retry.is_some()
-                        || state.entries.values().any(|entry| matches!(entry, Ownership::Prepared(_)))) =>
-            {
+            Ok(state) if state.failure.is_none() => {
                 // If local constraints prevented a retry at the old deadline,
                 // retain the backoff instead of scheduling an expired hint in
                 // a tight loop. Reading a future deadline never postpones it.
-                Some(state.retry.map_or(
-                    now + FIRST_RETRY,
-                    |retry| {
-                        if retry.at > now { retry.at } else { now + retry.delay }
-                    },
-                ))
+                let global = (state.retry.is_some()
+                    || state.entries.values().any(|entry| matches!(entry, Ownership::Prepared(_))))
+                .then(|| {
+                    state.retry.map_or(
+                        now + FIRST_RETRY,
+                        |retry| {
+                            if retry.at > now { retry.at } else { now + retry.delay }
+                        },
+                    )
+                });
+                let quarantined = state.quarantined.values().map(|retry| retry.at).filter(|at| *at > now).min();
+                match (global, quarantined) {
+                    (Some(global), Some(quarantined)) => Some(global.min(quarantined)),
+                    (global, quarantined) => global.or(quarantined),
+                }
             }
             Err(ThrottleCause::Coordination) => Some(now + FIRST_RETRY),
             _ => None,

@@ -374,8 +374,9 @@ Abstract
 
    Coordinator
       Owns mutable synchronization state. It receives commands, watcher
-      hints, timer notifications, and completed filesystem jobs. It is
-      the only component allowed to publish a new snapshot.
+      hints, timer notifications, and completed filesystem jobs. A tree
+      wakes when its process governor changes. It is the only component
+      allowed to publish a new snapshot.
 
    Snapshot store
       Holds the current immutable snapshot and its monotonically
@@ -2214,12 +2215,16 @@ Abstract
    quarantined domain is resolved Unsatisfied when the cursor reaches
    it, so the round can end and healthy domains keep receiving baseline
    coverage. Jobs already admitted on the quarantined domain that have
-   not started are cancelled so the closed batch can complete. The
-   round result for a quarantined obligation is Degraded; the quarantine
-   adds no path to the degraded set, and the domain's resource state
-   names StuckWorker as the cause. A dead mount therefore costs exactly
-   the workers that were already inside it when it died, never more, and
-   degrades one domain instead of exhausting the host's blocking pool.
+   not started are cancelled so the closed batch can complete, and so
+   is a suspended listing session whose next lease the quarantine
+   denies. Cancellation leaves attached commands open. Each cancelled
+   read is requested again and is admitted once the quarantine lifts.
+   The round result for a quarantined obligation is Degraded; the
+   quarantine adds no path to the degraded set, and the domain's
+   resource state names StuckWorker as the cause. A dead mount therefore
+   costs exactly the workers that were already inside it when it died,
+   never more, and degrades one domain instead of exhausting the host's
+   blocking pool.
 
 13.6.  Capacity Exhaustion
 
@@ -2595,8 +2600,9 @@ Abstract
    window and in the global in-flight limit and still counts against the
    memory ceiling. Exhausting the foreground allowance queues the
    command's reads; it neither fails the command nor borrows from the
-   background buckets. Section 9 places no wall-clock bound on command
-   completion.
+   background buckets. A dispatch cycle that finds one allowance
+   exhausted still admits, in that cycle, the work the other allowance
+   affords. Section 9 places no wall-clock bound on command completion.
 
    Each command additionally has a ceiling on the worker time its reads
    may be admitted with. The ceiling bounds admission: once the cost

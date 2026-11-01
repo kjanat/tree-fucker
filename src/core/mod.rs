@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) use apply::requires_crossing_decision;
+pub(crate) use governor::ChangeWaker;
 pub use governor::{
     AdmissionDecision, Admitted, DomainAccount, DomainView, GovernorView, Grant, GrantId, HostGovernor,
     HostGovernorError, LatencySummary, PreparedAdmission, Reported, Reservation, TreeNumber, host_governor,
@@ -1366,13 +1367,21 @@ impl Coordinator {
         self.declare_stuck_workers();
         self.start_releases();
         if self.is_stopped() {
+            let mut wake = None;
             if !self.pending_releases.is_empty() && self.governor.coordination_error().is_none() {
-                let at = self.governor.coordination_retry_at(now).unwrap_or(now + self.config.minimum_period);
-                if self.timer_wake != Some(at) {
-                    self.timer_wake = Some(at);
-                    self.timer_id = self.timer_id.next();
-                    self.outputs.push(Output::SetTimer { id: self.timer_id, at });
-                }
+                wake = Some(self.governor.coordination_retry_at(now).unwrap_or(now + self.config.minimum_period));
+            }
+            if !self.blocking_slots.is_empty()
+                && let Some(deadline) = self.governor.next_stuck_deadline()
+            {
+                wake = Some(wake.map_or(deadline, |at| at.min(deadline)));
+            }
+            if let Some(at) = wake
+                && self.timer_wake != Some(at)
+            {
+                self.timer_wake = Some(at);
+                self.timer_id = self.timer_id.next();
+                self.outputs.push(Output::SetTimer { id: self.timer_id, at });
             }
             return;
         }
@@ -1384,6 +1393,9 @@ impl Coordinator {
         self.resume_sessions();
         self.start_queued();
         if let Some(error) = self.governor.coordination_error() {
+            if self.open_gate == OpenGate::Pending {
+                self.open_gate = OpenGate::Failed(Error::Coordination(error.clone()));
+            }
             let commands: Vec<_> = self.commands.keys().copied().collect();
             for id in commands {
                 self.finish_command(id, Err(Error::Coordination(error.clone())));
@@ -1909,7 +1921,7 @@ impl Coordinator {
                 None => t,
             });
         };
-        let (resume, stuck_deadline) = self.governor.timer_hints(self.now);
+        let (resume, background_resume, stuck_deadline) = self.governor.timer_hints(self.now);
         let waiting_for_work = self.baseline_due
             || !self.pending.is_empty()
             || !self.pending_enrichment.is_empty()
@@ -1920,7 +1932,7 @@ impl Coordinator {
             consider(at);
         }
         if !self.baseline_due && self.batch.is_none() {
-            let due = match self.next_admissible(resume) {
+            let due = match self.next_admissible(background_resume) {
                 Some(at) => self.periodic_due.max(at),
                 None => self.periodic_due.min(self.now + self.config.maximum_period),
             };

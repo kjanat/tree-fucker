@@ -10,15 +10,19 @@ mod storage;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use clock::Clock;
 use handles::{Bookkeeping, Identity, directory_identity, identity};
 use security::Principal;
-use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+use windows_sys::Win32::Foundation::{ERROR_NO_TOKEN, ERROR_SHARING_VIOLATION};
+use windows_sys::Win32::Security::{TOKEN_IMPERSONATE, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken, SetThreadToken};
 
 use super::authority::{self, Authority, Config, View};
 pub(crate) use super::client::Physical;
@@ -344,6 +348,38 @@ impl Scope {
 
 fn lock_error(error: io::Error) -> Error {
     if error.kind() == io::ErrorKind::WouldBlock { Error::Busy } else { error.into() }
+}
+
+pub(crate) struct Caller(Option<OwnedHandle>);
+
+impl Caller {
+    pub(crate) fn current() -> io::Result<Self> {
+        let mut token = null_mut();
+        // SAFETY: the pseudo-handle refers to this thread; success transfers
+        // a real token handle to OwnedHandle.
+        unsafe {
+            if OpenThreadToken(GetCurrentThread(), TOKEN_IMPERSONATE | TOKEN_QUERY, 1, &mut token) == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_TOKEN as i32) {
+                    return Ok(Self(None));
+                }
+                return Err(error);
+            }
+            Ok(Self(Some(OwnedHandle::from_raw_handle(token))))
+        }
+    }
+
+    pub(crate) fn enter(&self) -> io::Result<()> {
+        let Some(token) = &self.0 else {
+            return Ok(());
+        };
+        // SetThreadToken assigns the token object itself and keeps its TokenId.
+        // SAFETY: null selects the current thread; the token handle is live.
+        if unsafe { SetThreadToken(null(), token.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Scope {
