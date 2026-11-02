@@ -674,6 +674,23 @@ impl Scan {
         }
         self.stats.grants += 1;
         let held = Held { id, governor: self.governor.clone(), clock: self.clock.clone(), base: self.base };
+        let started = self.start_prepared(id, need.domain);
+        if !matches!(started, Ok(None)) {
+            // Refund only a still-reversible hold. Already committed local
+            // admissions and physical work remain charged.
+            let refund = self.governor.prepared_cost_of(id);
+            self.stats.admitted -= refund;
+            if id.tree().is_none() {
+                self.bootstrap_charged -= refund;
+            }
+        }
+        match started? {
+            Some(domain) => Ok(Admission::Quarantined(domain)),
+            None => Ok(Admission::Granted(Granted { held, operations: admitted.operations })),
+        }
+    }
+
+    fn start_prepared(&mut self, id: GrantId, domain: Option<StorageDomainId>) -> Result<Option<StorageDomainId>> {
         loop {
             self.check_cancelled()?;
             if let Some(error) = self.governor.coordination_error() {
@@ -690,18 +707,17 @@ impl Scan {
                     return Err(self.ceiling_reached());
                 }
             }
-            if let Some(domain) = need.domain
+            if let Some(domain) = domain
                 && self.governor.quarantined(Some(domain))
             {
-                return Ok(Admission::Quarantined(domain));
+                return Ok(Some(domain));
             }
-            match (self.governor.try_start(id, now), need.domain) {
-                (Ok(()), _) => break,
-                (Err(ThrottleCause::StuckWorker), Some(domain)) => return Ok(Admission::Quarantined(domain)),
+            match (self.governor.try_start(id, now), domain) {
+                (Ok(()), _) => return Ok(None),
+                (Err(ThrottleCause::StuckWorker), Some(domain)) => return Ok(Some(domain)),
                 (Err(_), _) => self.wait(seen, now),
             }
         }
-        Ok(Admission::Granted(Granted { held, operations: admitted.operations }))
     }
 
     fn alone_over_memory(&self, domain: Option<StorageDomainId>, listing: bool) -> bool {

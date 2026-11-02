@@ -70,6 +70,7 @@ mod quarantine {
         host: HostGovernor,
         armed: Arc<AtomicBool>,
         peer: Mutex<Option<(HostGovernor, GrantId)>>,
+        at: Mutex<Instant>,
     }
 
     impl Clock for StartOnPreparation {
@@ -80,7 +81,7 @@ mod quarantine {
             {
                 peer.try_start(id, NOW).unwrap();
             }
-            Instant::now()
+            *self.at.lock().unwrap()
         }
         fn sleep(&self, duration: Duration) {
             NoWait.sleep(duration);
@@ -184,21 +185,22 @@ mod quarantine {
         inner.report_inline_domains(false);
         let armed = Arc::new(AtomicBool::new(false));
         let fs = Arc::new(Domains { inner: inner.clone(), healthy, stuck, armed: armed.clone() });
-        let clock: Arc<dyn Clock> = if at_start {
-            Arc::new(StartOnPreparation { host: host.clone(), armed, peer: Mutex::new(Some((peer.clone(), id))) })
-        } else {
-            Arc::new(NoWait)
-        };
-        let scan = Scan::open_outside_host_governor(
+        let clock = Arc::new(StartOnPreparation {
+            host: host.clone(),
+            armed,
+            peer: Mutex::new(at_start.then(|| (peer.clone(), id))),
+            at: Mutex::new(Instant::now()),
+        });
+        let mut scan = Scan::open_outside_host_governor(
             fs,
             inner.root().to_path_buf(),
             Arc::new(LoadAll),
-            ScanOptions { crossing: DomainCrossing::Follow, ceiling: Duration::MAX, ..ScanOptions::default() },
+            ScanOptions { crossing: DomainCrossing::Follow, ceiling: Duration::from_secs(1), ..ScanOptions::default() },
             host.clone(),
             clock,
         )
         .unwrap();
-        let events: Vec<_> = scan.map(Result::unwrap).collect();
+        let events: Vec<_> = scan.by_ref().map(Result::unwrap).collect();
         assert!(events.iter().any(|event| matches!(event,
             ScanEvent::Unlisted { path, failure: ScanFailure::Quarantined(id) } if path.to_string() == "bad" && *id == domain
         )), "{events:?}");
@@ -210,6 +212,7 @@ mod quarantine {
         assert_eq!(inner.count_ops(FakeOp::ReadDir, "bad"), 0);
         assert!(!host.quarantined(Some(domain)), "quarantine belongs to the other participant");
         assert_eq!(host.view(NOW).preparations, 0);
+        assert_eq!(scan.stats().admitted, host.view(NOW).charged, "only authorized work spends the Scan ceiling");
         let shared = scope.view().unwrap();
         assert_eq!((shared.prepared, shared.physical), (0, 1));
         peer.release(id, NOW);
@@ -224,6 +227,57 @@ mod quarantine {
     #[test]
     fn scan_skips_shared_quarantine_between_preparation_and_start() {
         scan_with_stuck_peer(true);
+    }
+
+    #[test]
+    fn repeated_lazy_read_start_quarantine_spends_no_scan_allowance() {
+        let (root, _) = fixture();
+        let local = host_config();
+        let mut config = Config::from_host(&local, 8, 16, 16).unwrap();
+        config.stuck_after_ns = 1;
+        let scope = Scope::open(root.path().join("lazy-quarantine"), config).unwrap();
+        let host = HostGovernor::with_coordination(&local, scope.clone()).unwrap();
+        let peer = HostGovernor::with_coordination(&local, scope.clone()).unwrap();
+        let inner = Arc::new(FakeFileSystem::new(WatcherKind::None));
+        inner.report_inline_domains(false);
+        let healthy = LinuxProbe::new().probe(Path::new("/"), None).unwrap().identity;
+        let stuck = LinuxProbe::new().probe(Path::new("/dev/shm"), None).unwrap().identity;
+        let armed = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(StartOnPreparation {
+            host: host.clone(),
+            armed: armed.clone(),
+            peer: Mutex::new(None),
+            at: Mutex::new(Instant::now()),
+        });
+        let mut scan = Scan::open_outside_host_governor(
+            Arc::new(Domains { inner: inner.clone(), healthy, stuck, armed: armed.clone() }),
+            inner.root().to_path_buf(),
+            Arc::new(LoadAll),
+            ScanOptions { ceiling: Duration::from_secs(1), ..ScanOptions::default() },
+            host.clone(),
+            clock.clone(),
+        )
+        .unwrap();
+        let ScanEvent::Entry(entry) = scan.next().unwrap().unwrap() else { panic!("root entry") };
+        peer.register_domain(entry.domain, &DomainCapabilities::inline(), NOW);
+        let charged = scan.stats().admitted;
+        for _ in 0..3 {
+            let reservation = Reservation { domain: Some(entry.domain), ..request(&peer) };
+            let id = reservation.id;
+            peer.try_admit(reservation, NOW).unwrap();
+            *clock.peer.lock().unwrap() = Some((peer.clone(), id));
+            armed.store(true, Ordering::SeqCst);
+            let result = scan.read(&entry, |_| -> Result<(), FsError> { panic!("quarantined read started") });
+            assert!(matches!(result, Err(Error::Stuck)), "{result:?}");
+            assert!(clock.peer.lock().unwrap().is_none(), "peer must start after preparation");
+            assert_eq!(scan.stats().admitted, charged, "an unstarted read cannot spend the Scan ceiling");
+            assert_eq!(host.view(NOW).preparations, 0);
+            peer.release(id, NOW);
+            *clock.at.lock().unwrap() += Duration::from_secs(1);
+        }
+        scan.read(&entry, |_| Ok(())).expect("settled quarantine leaves the original read allowance available");
+        assert_eq!(scan.stats().metadata_operations, 1);
+        assert!(scan.stats().admitted > charged, "physically authorized work still spends allowance");
     }
 
     fn hold_bookkeeping(root: &tempfile::TempDir) -> std::fs::File {

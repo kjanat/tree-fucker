@@ -1985,7 +1985,7 @@ impl HostGovernor {
         guard(&self.inner).overshoot_of(id)
     }
 
-    pub(super) fn prepared_cost_of(&self, id: GrantId) -> Duration {
+    pub(crate) fn prepared_cost_of(&self, id: GrantId) -> Duration {
         guard(&self.inner).prepared.get(&id).map(|held| held.admitted.cost).unwrap_or_default()
     }
 
