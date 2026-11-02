@@ -125,9 +125,11 @@ impl Directory {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(root)?;
+        // Reject unsupported storage before requesting FileIdInfo, which
+        // FAT volumes cannot provide.
+        super::storage::validate(&file)?;
         super::handles::directory_identity(&file)?;
         let mut ancestors = Vec::new();
-        super::storage::validate(&file)?;
         for part in parts {
             let Component::Normal(name) = part else {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "coordination path contains traversal"));

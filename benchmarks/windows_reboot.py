@@ -291,8 +291,17 @@ def main() -> None:
         or outcome.get("phase") != "windows_after_reboot"
         or outcome.get("sessions", {}).get("status") != "passed"
     ):
+        diagnostics = [
+            str(outcome.get("error", "Missing successful guest result")),
+            str(outcome.get("stack", "")),
+            str(outcome.get("stderr", "")),
+        ]
+        for name, contents in outcome.get("sessionLogs", {}).items():
+            if name.endswith(".stderr.log") and contents.strip():
+                diagnostics.append(f"{name}:\n{contents}")
         raise RuntimeError(
-            f"Windows reboot acceptance failed; see {root / 'result.json'}"
+            f"Windows reboot acceptance failed; see {root / 'result.json'}\n"
+            + redacted("\n".join(diagnostics))
         )
     print(
         "Windows reboot and real user sessions: retained accounting, ownership, UAC and principal isolation verified"

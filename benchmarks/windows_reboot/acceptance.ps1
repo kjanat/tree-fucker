@@ -4,8 +4,8 @@ New-Item -ItemType Directory -Path $env:TF_POWER_ROOT -Force | Out-Null
 $phase = if (Test-Path "$env:TF_POWER_ROOT\ready") { 'windows_after_reboot' } else { 'windows_before_reboot' }
 $log = "$env:TF_POWER_ROOT\$phase.log"
 try {
-	& C:\OEM\coordination_power.exe --exact $phase --ignored --nocapture *> $log
-	if ($LASTEXITCODE -ne 0) { throw "Fixture exited $LASTEXITCODE" }
+	$fixture = Start-Process -FilePath C:\OEM\coordination_power.exe -ArgumentList @('--exact', $phase, '--ignored', '--nocapture') -NoNewWindow -Wait -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.stderr.log"
+	if ($fixture.ExitCode -ne 0) { throw "Fixture exited $($fixture.ExitCode)" }
 	if ($phase -ne 'windows_after_reboot' -or !(Test-Path "$env:TF_POWER_ROOT\verified")) { throw 'Missing post-reboot verification' }
 	$sessions = & C:\OEM\sessions.ps1
 	if ($sessions.status -ne 'passed') { throw 'Missing real-session verification' }
@@ -16,6 +16,7 @@ try {
 catch {
 	$result = @{ status = 'failed'; phase = $phase; error = $_.ToString(); stack = $_.ScriptStackTrace }
 	if (Test-Path $log) { $result.log = [System.IO.File]::ReadAllText($log) }
+	if (Test-Path "$log.stderr.log") { $result.stderr = [System.IO.File]::ReadAllText("$log.stderr.log") }
 	if (Test-Path 'C:\coordination-sessions') {
 		$result.sessionLogs = @{}
 		foreach ($sessionLog in Get-ChildItem 'C:\coordination-sessions\*.log') {

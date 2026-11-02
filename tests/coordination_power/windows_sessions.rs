@@ -114,10 +114,11 @@ fn interactive_session_fixture() {
     if mode == "denied" {
         let options = Options { scope: rendezvous, limits: limits() };
         let automatic = HostGovernor::configured(&HostConfig::default(), Mode::Auto(options.clone())).unwrap();
-        assert!(matches!(
-            automatic.coordination_status().state,
-            State::Fallback { reason: coordination::Error::Unavailable(_) }
-        ));
+        let state = automatic.coordination_status().state;
+        assert!(
+            matches!(state, State::Fallback { reason: coordination::Error::Unavailable(_) }),
+            "unsupported storage did not fall back: {state:?}"
+        );
         assert!(matches!(
             HostGovernor::configured(&HostConfig::default(), Mode::Required(options)),
             Err(HostGovernorError::Coordination(coordination::Error::Unavailable(_)))

@@ -26,7 +26,8 @@ if ($Mode -eq 'appcontainer') {
 	Add-Type -Path C:\OEM\session-native.cs
 	exit ([SessionNative]::RunContainer("$env:TF_SESSION_ROOT\$Name.log"))
 }
-& C:\OEM\coordination_power.exe --exact windows_sessions::interactive_session_fixture --ignored --nocapture *> "$env:TF_SESSION_ROOT\$Name.log"
-$result = $LASTEXITCODE
+# Native stderr must bypass PowerShell 5.1's terminating NativeCommandError.
+$fixture = Start-Process -FilePath C:\OEM\coordination_power.exe -ArgumentList @('--exact', 'windows_sessions::interactive_session_fixture', '--ignored', '--nocapture') -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:TF_SESSION_ROOT\$Name.log" -RedirectStandardError "$env:TF_SESSION_ROOT\$Name.stderr.log"
+$result = $fixture.ExitCode
 if ($Scope -eq 'mapped') { Remove-PSDrive -Name Z -Force }
 exit $result
