@@ -1,7 +1,9 @@
 //! [tree-fucker] maintains an immutable, diffable representation of a
-//! filesystem tree, specified by [`rfc/tree-fucker.txt`][RFC].
+//! filesystem tree, specified by [the tree-fucker RFC][RFC]
+//! ([plain text][RFC-TXT]).
 //!
-//! [RFC]: https://tree-fucker.kjanat.dev/tree-fucker.txt
+//! [RFC]: https://tree-fucker.kjanat.dev/
+//! [RFC-TXT]: https://tree-fucker.kjanat.dev/tree-fucker.txt
 //! [tree-fucker]: https://github.com/kjanat/tree-fucker
 #![doc(
     html_logo_url = "https://tree-fucker.kjanat.dev/fucker/stickfigure.svg",
