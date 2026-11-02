@@ -171,6 +171,98 @@ mod tests {
         Journal::open(OpenOptions::new().read(true).write(true).open(path.join(STATE)).unwrap()).unwrap()
     }
 
+    fn mark_preparing(directory: &Path) {
+        let mut anchor = OpenOptions::new().write(true).open(directory.join("coordination.authority.lock")).unwrap();
+        anchor.seek(SeekFrom::Start(12)).unwrap();
+        anchor.write_all(&[PREPARING]).unwrap();
+    }
+
+    #[test]
+    fn partial_anchors_never_replace_retained_accounting() {
+        for length in [1, HEADER as u64 / 2, HEADER as u64 - 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("coordination");
+            let config = Config::from_host(&HostConfig::default(), 4, 8, 4).unwrap();
+            drop(Scope::open(&path, config).unwrap());
+            let anchor_path = directory.path().join("coordination.authority.lock");
+            File::options().write(true).open(&anchor_path).unwrap().set_len(length).unwrap();
+            let anchor = std::fs::read(&anchor_path).unwrap();
+            let state = std::fs::read(path.join(STATE)).unwrap();
+            for _ in 0..2 {
+                assert!(matches!(Scope::open(&path, config), Err(Error::Replaced)));
+                assert_eq!(std::fs::read(&anchor_path).unwrap(), anchor);
+                assert_eq!(std::fs::read(path.join(STATE)).unwrap(), state);
+            }
+        }
+    }
+
+    #[test]
+    fn only_unpublished_windows_initialization_can_be_reinitialized() {
+        for empty_slots in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("coordination");
+            let config = Config::from_host(&HostConfig::default(), 4, 8, 4).unwrap();
+            let scope = Scope::open(&path, config).unwrap();
+            let generation = scope.generation;
+            drop(scope);
+            mark_preparing(directory.path());
+            let mut state = File::options().read(true).write(true).open(path.join(STATE)).unwrap();
+            let original_id = identity(&state).unwrap();
+            if empty_slots {
+                let length = state.metadata().unwrap().len();
+                state.seek(SeekFrom::Start(journal::HEADER)).unwrap();
+                state.write_all(&vec![0; (length - journal::HEADER) as usize]).unwrap();
+            } else {
+                state.set_len(35).unwrap();
+            }
+            drop(state);
+            let reopened = Scope::open(&path, config).unwrap();
+            assert_eq!(reopened.generation, generation);
+            assert_eq!(reopened.view().unwrap().charged_ns, 0);
+            assert_eq!(identity(&File::open(path.join(STATE)).unwrap()).unwrap(), original_id);
+            drop(reopened);
+            assert_eq!(std::fs::read(directory.path().join("coordination.authority.lock")).unwrap()[12], READY);
+
+            // Once READY was published, a short journal is corruption rather
+            // than permission to initialize a fresh account.
+            File::options().write(true).open(path.join(STATE)).unwrap().set_len(35).unwrap();
+            let retained = std::fs::read(path.join(STATE)).unwrap();
+            assert!(matches!(Scope::open(&path, config), Err(Error::Journal(_))));
+            assert_eq!(std::fs::read(path.join(STATE)).unwrap(), retained);
+        }
+    }
+
+    #[test]
+    fn preparing_windows_anchor_keeps_a_committed_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordination");
+        let config = Config::from_host(&HostConfig::default(), 4, 8, 4).unwrap();
+        let scope = Scope::open(&path, config).unwrap();
+        let generation = scope.generation;
+        let client = scope.join().unwrap();
+        client
+            .prepare(Request {
+                work: Work::LazyRead,
+                origin: Origin::Foreground,
+                domain: None,
+                required: 1,
+                desired: 0,
+                ceiling_ns: u64::MAX,
+            })
+            .unwrap()
+            .try_run(|_| Completion { value: (), operations: 1, failed: true })
+            .unwrap();
+        let before = scope.view().unwrap();
+        assert!(before.charged_ns > 0);
+        assert!(before.surcharged_ns > 0);
+        drop((client, scope));
+        mark_preparing(directory.path());
+        let reopened = Scope::open(&path, config).unwrap();
+        assert_eq!(reopened.generation, generation);
+        let after = reopened.view().unwrap();
+        assert_eq!((after.charged_ns, after.surcharged_ns), (before.charged_ns, before.surcharged_ns));
+    }
+
     #[test]
     fn retained_authority_reopens_after_a_boot_epoch_change_without_resetting_debt() {
         let directory = tempfile::tempdir().unwrap();

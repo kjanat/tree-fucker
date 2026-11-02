@@ -1,6 +1,9 @@
 //! Windows authority primitives, exercised through independent processes.
 #![cfg(windows)]
 
+#[path = "coordination_windows/context.rs"]
+mod context;
+
 #[path = "../src/coordination/clock_binding.rs"]
 mod clock_binding;
 #[path = "../src/coordination/windows/handles.rs"]

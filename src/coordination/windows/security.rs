@@ -510,7 +510,7 @@ mod tests {
             let descriptor = Descriptor::parse(&format!("O:{}{dacl}", principal.sid)).unwrap();
             assert!(
                 matches!(descriptor.validate(&principal, false), Err(error) if error.kind() == io::ErrorKind::InvalidData),
-                "a non-private DACL must fail without permitting unavailable-mode fallback: {dacl}"
+                "an opened object's non-private DACL must fail descriptor validation: {dacl}"
             );
         }
         let wrong_owner = Descriptor::parse(&format!("O:WDD:P(A;;FA;;;{})", principal.sid)).unwrap();

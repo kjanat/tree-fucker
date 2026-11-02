@@ -42,17 +42,19 @@ fn unavailable_native_backend_has_explicit_required_and_auto_outcomes() {
     ));
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
 mod native {
     use coordination_support::native::Scope;
 
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, Options) {
-        let root = tempfile::Builder::new()
-            .prefix("tree-fucker-policy-")
-            .tempdir_in(coordination_support::RENDEZVOUS)
-            .unwrap();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("tree-fucker-policy-");
+        #[cfg(windows)]
+        let root = builder.tempdir().unwrap();
+        #[cfg(not(windows))]
+        let root = builder.tempdir_in(coordination_support::RENDEZVOUS).unwrap();
         let options = Options { scope: Rendezvous::Directory(root.path().join("scope")), ..options() };
         (root, options)
     }
@@ -75,6 +77,7 @@ mod native {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn auto_keeps_the_shared_identity_after_a_postjoin_failure() {
         use tree_fucker::core::{GrantId, MonotonicTime, Reservation, WorkOrigin};
         let (root, options) = fixture();
@@ -111,7 +114,6 @@ mod native {
     fn busy_incompatible_full_and_corrupt_authorities_do_not_enable_auto_fallback() {
         use std::io::{Seek, SeekFrom, Write};
 
-        use rustix::fs::{FlockOperation, flock};
         let (root, mut options) = fixture();
         options.limits.ownership.participants = 1;
         let scope = Scope::open(root.path().join("scope"), options.limits).unwrap();
@@ -122,12 +124,12 @@ mod native {
         ));
         let lock =
             std::fs::OpenOptions::new().read(true).write(true).open(root.path().join("scope.authority.lock")).unwrap();
-        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        lock.lock().unwrap();
         assert!(matches!(
             HostGovernor::configured(&HostConfig::default(), Mode::Auto(options.clone())),
             Err(HostGovernorError::Coordination(coordination::Error::Busy))
         ));
-        flock(&lock, FlockOperation::Unlock).unwrap();
+        lock.unlock().unwrap();
         let mut incompatible = options.clone();
         incompatible.limits.domains += 1;
         assert!(matches!(
@@ -144,7 +146,20 @@ mod native {
             Err(HostGovernorError::Coordination(coordination::Error::Failed(_)))
         ));
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn unc_rendezvous_paths_are_rejected_without_auto_fallback() {
+        let mut options = options();
+        options.scope = Rendezvous::Directory(r"\\localhost\share\scope".into());
+        for mode in [Mode::Auto(options.clone()), Mode::Required(options)] {
+            assert!(matches!(
+                HostGovernor::configured(&HostConfig::default(), mode),
+                Err(HostGovernorError::Coordination(coordination::Error::Failed(_)))
+            ));
+        }
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
 mod coordination_support;

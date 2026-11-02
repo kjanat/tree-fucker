@@ -110,6 +110,12 @@ fn counts(root: &Path, change: i64) -> (u64, u64) {
 fn held_read(root: &Path, index: usize) {
     let (current, _) = counts(root, 1);
     assert!(current <= 2, "more than two filesystem callbacks physically dispatched");
+    #[cfg(windows)]
+    {
+        // SAFETY: obtains the calling fixture thread's identifier only.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        fs::write(root.join(format!("thread-{index}")), thread.to_string()).unwrap();
+    }
     fs::write(root.join(format!("started-{index}")), []).unwrap();
     // Stdio::piped gives each independently launched child a kernel pipe.
     // This read remains blocked in read(2)/ReadFile until the parent writes.
@@ -403,6 +409,164 @@ fn twenty_independent_processes_hold_at_most_two_filesystem_calls() {
 }
 
 #[test]
+fn recovery_preserves_a_reused_live_slot_and_join_respects_bookkeeping() {
+    let root = fixture_root();
+    let scope = retry(|| Scope::open(root.path().join("scope"), config()));
+    let first = retry(|| scope.join());
+    let old = first.participant();
+    drop(first);
+    // Closing the owner releases its lifetime handle. Recovery removes the
+    // ledger entry only when the bounded cursor next visits that slot.
+    for _ in 0..4 {
+        retry(|| scope.view());
+    }
+    assert_eq!(retry(|| scope.view()).participants, 0);
+    let second = retry(|| scope.join());
+    let current = second.participant();
+    assert_eq!(current.slot, old.slot);
+    assert!(current.incarnation > old.incarnation);
+    let observer = retry(|| Scope::open(root.path().join("scope"), config()));
+    let anchor = OpenOptions::new().read(true).write(true).open(root.path().join("scope.authority.lock")).unwrap();
+    anchor.lock().unwrap();
+    assert!(matches!(scope.join(), Err(Error::Busy)));
+    assert!(matches!(observer.join(), Err(Error::Busy)));
+    drop(anchor);
+    // Each observer visits the complete 32-slot table twice while the reused
+    // owner remains alive. Its old incarnation must never be reclaimed again.
+    for _ in 0..8 {
+        for observer in [&scope, &observer] {
+            let view = retry(|| observer.view());
+            assert_eq!((view.participants, view.physical, view.prepared), (1, 0, 0));
+            assert_eq!((view.charged_ns, view.surcharged_ns), (0, 0));
+        }
+    }
+}
+
+#[test]
+fn removing_the_anchor_cannot_reset_retained_accounting() {
+    let root = fixture_root();
+    let path = root.path().join("scope");
+    let scope = retry(|| Scope::open(&path, config()));
+    let client = retry(|| scope.join());
+    client
+        .prepare(request(Work::LazyRead))
+        .unwrap()
+        .try_run(|_| Completion { value: (), operations: 1, failed: false })
+        .unwrap();
+    assert!(retry(|| scope.view()).charged_ns > 0);
+    let anchor = root.path().join("scope.authority.lock");
+    #[cfg(windows)]
+    assert!(fs::remove_file(&anchor).is_err(), "live Windows handles must pin the anchor");
+    drop((client, scope));
+    let state = path.join("authority.state");
+    let retained = fs::read(&state).unwrap();
+    fs::remove_file(&anchor).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(Scope::open(&path, config()), Err(Error::Replaced)));
+        assert_eq!(fs::read(&state).unwrap(), retained, "a missing anchor must not erase the journal");
+    }
+}
+
+#[test]
+#[ignore = "subprocess exits after physical work and before settlement"]
+fn completed_before_settlement_fixture() {
+    let root = std::path::PathBuf::from(std::env::var_os("TF_COORDINATION_FIXTURE").unwrap());
+    let scope = retry(|| Scope::open(root.join("scope"), config()));
+    let client = retry(|| scope.join());
+    let participant = client.participant();
+    client
+        .prepare(request(Work::LazyRead))
+        .unwrap()
+        .try_run(|_| -> Completion<()> {
+            let data = root.join("completed-data");
+            fs::write(&data, b"physical work completed").unwrap();
+            assert_eq!(fs::read(&data).unwrap(), b"physical work completed");
+            fs::write(root.join("completed-owner"), format!("{} {}", participant.slot, participant.incarnation))
+                .unwrap();
+            // The filesystem call has returned, but no completion report or
+            // Rust destructor may publish settlement before process exit.
+            std::process::exit(0);
+        })
+        .unwrap();
+}
+
+#[test]
+fn completion_without_settlement_survives_every_connection_closing() {
+    let root = fixture_root();
+    let path = root.path().join("scope");
+    let scope = retry(|| Scope::open(&path, config()));
+    let generation = scope.diagnostics().unwrap().generation;
+    drop(scope);
+    let mut children = Children(vec![spawn_worker(root.path(), 0, "completed_before_settlement_fixture")]);
+    children.finish();
+    let owner = fs::read_to_string(root.path().join("completed-owner")).unwrap();
+    let owner: Vec<u64> = owner.split_whitespace().map(|value| value.parse().unwrap()).collect();
+    assert_eq!(owner.len(), 2);
+    // All authority connections and the dead operation owner have closed.
+    let scope = retry(|| Scope::open(&path, config()));
+    assert_eq!(scope.diagnostics().unwrap().generation, generation);
+    let recovered = retry(|| scope.view());
+    assert_eq!((recovered.participants, recovered.prepared, recovered.physical), (0, 0, 0));
+    assert!(recovered.charged_ns >= u128::from(config().initial_estimate_ns));
+    assert_eq!(recovered.surcharged_ns, u128::from(config().failure_surcharge_ns));
+    drop(scope);
+    let reopened = retry(|| Scope::open(&path, config()));
+    assert_eq!(reopened.diagnostics().unwrap().generation, generation);
+    let retained = retry(|| reopened.view());
+    assert_eq!(retained.charged_ns, recovered.charged_ns);
+    assert_eq!(retained.surcharged_ns, recovered.surcharged_ns);
+    let replacement = retry(|| reopened.join());
+    assert_eq!(u64::from(replacement.participant().slot), owner[0]);
+    assert!(replacement.participant().incarnation > owner[1]);
+    let live = retry(|| reopened.view());
+    assert_eq!((live.participants, live.physical, live.prepared), (1, 0, 0));
+    assert_eq!((live.charged_ns, live.surcharged_ns), (retained.charged_ns, retained.surcharged_ns));
+}
+
+#[test]
+#[cfg(windows)]
+fn suspending_the_physical_owner_cannot_release_its_slot() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME};
+
+    struct Suspended(OwnedHandle);
+    impl Drop for Suspended {
+        fn drop(&mut self) {
+            // SAFETY: the guard owns the one suspend count on this fixture.
+            assert_eq!(unsafe { ResumeThread(self.0.as_raw_handle()) }, 1);
+        }
+    }
+    let root = fixture_root();
+    let mut children = Children(vec![spawn_worker(root.path(), 0, "physical_process_fixture")]);
+    children.wait_for(root.path(), "joined-", 1);
+    fs::write(root.path().join("dispatch"), []).unwrap();
+    children.wait_for(root.path(), "started-", 1);
+    let thread = fs::read_to_string(root.path().join("thread-0")).unwrap().parse().unwrap();
+    // SAFETY: this ID comes from our live fixture, held inside its callback.
+    let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread) };
+    assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+    // SAFETY: OpenThread returned a new owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    assert_eq!(unsafe { SuspendThread(handle.as_raw_handle()) }, 0);
+    let suspended = Suspended(handle);
+    let scope = retry(|| Scope::open(root.path().join("scope"), config()));
+    let generation = scope.diagnostics().unwrap().generation;
+    // The I/O can complete while its owner is suspended. Even after the stuck
+    // threshold, only resumption and settlement may relinquish ownership.
+    children.0[0].stdin.take().unwrap().write_all(&[1]).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    for _ in 0..8 {
+        let view = retry(|| scope.view());
+        assert_eq!((view.participants, view.physical), (1, 1));
+    }
+    drop(suspended);
+    children.finish();
+    assert_eq!(counts(root.path(), 0), (0, 1));
+    verify_retained(root.path(), scope, generation);
+}
+
+#[test]
 fn twenty_real_scans_hold_at_most_two_lazy_filesystem_reads() {
     twenty_processes("scan_process_fixture");
 }
@@ -430,6 +594,7 @@ fn killing_one_physical_owner_retains_the_other_and_recovers_only_its_slot() {
         let scope = retry(|| Scope::open(root.path().join("scope"), config()));
         let generation = retry(|| scope.diagnostics()).generation;
         assert_eq!(counts(root.path(), 0), (2, 2));
+        let charged_before_exit = retry(|| scope.view()).charged_ns;
 
         let mut victim = children.0.remove(0);
         victim.kill().unwrap();
@@ -442,6 +607,7 @@ fn killing_one_physical_owner_retains_the_other_and_recovers_only_its_slot() {
             let view = retry(|| scope.view());
             if view.physical == 1 {
                 assert_eq!(view.participants, 1);
+                assert!(view.charged_ns >= charged_before_exit, "owner recovery must retain existing charges");
                 break;
             }
             assert!(Instant::now() < deadline, "dead owner was not recovered");
