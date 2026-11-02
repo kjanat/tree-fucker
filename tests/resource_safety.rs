@@ -2295,6 +2295,51 @@ fn an_exhausted_foreground_allowance_withholds_no_background_admission() {
 }
 
 #[test]
+fn an_exhausted_domain_foreground_allowance_withholds_no_background_admission() {
+    let fs = tree(&["a", "b", "z"]);
+    fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));
+    let host = HostConfig {
+        foreground_duty: 1.0,
+        domain_foreground_duty: 0.001,
+        stuck_threshold: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let config = Config { fixed_interval: Some(Duration::from_secs(30)), ..Default::default() };
+    let mut h = scanned_under(fs.clone(), host, config);
+    fs.set_cost(CostScope::path("z"), FakeOp::ReadDir, Duration::from_secs(60));
+    let first = h.command(Command::Refresh(vec![path("z")]));
+    h.run_jobs_until(h.now() + Duration::from_secs(1));
+    fs.set_cost(CostScope::path("z"), FakeOp::ReadDir, Duration::from_millis(10));
+    for _ in 0..20 {
+        h.run_jobs_until(h.now() + Duration::from_secs(10));
+        if h.result(first).is_some() {
+            break;
+        }
+    }
+    assert_eq!(h.result(first), Some(Ok(())), "the fixture's foreground read never completed");
+    h.run_jobs_until(h.now() + Duration::from_secs(120));
+    assert_eq!(h.governor().foreground_debt, Duration::ZERO, "global foreground capacity remains available");
+    assert!(h.governor().domains.values().any(|domain| domain.foreground_debt > Duration::ZERO));
+    assert_eq!(h.governor().debt, Duration::ZERO, "the fixture left the background bucket in debt");
+
+    let issued = h.now();
+    let ticket = h.command(Command::Refresh(vec![path("a")]));
+    h.run_jobs_until(issued + Duration::from_secs(600));
+    assert_eq!(h.result(ticket), None, "the fixture's foreground refresh was admitted");
+    let background: BTreeSet<RelativePath> = h
+        .admissions()
+        .into_iter()
+        .filter(|a| a.at >= issued && a.origin == WorkOrigin::Background)
+        .map(|a| a.entry)
+        .collect();
+    assert!(
+        background.contains(&path("b")) && background.contains(&path("z")),
+        "RFC 15.4: the foreground buckets have their own rate and capacity; with the foreground refresh of a denied, \
+         the background listings admitted were {background:?}"
+    );
+}
+
+#[test]
 fn a_background_refill_admits_background_listings_while_a_foreground_refresh_waits() {
     let fs = tree(&["a", "b", "c"]);
     fs.set_cost(CostScope::Everything, FakeOp::ReadDir, Duration::from_millis(10));

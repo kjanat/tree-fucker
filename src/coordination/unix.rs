@@ -406,29 +406,42 @@ impl Scope {
     }
 
     pub fn join(self: &Arc<Self>) -> Result<Client, Error> {
-        self.access(|store| {
-            let Store { journal, recovery_slot } = store;
-            journal.transaction_with(|state| {
-                self.recover(state, recovery_slot)?;
-                for slot in 0..self.config.ownership.participants {
-                    if state.ledger().participants().any(|participant| participant.slot == slot) {
-                        continue;
+        // Visit the whole table before reporting exhaustion, committing each
+        // bounded recovery batch and releasing the authority lock between them.
+        for _ in (0..self.config.ownership.participants).step_by(RECOVERY_BATCH) {
+            let client = self.access(|store| {
+                let Store { journal, recovery_slot } = store;
+                journal.transaction_with(|state| {
+                    self.recover(state, recovery_slot)?;
+                    if state.ledger().participant_count() == self.config.ownership.participants as usize {
+                        return Ok(None);
                     }
-                    let owner = open_file(&self.root, OsStr::new(&format!("owner-{slot}")), true, self.context.uid)?;
-                    match exclusive(&owner) {
-                        Ok(()) => {}
-                        Err(Error::Busy) => continue,
-                        Err(error) => return Err(error),
+                    for slot in 0..self.config.ownership.participants {
+                        if state.ledger().participants().any(|participant| participant.slot == slot) {
+                            continue;
+                        }
+                        let owner =
+                            open_file(&self.root, OsStr::new(&format!("owner-{slot}")), true, self.context.uid)?;
+                        match exclusive(&owner) {
+                            Ok(()) => {}
+                            Err(Error::Busy) => continue,
+                            Err(error) => return Err(error),
+                        }
+                        let identity = identity(&owner.metadata()?);
+                        let participant = state.join_owned(VERSION, slot, identity)?;
+                        return Ok(Some(Client::new(self.clone(), participant, owner)));
                     }
-                    let identity = identity(&owner.metadata()?);
-                    let participant = state.join_owned(VERSION, slot, identity)?;
-                    return Ok(Ok(Client::new(self.clone(), participant, owner)));
-                }
-                // Retain successful recovery even if no participant slot is
-                // available yet; a retry must not repeat discarded recovery.
-                Ok::<_, Error>(Err(Error::Authority(protocol::Error::ParticipantCapacity.into())))
-            })?
-        })
+                    // Retain successful recovery even if no participant slot is
+                    // available yet; a retry must not repeat discarded
+                    // recovery.
+                    Ok::<_, Error>(None)
+                })
+            })?;
+            if let Some(client) = client {
+                return Ok(client);
+            }
+        }
+        Err(Error::Authority(protocol::Error::ParticipantCapacity.into()))
     }
 
     /// Separate shared accounting; do not sum this with process accounting.

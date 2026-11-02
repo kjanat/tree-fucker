@@ -283,36 +283,53 @@ impl Scope {
     }
 
     pub fn join(self: &Arc<Self>) -> Result<Client, Error> {
-        self.access(|store| {
-            let Store { journal, recovery_slot } = store;
-            let mut recovered = Vec::new();
-            journal.transaction_with(|state| {
-                self.recover(state, recovery_slot, &mut recovered)?;
-                for slot in 0..self.config.ownership.participants {
-                    if state.ledger().participants().any(|participant| participant.slot == slot) {
-                        continue;
+        // Fresh connections must reach every slot without extending a single
+        // authority-lock hold beyond the bounded recovery batch.
+        for _ in (0..self.config.ownership.participants).step_by(RECOVERY_BATCH) {
+            let client = self.access(|store| {
+                let Store { journal, recovery_slot } = store;
+                let mut recovered = Vec::new();
+                journal.transaction_with(|state| {
+                    self.recover(state, recovery_slot, &mut recovered)?;
+                    if state.ledger().participant_count() == self.config.ownership.participants as usize {
+                        return Ok(None);
                     }
-                    let owner = if let Some(index) =
-                        recovered.iter().position(|(recovered_slot, _)| *recovered_slot == slot)
-                    {
-                        recovered.swap_remove(index).1
-                    } else {
-                        match self.principal.open_at(&self.root, OsStr::new(&format!("owner-{slot}")), true, 0, false) {
-                            Ok(owner) => owner,
-                            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => continue,
-                            Err(error) => return Err(error.into()),
+                    for slot in 0..self.config.ownership.participants {
+                        if state.ledger().participants().any(|participant| participant.slot == slot) {
+                            continue;
                         }
-                    };
-                    let id = identity(&owner)?;
-                    if id.volume != self.root_id.volume {
-                        return Err(Error::Replaced);
+                        let owner = if let Some(index) =
+                            recovered.iter().position(|(recovered_slot, _)| *recovered_slot == slot)
+                        {
+                            recovered.swap_remove(index).1
+                        } else {
+                            match self.principal.open_at(
+                                &self.root,
+                                OsStr::new(&format!("owner-{slot}")),
+                                true,
+                                0,
+                                false,
+                            ) {
+                                Ok(owner) => owner,
+                                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => continue,
+                                Err(error) => return Err(error.into()),
+                            }
+                        };
+                        let id = identity(&owner)?;
+                        if id.volume != self.root_id.volume {
+                            return Err(Error::Replaced);
+                        }
+                        let participant = state.join_owned(VERSION, slot, id.file)?;
+                        return Ok(Some(Client::new(self.clone(), participant, owner)));
                     }
-                    let participant = state.join_owned(VERSION, slot, id.file)?;
-                    return Ok(Ok(Client::new(self.clone(), participant, owner)));
-                }
-                Ok::<_, Error>(Err(Error::Authority(protocol::Error::ParticipantCapacity.into())))
-            })?
-        })
+                    Ok::<_, Error>(None)
+                })
+            })?;
+            if let Some(client) = client {
+                return Ok(client);
+            }
+        }
+        Err(Error::Authority(protocol::Error::ParticipantCapacity.into()))
     }
 
     pub fn view(&self) -> Result<View, Error> {

@@ -25,6 +25,8 @@ struct State {
     entries: BTreeMap<GrantId, Ownership>,
     domains: BTreeMap<StorageDomainId, DomainId>,
     quarantined: BTreeMap<StorageDomainId, Retry>,
+    budgets: BTreeMap<(Option<StorageDomainId>, WorkOrigin), Retry>,
+    capacity: BTreeMap<StorageDomainId, Retry>,
     failure: Option<String>,
     retry: Option<Retry>,
 }
@@ -37,28 +39,54 @@ pub(super) struct Binding {
 }
 
 impl State {
-    fn refusal(&self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Option<ThrottleCause> {
+    fn refusal(
+        &self,
+        domain: Option<StorageDomainId>,
+        origin: WorkOrigin,
+        cleanup: bool,
+        now: MonotonicTime,
+    ) -> Option<ThrottleCause> {
         if self.retry.is_some_and(|retry| retry.at > now) {
             return Some(ThrottleCause::Coordination);
         }
         match domain.and_then(|domain| self.quarantined.get(&domain)) {
             Some(retry) if retry.at > now => Some(ThrottleCause::StuckWorker),
+            _ if domain.and_then(|domain| self.capacity.get(&domain)).is_some_and(|retry| retry.at > now)
+                || (!cleanup && self.budgets.get(&(domain, origin)).is_some_and(|retry| retry.at > now)) =>
+            {
+                Some(ThrottleCause::Coordination)
+            }
             _ => None,
         }
     }
 
-    fn deny(&mut self, error: native::Error, domain: Option<StorageDomainId>, now: MonotonicTime) -> ThrottleCause {
+    fn deny(
+        &mut self,
+        error: native::Error,
+        domain: Option<StorageDomainId>,
+        origin: WorkOrigin,
+        now: MonotonicTime,
+    ) -> ThrottleCause {
         let busy = matches!(error, native::Error::Busy);
         let cause = match error {
             native::Error::Busy
-            | native::Error::Authority(
-                authority::Error::DomainPhysical | authority::Error::Protocol(protocol::Error::PhysicalCapacity),
-            ) => {
+            | native::Error::Authority(authority::Error::Protocol(protocol::Error::PhysicalCapacity)) => {
                 // Short lock/occupancy conflicts can resolve within one lease.
                 // Back off only after actual denials, never when reading a
                 // hint.
                 let delay = self.retry.map_or(FIRST_RETRY, |retry| retry.delay.saturating_mul(2).min(MAX_RETRY));
                 self.retry = Some(Retry { at: now + delay, delay });
+                ThrottleCause::Coordination
+            }
+            native::Error::Authority(authority::Error::DomainPhysical) => {
+                self.retry = None;
+                if let Some(domain) = domain {
+                    let delay = self
+                        .capacity
+                        .get(&domain)
+                        .map_or(FIRST_RETRY, |retry| retry.delay.saturating_mul(2).min(MAX_RETRY));
+                    self.capacity.insert(domain, Retry { at: now + delay, delay });
+                }
                 ThrottleCause::Coordination
             }
             native::Error::Authority(authority::Error::Quarantined) => {
@@ -77,8 +105,10 @@ impl State {
                 ThrottleCause::CommandCeiling { required: Duration::from_nanos(minimum_ns) }
             }
             native::Error::Authority(authority::Error::Budget | authority::Error::Bootstrap) => {
-                // Debt needs longer than a bookkeeping lock.
-                self.retry = Some(Retry { at: now + MAX_RETRY, delay: MAX_RETRY });
+                // Budget debt in one account must not delay another origin
+                // or domain whose allowance remains available.
+                self.retry = None;
+                self.budgets.insert((domain, origin), Retry { at: now + MAX_RETRY, delay: MAX_RETRY });
                 ThrottleCause::Coordination
             }
             error => {
@@ -94,9 +124,13 @@ impl State {
         cause
     }
 
-    fn admitted(&mut self, domain: Option<StorageDomainId>) {
+    fn admitted(&mut self, domain: Option<StorageDomainId>, origin: WorkOrigin, cleanup: bool) {
         self.retry = None;
+        if !cleanup {
+            self.budgets.remove(&(domain, origin));
+        }
         if let Some(domain) = domain {
+            self.capacity.remove(&domain);
             self.quarantined.remove(&domain);
         }
     }
@@ -136,7 +170,9 @@ impl Binding {
         if state.failure.is_some() {
             return Err(ThrottleCause::CoordinationFailed);
         }
-        if let Some(cause) = state.refusal(reservation.domain, now) {
+        if let Some(cause) =
+            state.refusal(reservation.domain, reservation.origin, reservation.id.release().is_some(), now)
+        {
             return Err(cause);
         }
         let id = reservation.id;
@@ -201,13 +237,13 @@ impl Binding {
                 );
                 let admitted = local.admitted;
                 state.entries.insert(id, Ownership::Prepared(prepared));
-                state.admitted(reservation.domain);
+                state.admitted(reservation.domain, reservation.origin, reservation.id.release().is_some());
                 Ok(admitted)
             }
             Err(error) => {
                 guard(&host.inner).prepared.remove(&id);
                 host.changed();
-                Err(state.deny(error, reservation.domain, now))
+                Err(state.deny(error, reservation.domain, reservation.origin, now))
             }
         }
     }
@@ -217,14 +253,16 @@ impl Binding {
         if state.failure.is_some() {
             return Err(ThrottleCause::CoordinationFailed);
         }
-        let domain = match state.entries.get(&id) {
+        let (domain, origin) = match state.entries.get(&id) {
             None => return Err(ThrottleCause::Concurrency),
             Some(Ownership::Physical(_)) => return Ok(()),
             Some(Ownership::Prepared(_)) => {
-                guard(&host.inner).prepared.get(&id).expect("local preparation").reservation.domain
+                let governor = guard(&host.inner);
+                let reservation = &governor.prepared.get(&id).expect("local preparation").reservation;
+                (reservation.domain, reservation.origin)
             }
         };
-        if let Some(cause) = state.refusal(domain, now) {
+        if let Some(cause) = state.refusal(domain, origin, id.release().is_some(), now) {
             return Err(cause);
         }
         let Some(ownership) = state.entries.get_mut(&id) else {
@@ -281,10 +319,10 @@ impl Binding {
                 governor.record_admission(local.reservation, local.admitted, now);
                 governor.start(id, now);
                 *ownership = Ownership::Physical(physical);
-                state.admitted(domain);
+                state.admitted(domain, origin, id.release().is_some());
                 Ok(())
             }
-            Err(error) => Err(state.deny(error, domain, now)),
+            Err(error) => Err(state.deny(error, domain, origin, now)),
         }
     }
 
@@ -302,6 +340,7 @@ impl Binding {
         let failed = stuck || governor.grants.get(&id).is_some_and(|grant| grant.failed);
         let operations = governor.grants.get(&id).map_or(0, |grant| grant.performed.unwrap_or(grant.required));
         let domain = governor.grants.get(&id).and_then(|grant| grant.domain);
+        let origin = governor.grants.get(&id).map_or(WorkOrigin::Background, |grant| grant.origin);
         governor.prepared.remove(&id);
         governor.release(id, now);
         drop(governor);
@@ -309,7 +348,7 @@ impl Binding {
         match ownership {
             Some(Ownership::Physical(physical)) => {
                 if let Err(error) = physical.finish(operations, failed) {
-                    self.state.lock().unwrap_or_else(|error| error.into_inner()).deny(error, domain, now);
+                    self.state.lock().unwrap_or_else(|error| error.into_inner()).deny(error, domain, origin, now);
                 }
             }
             other => drop(other),
@@ -332,15 +371,28 @@ impl Binding {
         self.state.lock().unwrap_or_else(|error| error.into_inner()).quarantined.keys().copied().collect()
     }
 
-    pub(super) fn retry_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
+    pub(super) fn retry_at(&self, host: &HostGovernor, now: MonotonicTime) -> Option<MonotonicTime> {
         match self.lock() {
             Ok(state) if state.failure.is_none() => {
                 // If local constraints prevented a retry at the old deadline,
                 // retain the backoff instead of scheduling an expired hint in
                 // a tight loop. Reading a future deadline never postpones it.
-                let global = (state.retry.is_some()
-                    || state.entries.values().any(|entry| matches!(entry, Ownership::Prepared(_))))
-                .then(|| {
+                let unblocked = state.retry.is_none() && {
+                    let governor = guard(&host.inner);
+                    governor.prepared.values().any(|prepared| {
+                        let reservation = &prepared.reservation;
+                        state.entries.contains_key(&reservation.id)
+                            && state
+                                .refusal(
+                                    reservation.domain,
+                                    reservation.origin,
+                                    reservation.id.release().is_some(),
+                                    now,
+                                )
+                                .is_none()
+                    })
+                };
+                let global = (state.retry.is_some() || unblocked).then(|| {
                     state.retry.map_or(
                         now + FIRST_RETRY,
                         |retry| {
@@ -349,10 +401,9 @@ impl Binding {
                     )
                 });
                 let quarantined = state.quarantined.values().map(|retry| retry.at).filter(|at| *at > now).min();
-                match (global, quarantined) {
-                    (Some(global), Some(quarantined)) => Some(global.min(quarantined)),
-                    (global, quarantined) => global.or(quarantined),
-                }
+                let budget = state.budgets.values().map(|retry| retry.at).filter(|at| *at > now).min();
+                let capacity = state.capacity.values().map(|retry| retry.at).filter(|at| *at > now).min();
+                [global, quarantined, budget, capacity].into_iter().flatten().min()
             }
             Err(ThrottleCause::Coordination) => Some(now + FIRST_RETRY),
             _ => None,

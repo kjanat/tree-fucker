@@ -2635,7 +2635,11 @@ Abstract
    command's reads; it neither fails the command nor borrows from the
    background buckets. A dispatch cycle that finds one allowance
    exhausted still admits, in that cycle, the work the other allowance
-   affords. Section 9 places no wall-clock bound on command completion.
+   affords. This applies to global and per-domain allowances, including
+   shared-authority denials. A denial in one domain and origin MUST NOT
+   suppress another origin's admission on that domain or another domain's
+   available capacity. Section 9 places no wall-clock bound on command
+   completion.
 
    Each command additionally has a ceiling on the worker time its reads
    may be admitted with. The ceiling bounds admission: once the cost

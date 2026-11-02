@@ -2142,7 +2142,7 @@ impl HostGovernor {
     pub fn coordination_retry_at(&self, _now: MonotonicTime) -> Option<MonotonicTime> {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
         if let Some(shared) = &self.shared {
-            return shared.retry_at(_now);
+            return shared.retry_at(self, _now);
         }
         None
     }

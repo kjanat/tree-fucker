@@ -135,7 +135,7 @@ impl Coordinator {
             }
             Err(_) => match self.governor.global_exhausted(domain, origin) {
                 true => Err(Denied::Globally(origin)),
-                false => Err(Denied::OnDomain(domain)),
+                false => Err(Denied::OnDomain(domain, origin)),
             },
         }
     }
@@ -475,7 +475,7 @@ impl Coordinator {
         exhausted: &mut BTreeSet<WorkOrigin>,
     ) -> bool {
         let mut remaining = slots;
-        let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
+        let mut denied: BTreeSet<(Option<StorageDomainId>, WorkOrigin)> = BTreeSet::new();
         let mut quarantined: std::collections::HashMap<Option<StorageDomainId>, bool> =
             std::collections::HashMap::new();
         let mut index = match self.round.as_ref() {
@@ -566,12 +566,10 @@ impl Coordinator {
                 }
                 continue;
             }
-            if denied.contains(&domain) {
-                continue;
-            }
             let barriers =
                 self.pending.get(&obligation.entry).map(|request| request.barriers.clone()).unwrap_or_default();
-            if exhausted.contains(&self.origin_of(Some(obligation.entry), &barriers)) {
+            let origin = self.origin_of(Some(obligation.entry), &barriers);
+            if denied.contains(&(domain, origin)) || exhausted.contains(&origin) {
                 continue;
             }
             let grant = match self.try_grant_on(Some(obligation.entry), ReadNeed::Listing, &obligation.path, &barriers)
@@ -581,8 +579,8 @@ impl Coordinator {
                     true => return false,
                     false => continue,
                 },
-                Err(Denied::OnDomain(domain)) => {
-                    denied.insert(domain);
+                Err(Denied::OnDomain(domain, origin)) => {
+                    denied.insert((domain, origin));
                     continue;
                 }
             };
@@ -691,7 +689,7 @@ impl Coordinator {
             }
         }
         self.class_rotation = (rotation + 1) % 5;
-        let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
+        let mut denied: BTreeSet<(Option<StorageDomainId>, WorkOrigin)> = BTreeSet::new();
         for step in 0..5 {
             let i = (rotation + step) % 5;
             let mut take = quota[i];
@@ -735,9 +733,12 @@ impl Coordinator {
                     continue;
                 };
                 let id = candidate.entry();
-                if denied.contains(&self.domain_of(id))
-                    || exhausted.contains(&self.origin_of(Some(id), &request.barriers))
-                {
+                let domain = match request.need {
+                    ReadNeed::Domain => None,
+                    _ => self.domain_of(id),
+                };
+                let origin = self.origin_of(Some(id), &request.barriers);
+                if denied.contains(&(domain, origin)) || exhausted.contains(&origin) {
                     continue;
                 }
                 let grant = match self.try_grant_on(Some(id), request.need, &request.path, &request.barriers) {
@@ -746,8 +747,8 @@ impl Coordinator {
                         true => return false,
                         false => continue,
                     },
-                    Err(Denied::OnDomain(domain)) => {
-                        denied.insert(domain);
+                    Err(Denied::OnDomain(domain, origin)) => {
+                        denied.insert((domain, origin));
                         continue;
                     }
                 };
@@ -1101,7 +1102,7 @@ type RelativePathOwned = crate::path::RelativePath;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Denied {
     Globally(WorkOrigin),
-    OnDomain(Option<StorageDomainId>),
+    OnDomain(Option<StorageDomainId>, WorkOrigin),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

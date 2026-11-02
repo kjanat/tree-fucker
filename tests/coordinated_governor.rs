@@ -181,6 +181,32 @@ fn fixture() -> (tempfile::TempDir, Arc<Scope>) {
     (root, scope)
 }
 
+#[test]
+fn fresh_governor_connections_recover_participants_beyond_the_first_batch() {
+    use tree_fucker::HostGovernorError;
+    use tree_fucker::coordination::{self, Mode, Options, Rendezvous, State};
+
+    let (root, scope) = fixture();
+    let mut limits = scope.diagnostics().unwrap().config;
+    limits.ownership.participants = 17;
+    let path = root.path().join("recovery");
+    let scope = Scope::open(&path, limits).unwrap();
+    let mut clients: Vec<_> = (0..17).map(|_| scope.join().unwrap()).collect();
+    let options = Options { scope: Rendezvous::Directory(path), limits };
+    for _ in 0..2 {
+        assert!(matches!(
+            HostGovernor::configured(&host_config(), Mode::Required(options.clone())),
+            Err(HostGovernorError::Coordination(coordination::Error::Capacity(_)))
+        ));
+    }
+    assert_eq!(clients.last().unwrap().participant().slot, 16);
+    drop(clients.pop());
+    let host = HostGovernor::configured(&host_config(), Mode::Required(options)).unwrap();
+    assert!(matches!(host.coordination_status().state, State::Shared { failure: None, .. }));
+    assert_eq!(scope.view().unwrap().participants, 17);
+    assert_eq!(clients.len(), 16);
+}
+
 fn request(host: &HostGovernor) -> Reservation {
     Reservation {
         id: GrantId::Bootstrap(host.next_bootstrap()),

@@ -319,3 +319,148 @@ mod quarantine {
         peer.release(held, NOW);
     }
 }
+
+#[test]
+fn shared_budget_backoff_does_not_block_the_other_origin() {
+    use tree_fucker::coordination::authority::{Origin, Request};
+    use tree_fucker::coordination::protocol::Work;
+    use tree_fucker::{DomainCapabilities, StorageDomainId};
+
+    for origin in [WorkOrigin::Background, WorkOrigin::Foreground] {
+        let (_root, scope) = fixture();
+        let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+        let holder = scope.join().unwrap();
+        let domain = holder.register_private_domain(1).unwrap();
+        let held = holder
+            .prepare(Request {
+                work: Work::Listing,
+                origin: match origin {
+                    WorkOrigin::Background => Origin::Background,
+                    WorkOrigin::Foreground => Origin::Foreground,
+                },
+                domain: Some(domain),
+                required: 1000,
+                desired: 0,
+                ceiling_ns: u64::MAX,
+            })
+            .unwrap();
+        let local_domain = StorageDomainId::fresh();
+        host.register_domain(local_domain, &DomainCapabilities::inline(), NOW);
+        let denied = Reservation { origin, domain: Some(local_domain), ..request(&host) };
+        assert_eq!(host.try_admit(denied.clone(), NOW), Err(ThrottleCause::Coordination));
+        let cleanup = Reservation {
+            id: GrantId::WatchRelease(host.next_tree(), tree_fucker::WatchReleaseId::new(1)),
+            origin,
+            domain: Some(local_domain),
+            ..request(&host)
+        };
+        host.try_admit(cleanup.clone(), NOW).expect("cleanup is exempt from budget backoff");
+        host.try_start(cleanup.id, NOW).unwrap();
+        host.release(cleanup.id, NOW);
+        let other = match origin {
+            WorkOrigin::Background => WorkOrigin::Foreground,
+            WorkOrigin::Foreground => WorkOrigin::Background,
+        };
+        let admitted = Reservation { origin: other, domain: Some(local_domain), ..request(&host) };
+        host.try_admit(admitted.clone(), NOW).expect("one exhausted origin cannot withhold the other");
+        host.try_start(admitted.id, NOW).unwrap();
+        host.release(admitted.id, NOW);
+        let attempts = scope.diagnostics().unwrap().access.attempts;
+        assert_eq!(host.try_admit(denied.clone(), NOW), Err(ThrottleCause::Coordination));
+        assert_eq!(
+            scope.diagnostics().unwrap().access.attempts,
+            attempts,
+            "other-origin progress preserves the backoff"
+        );
+        drop(held);
+        let retry = NOW + Duration::from_millis(10);
+        host.try_admit(denied.clone(), retry).unwrap();
+        host.try_start(denied.id, retry).unwrap();
+        host.release(denied.id, retry);
+        assert_eq!(host.coordination_retry_at(retry), None);
+    }
+}
+
+#[test]
+fn shared_domain_budget_backoff_does_not_block_another_domain() {
+    use tree_fucker::{DomainCapabilities, StorageDomainId};
+
+    for origin in [WorkOrigin::Background, WorkOrigin::Foreground] {
+        let (root, original) = fixture();
+        let mut config = original.diagnostics().unwrap().config;
+        config.domain_background.burst_ns = 10_000_000;
+        config.domain_foreground.burst_ns = 10_000_000;
+        let scope = Scope::open(root.path().join("domain-budget"), config).unwrap();
+        let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+        let a = StorageDomainId::fresh();
+        let b = StorageDomainId::fresh();
+        for domain in [a, b] {
+            host.register_domain(domain, &DomainCapabilities::inline(), NOW);
+        }
+        let held = Reservation { origin, domain: Some(a), operations: 9, ..request(&host) };
+        host.try_admit(held.clone(), NOW).unwrap();
+        let denied = Reservation { origin, domain: Some(a), ..request(&host) };
+        assert_eq!(host.try_admit(denied.clone(), NOW), Err(ThrottleCause::Coordination));
+        let healthy = Reservation { origin, domain: Some(b), ..request(&host) };
+        host.try_admit(healthy.clone(), NOW).expect("one domain's budget must not withhold another domain");
+        host.try_start(healthy.id, NOW).unwrap();
+        host.release(healthy.id, NOW);
+        let attempts = scope.diagnostics().unwrap().access.attempts;
+        assert_eq!(host.try_admit(denied.clone(), NOW), Err(ThrottleCause::Coordination));
+        assert_eq!(scope.diagnostics().unwrap().access.attempts, attempts);
+        host.release(held.id, NOW);
+        let retry = NOW + Duration::from_millis(10);
+        host.try_admit(denied.clone(), retry).unwrap();
+        host.try_start(denied.id, retry).unwrap();
+        host.release(denied.id, retry);
+        assert_eq!(host.coordination_retry_at(retry), None);
+    }
+}
+
+#[test]
+fn shared_domain_capacity_backoff_does_not_block_another_domain() {
+    use tree_fucker::{AccessTopology, DomainCapabilities, StorageDomainId};
+
+    let (root, original) = fixture();
+    let mut config = original.diagnostics().unwrap().config;
+    config.ownership.physical = 2;
+    let scope = Scope::open(root.path().join("domain-capacity"), config).unwrap();
+    let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+    let a = StorageDomainId::fresh();
+    let b = StorageDomainId::fresh();
+    for domain in [a, b] {
+        host.register_domain(
+            domain,
+            &DomainCapabilities { topology: AccessTopology::Local, ..DomainCapabilities::inline() },
+            NOW,
+        );
+    }
+    let held = Reservation { domain: Some(a), ..request(&host) };
+    host.try_admit(held.clone(), NOW).unwrap();
+    host.try_start(held.id, NOW).unwrap();
+    let denied = Reservation { domain: Some(a), ..request(&host) };
+    host.try_admit(denied.clone(), NOW).unwrap();
+    assert_eq!(host.try_start(denied.id, NOW), Err(ThrottleCause::Coordination));
+    let healthy = Reservation { domain: Some(b), ..request(&host) };
+    host.try_admit(healthy.clone(), NOW).expect("one full domain cannot withhold another domain");
+    host.try_start(healthy.id, NOW).unwrap();
+    assert_eq!(scope.view().unwrap().physical, 2);
+    host.release(healthy.id, NOW);
+    let attempts = scope.diagnostics().unwrap().access.attempts;
+    assert_eq!(host.try_start(denied.id, NOW), Err(ThrottleCause::Coordination));
+    assert_eq!(scope.diagnostics().unwrap().access.attempts, attempts);
+    let mut now = NOW;
+    let mut retry = NOW;
+    for delay in [3, 6, 10] {
+        retry = now + Duration::from_millis(delay);
+        assert_eq!(host.coordination_retry_at(now), Some(retry));
+        if delay != 10 {
+            now = retry;
+            assert_eq!(host.try_start(denied.id, now), Err(ThrottleCause::Coordination));
+        }
+    }
+    host.release(held.id, now);
+    host.try_start(denied.id, retry).unwrap();
+    host.release(denied.id, retry);
+    assert_eq!(host.coordination_retry_at(retry), None);
+}

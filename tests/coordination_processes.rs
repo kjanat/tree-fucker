@@ -431,6 +431,37 @@ fn owner_recovery_retires_only_a_bounded_batch_per_access() {
 }
 
 #[test]
+fn fresh_connections_retain_bounded_recovery_from_failed_joins() {
+    let (root, scope) = fixture();
+    let clients: Vec<_> = (0..31).map(|_| retry(|| scope.join())).collect();
+    let mut children = Children(vec![
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "abandoned_preparations_fixture", "--ignored", "--nocapture"])
+            .env("TF_COORDINATION_FIXTURE", root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    ]);
+    assert!(children.0[0].wait().unwrap().success());
+    let fresh = Scope::open(root.path().join("scope"), config()).unwrap();
+    assert!(matches!(
+        fresh.join(),
+        Err(Error::Authority(authority::Error::Protocol(protocol::Error::ParticipantCapacity)))
+    ));
+    drop(fresh);
+    let fresh = Scope::open(root.path().join("scope"), config()).unwrap();
+    let client = retry(|| fresh.join());
+    assert_eq!(client.participant().slot, 31);
+    let view = retry(|| fresh.view());
+    assert_eq!(view.prepared, 0);
+    assert_eq!(view.participants, 32);
+    assert_eq!(view.charged_ns, 0);
+    assert_eq!(clients.len(), 31);
+}
+
+#[test]
 fn killed_blocked_owner_is_recovered_by_kernel_lifetime_evidence() {
     let (root, scope) = fixture();
     let _gate = fifo(root.path(), 0);
