@@ -24,8 +24,8 @@ catch {
 	}
 }
 $result | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 "$env:TF_POWER_ROOT\result.json"
-# QEMU user networking reaches the Linux controller through Docker's bridge
-# gateway. RDP is forwarded only on the controller's loopback interface.
+# Passt keeps Docker's bridge gateway as the controller destination instead
+# of remapping it to container loopback. RDP is forwarded only on host loopback.
 $gateway = (Get-Content C:\OEM\controller.txt -Raw).Trim()
 for ($attempt = 0; $attempt -lt 60; $attempt++) {
 	try {

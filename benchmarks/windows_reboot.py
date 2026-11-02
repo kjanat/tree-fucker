@@ -137,7 +137,12 @@ def main() -> None:
         "-e",
         "DISK_SIZE=40G",
         "-e",
-        "NETWORK=user",
+        "NETWORK=passt",
+        "-e",
+        # The guest gateway is also Docker's bridge gateway. Passt normally
+        # redirects that address to the container's loopback, hiding the host
+        # controller. Preserve the destination so it reaches the Linux host.
+        "PASST_OPTS=--no-map-gw",
         "-e",
         "SAMBA=N",
         "-e",

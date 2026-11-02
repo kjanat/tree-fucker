@@ -415,12 +415,15 @@ fn recovery_preserves_a_reused_live_slot_and_join_respects_bookkeeping() {
     let first = retry(|| scope.join());
     let old = first.participant();
     drop(first);
-    // Closing the owner releases its lifetime handle. Recovery removes the
-    // ledger entry only when the bounded cursor next visits that slot.
-    for _ in 0..4 {
-        retry(|| scope.view());
+    // Another test can fork while this owner is open. Its inherited
+    // close-on-exec descriptor remains live until exec, even after this
+    // client is dropped. Wait for actual retirement instead of assuming the
+    // drop was the last close.
+    let deadline = Instant::now() + TIMEOUT;
+    while retry(|| scope.view()).participants != 0 {
+        assert!(Instant::now() < deadline, "closed participant never retired");
+        std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(retry(|| scope.view()).participants, 0);
     let second = retry(|| scope.join());
     let current = second.participant();
     assert_eq!(current.slot, old.slot);

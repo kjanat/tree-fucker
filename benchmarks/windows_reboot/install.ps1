@@ -10,6 +10,10 @@ foreach ($role in @('standard', 'admin')) {
 	Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $account.Name
 	if ($role -eq 'admin') { Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $account.Name }
 }
+# Ordinary concurrent user desktops require Session Host; administrative RDP
+# alone does not provide the session contract exercised by this guest.
+$sessionHost = Install-WindowsFeature RDS-RD-Server
+if (!$sessionHost.Success) { throw 'Cannot install the disposable session host' }
 # These changes apply only inside the disposable guest. The existing reboot
 # phase activates UAC before the actual session/elevation acceptance begins.
 Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -Value 1

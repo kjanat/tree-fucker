@@ -127,6 +127,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
+      - name: Check zone setup preserves streamed commands
+        run: python3 -m unittest discover -s benchmarks -p test_omnios_zone.py
       - uses: vmactions/omnios-vm@v1
         with:
           release: r151058-build

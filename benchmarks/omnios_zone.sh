@@ -12,8 +12,9 @@ zoneadm -z tree-fucker-coordination install
 zoneadm -z tree-fucker-coordination boot
 # zoneadm returns before SMF mounts /var/run. Wait for that parent tmpfs
 # before creating the rendezvous so startup cannot hide the test directory.
+# Keep zlogin off stdin: the VM action streams subsequent CI commands there.
 attempt=0
-until zlogin tree-fucker-coordination svcadm enable -s svc:/system/filesystem/minimal:default; do
+until zlogin -n tree-fucker-coordination svcadm enable -s svc:/system/filesystem/minimal:default; do
 	attempt=$((attempt + 1))
 	if [ "${attempt}" -ge 60 ]; then
 		echo "zone filesystem service did not become available" >&2
@@ -21,5 +22,5 @@ until zlogin tree-fucker-coordination svcadm enable -s svc:/system/filesystem/mi
 	fi
 	sleep 1
 done
-zlogin tree-fucker-coordination mkdir -p /var/run/tree-fucker
-zlogin tree-fucker-coordination chmod 1777 /var/run/tree-fucker
+zlogin -n tree-fucker-coordination mkdir -p /var/run/tree-fucker
+zlogin -n tree-fucker-coordination chmod 1777 /var/run/tree-fucker
