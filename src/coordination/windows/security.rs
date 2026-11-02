@@ -1,4 +1,5 @@
-//! Effective-caller checks and private Windows coordination objects.
+//! This module checks the effective caller and manages private Windows
+//! coordination objects.
 
 use std::ffi::{OsStr, c_void};
 use std::fs::File;
@@ -116,9 +117,12 @@ fn token_value<T: Default>(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io:
     Ok(value)
 }
 
-/// Session and authentication identify a live handle's caller context. Scope
-/// discovery must use the user identity, not the authentication ID: another
-/// login must reopen retained accounting instead of creating a fresh budget.
+/// `Principal` identifies the caller context of a live handle by session and
+/// authentication.
+///
+/// Scope discovery must use the user identity. The authentication ID never
+/// selects a scope, and another login must reopen retained accounting instead
+/// of creating a fresh budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Principal {
     pub sid: String,
@@ -258,6 +262,8 @@ impl Principal {
         self.open_at(parent.handle(), name, create, FILE_SHARE_READ | FILE_SHARE_WRITE, true)
     }
 
+    /// `open_at` opens `name` relative to the pinned `parent` directory.
+    ///
     /// Scope callers retain the parent pin across all journal transactions.
     pub(crate) fn open_at(
         &self,

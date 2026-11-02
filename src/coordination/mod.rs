@@ -1,4 +1,4 @@
-//! Daemonless coordination protocol.
+//! This module implements the daemonless coordination protocol.
 //!
 //! The ownership ledger, admission authority, and recoverable journal are
 //! platform-independent. Native interprocess synchronization and an installed

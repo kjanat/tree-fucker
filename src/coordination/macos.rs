@@ -1,9 +1,9 @@
-//! macOS coordination on administrator-mounted tmpfs storage.
+//! The macOS backend coordinates on administrator-mounted tmpfs storage.
 //!
 //! Discovery uses `/var/run/tree-fucker`. The retained mount and kernel
-//! monotonic clock share a boot lifetime; closing the final application does
-//! not remove accounting. Filesystem root identity and effective user qualify
-//! the scope. Sandbox denial is handled through the ordinary access checks.
+//! monotonic clock share a boot lifetime. Accounting survives the exit of the
+//! final application. Filesystem root identity and effective user qualify the
+//! scope. The ordinary access checks handle sandbox denial.
 
 use std::fs::{self, File};
 

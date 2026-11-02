@@ -4,7 +4,7 @@
 
 It combines direct directory reconciliation, optional watcher hints, explicit storage-domain semantics, and a process-wide resource governor behind one interface. The goal is simple: keep converging on reality without accidentally turning a slow, remote, gigantic, or broken filesystem into a six-hour RAM-and-I/O bonfire.
 
-> **Status:** experimental. The specification is currently a draft and the API is not yet stable.
+> **Status:** 0.1, new. The RFC is normative and the test suite covers it natively on Linux, macOS, Windows, FreeBSD and illumos. The public API changes when the RFC changes.
 
 ## What it does
 

@@ -1,3 +1,11 @@
+//! This module defines the immutable snapshot of a tree and the builder of the
+//! next snapshot.
+//!
+//! The coordinator publishes each [`Snapshot`] under a new
+//! [`SnapshotVersion`]. A [`SnapshotBuilder`] stages every change of one
+//! transaction. It yields either a complete new snapshot with its ordered
+//! path changes or nothing (RFC §7.3, §7.4).
+
 use std::cmp::Reverse;
 use std::ffi::OsStr;
 use std::fmt;
@@ -11,6 +19,14 @@ use crate::ids::{EntryGeneration, EntryId, IdHashing, IdMap, SharedIdMap, Snapsh
 use crate::path::{CaseSensitivity, PathKey, RelativePath};
 use crate::update::PathChange;
 
+/// `Snapshot` holds an immutable, versioned view of every represented entry
+/// (RFC §7.3).
+///
+/// A snapshot provides lookup by path and by [`EntryId`], ordered
+/// traversal and child traversal. It keys entries by [`PathKey`] and folds
+/// each component under the case rule of its containing directory. A
+/// directory can declare its own rule, and other directories inherit the
+/// rule of their parent. Clones are cheap and share structure.
 #[derive(Clone)]
 pub struct Snapshot {
     inner: Arc<Inner>,
@@ -64,6 +80,9 @@ fn fold(
 }
 
 impl Snapshot {
+    /// `empty` creates a snapshot with no entries.
+    ///
+    /// The snapshot applies `case` wherever no directory declares its own rule.
     pub fn empty(version: SnapshotVersion, case: CaseSensitivity) -> Snapshot {
         Snapshot {
             inner: Arc::new(Inner {
@@ -78,26 +97,37 @@ impl Snapshot {
         }
     }
 
+    /// `version` returns the publication version of this snapshot.
     pub fn version(&self) -> SnapshotVersion {
         self.inner.version
     }
 
+    /// `len` returns the number of entries, the root included.
     pub fn len(&self) -> usize {
         self.inner.by_path.len()
     }
 
+    /// `bytes` returns the estimated memory of all entries.
+    ///
+    /// [`crate::entry::entry_bytes`] defines the estimate for one entry.
     pub fn bytes(&self) -> u64 {
         self.inner.bytes
     }
 
+    /// `is_empty` reports whether the snapshot holds no entry, the root
+    /// included.
     pub fn is_empty(&self) -> bool {
         self.inner.by_path.is_empty()
     }
 
+    /// `key` derives the comparison key of `path` under the case rules of this
+    /// snapshot.
     pub fn key(&self, path: &RelativePath) -> PathKey {
         self.fold(path).0
     }
 
+    /// `child_case` returns the case rule for the children of the directory at
+    /// `path`.
     pub fn child_case(&self, path: &RelativePath) -> CaseSensitivity {
         self.fold(path).1
     }
@@ -106,45 +136,71 @@ impl Snapshot {
         fold(path, self.inner.case, &self.inner.by_path, &self.inner.child_case)
     }
 
+    /// `root` returns the root entry, or `None` before the tree represents the
+    /// root.
     pub fn root(&self) -> Option<&Entry> {
         self.get(&RelativePath::root())
     }
 
+    /// `get` looks up the entry at `path`.
+    ///
+    /// It compares names under the case rule of each directory on the path.
     pub fn get(&self, path: &RelativePath) -> Option<&Entry> {
         self.get_key(&self.key(path))
     }
 
+    /// `get_key` looks up the entry under `key`.
     pub fn get_key(&self, key: &PathKey) -> Option<&Entry> {
         self.inner.by_path.get(key).map(|e| e.as_ref())
     }
 
+    /// `parent_id` returns the id of the containing directory.
+    ///
+    /// It returns `None` for the root or an unknown id.
     pub fn parent_id(&self, id: EntryId) -> Option<EntryId> {
         let key = self.inner.by_id.get(&id)?;
         let parent = key.parent()?;
         self.inner.by_path.get(&parent).map(|entry| entry.id)
     }
 
+    /// `get_by_id` looks up an entry by id.
     pub fn get_by_id(&self, id: EntryId) -> Option<&Entry> {
         let key = self.inner.by_id.get(&id)?;
         self.get_key(key)
     }
 
+    /// `contains_id` reports whether the snapshot represents an entry with this
+    /// id.
     pub fn contains_id(&self, id: EntryId) -> bool {
         self.inner.by_id.contains_key(&id)
     }
 
+    /// `entries` iterates every entry in [`PathKey`] order.
+    ///
+    /// Each directory comes directly before its descendants.
     pub fn entries(&self) -> impl Iterator<Item = &Entry> + '_ {
         self.inner.by_path.values().map(|e| e.as_ref())
     }
 
+    /// `children` iterates the immediate children of `id` in [`PathKey`] order.
+    ///
+    /// It yields nothing for an unknown id or for a directory without
+    /// represented children.
     pub fn children(&self, id: EntryId) -> impl Iterator<Item = &Entry> + '_ {
         self.inner.children.get(&id).into_iter().flat_map(|c| c.values()).filter_map(|child| self.get_by_id(*child))
     }
 
+    /// `child_ids` returns the ids of the immediate children of `id` in
+    /// [`PathKey`] order.
     pub fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
         self.inner.children.get(&id).map(|c| c.values().copied().collect()).unwrap_or_default()
     }
 
+    /// `child_by_name` looks up the child `name` of directory `id`.
+    ///
+    /// It compares `name` under the case rule of the directory. It returns
+    /// `None` when `id` is unknown, when `name` is an invalid component, or
+    /// when the snapshot holds no such child.
     pub fn child_by_name(&self, id: EntryId, name: &OsStr) -> Option<&Entry> {
         let parent = self.get_by_id(id)?;
         let (parent_key, case) = self.fold(&parent.path);
@@ -153,10 +209,17 @@ impl Snapshot {
         self.get_by_id(*child_id)
     }
 
+    /// `child_count` returns the number of represented immediate children of
+    /// `id`.
     pub fn child_count(&self, id: EntryId) -> usize {
         self.inner.children.get(&id).map(|c| c.len()).unwrap_or(0)
     }
 
+    /// `descendants` iterates every represented descendant of `id` in
+    /// [`PathKey`] order.
+    ///
+    /// The iterator skips the entry `id` itself. It yields nothing for an
+    /// unknown id.
     pub fn descendants(&self, id: EntryId) -> impl Iterator<Item = &Entry> + '_ {
         let prefix = self.inner.by_id.get(&id).cloned();
         let start = prefix.clone();
@@ -170,10 +233,18 @@ impl Snapshot {
             .map(|(_, entry)| entry.as_ref())
     }
 
+    /// `loaded_directories` iterates the loaded directories in [`PathKey`]
+    /// order.
+    ///
+    /// It yields each directory in [`crate::entry::LoadState::Loaded`].
     pub fn loaded_directories(&self) -> impl Iterator<Item = &Entry> + '_ {
         self.entries().filter(|e| e.is_loaded())
     }
 
+    /// `builder` starts a [`SnapshotBuilder`] for the next snapshot.
+    ///
+    /// The builder shares structure with `self`, and this snapshot stays
+    /// unchanged.
     pub fn builder(&self) -> SnapshotBuilder {
         SnapshotBuilder {
             bytes: self.inner.bytes,
@@ -194,6 +265,13 @@ impl fmt::Debug for Snapshot {
     }
 }
 
+/// `SnapshotBuilder` stages changes and produces the next [`Snapshot`] with its
+/// path changes.
+///
+/// Before the first change to an entry, the builder records the prior
+/// state of that entry. [`SnapshotBuilder::finish`] compares those records
+/// with the final state and emits the net [`PathChange`] list in canonical
+/// order (RFC §7.4).
 pub struct SnapshotBuilder {
     case: CaseSensitivity,
     bytes: u64,
@@ -205,11 +283,18 @@ pub struct SnapshotBuilder {
     before: IdMap<EntryId, Option<Arc<Entry>>>,
 }
 
+/// `BuildError` explains why a [`SnapshotBuilder`] rejected an operation.
+///
+/// The builder keeps its state when it rejects an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
+    /// The parent directory of the target path is absent.
     MissingParent(RelativePath),
+    /// Another entry already occupies the target path key.
     DuplicatePath(RelativePath),
+    /// An entry with this id is already present.
     DuplicateId(EntryId),
+    /// No entry with this id is present.
     UnknownEntry(EntryId),
 }
 
@@ -227,6 +312,9 @@ impl SnapshotBuilder {
         Some(removed)
     }
 
+    /// `bytes` returns the estimated memory of all staged entries.
+    ///
+    /// [`crate::entry::entry_bytes`] defines the estimate for one entry.
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -236,19 +324,28 @@ impl SnapshotBuilder {
         fold(path, self.case, &self.by_path, &self.child_case)
     }
 
+    /// `folds` returns the number of path keys this builder has derived.
     pub fn folds(&self) -> usize {
         self.folds
     }
 
+    /// `key` derives the comparison key of `path` under the staged case rules.
     pub fn key(&mut self, path: &RelativePath) -> PathKey {
         self.fold(path).0
     }
 
+    /// `directory_key` returns the key of directory `id` and the case rule for
+    /// its children.
+    ///
+    /// It returns `None` when `id` is absent.
     pub fn directory_key(&mut self, id: EntryId) -> Option<(PathKey, CaseSensitivity)> {
         let path = self.get(id)?.path.clone();
         Some(self.fold(&path))
     }
 
+    /// `child_case` returns the case rule for the children of `id`.
+    ///
+    /// It returns the snapshot-wide default rule when `id` is absent.
     pub fn child_case(&mut self, id: EntryId) -> CaseSensitivity {
         match self.get(id).map(|entry| entry.path.clone()) {
             Some(path) => self.fold(&path).1,
@@ -256,6 +353,16 @@ impl SnapshotBuilder {
         }
     }
 
+    /// `set_child_case` declares the case rule for the children of directory
+    /// `id`.
+    ///
+    /// `None` clears the declaration, and the children inherit the rule of
+    /// the parent again. When the effective rule changes, the builder
+    /// rekeys every descendant of `id`. Several names can then fold to one
+    /// key. The builder keeps the candidate with the smallest
+    /// [`crate::entry::CollisionKey`] and removes the others with their
+    /// descendants. `set_child_case` returns the removed entries. It
+    /// returns an empty list when `id` is absent or the rule is unchanged.
     pub fn set_child_case(&mut self, id: EntryId, case: Option<CaseSensitivity>) -> Vec<Arc<Entry>> {
         if self.child_case.get(&id).copied() == case {
             return Vec::new();
@@ -338,23 +445,30 @@ impl SnapshotBuilder {
         }
     }
 
+    /// `len` returns the number of staged entries, the root included.
     pub fn len(&self) -> usize {
         self.by_path.len()
     }
 
+    /// `is_empty` reports whether the builder stages no entry.
     pub fn is_empty(&self) -> bool {
         self.by_path.is_empty()
     }
 
+    /// `get` looks up a staged entry by id.
     pub fn get(&self, id: EntryId) -> Option<&Entry> {
         let key = self.by_id.get(&id)?;
         self.by_path.get(key).map(|e| e.as_ref())
     }
 
+    /// `child_ids` returns the ids of the staged immediate children of `id` in
+    /// [`PathKey`] order.
     pub fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
         self.children.get(&id).map(|c| c.values().copied().collect()).unwrap_or_default()
     }
 
+    /// `children` returns the staged immediate children of `id` in [`PathKey`]
+    /// order.
     pub fn children(&self, id: EntryId) -> Vec<Arc<Entry>> {
         self.child_ids(id)
             .into_iter()
@@ -369,11 +483,27 @@ impl SnapshotBuilder {
         }
     }
 
+    /// `insert` derives the key of `entry.path` and adds `entry` under it.
+    ///
+    /// # Errors
+    ///
+    /// `insert` fails like [`SnapshotBuilder::insert_at`].
     pub fn insert(&mut self, entry: Entry) -> Result<(), BuildError> {
         let key = self.key(&entry.path);
         self.insert_at(key, entry)
     }
 
+    /// `insert_at` adds `entry` under a precomputed `key`.
+    ///
+    /// The caller must pass the result of [`SnapshotBuilder::key`] for
+    /// `entry.path` as `key`.
+    ///
+    /// # Errors
+    ///
+    /// `insert_at` returns [`BuildError::DuplicatePath`] when another entry
+    /// occupies `key` and [`BuildError::DuplicateId`] when the id is
+    /// present. It returns [`BuildError::MissingParent`] when a non-root
+    /// entry has no parent.
     pub fn insert_at(&mut self, key: PathKey, entry: Entry) -> Result<(), BuildError> {
         if self.by_path.contains_key(&key) {
             return Err(BuildError::DuplicatePath(entry.path.clone()));
@@ -398,6 +528,14 @@ impl SnapshotBuilder {
         Ok(())
     }
 
+    /// `update` applies `change` to the staged entry `id` in place.
+    ///
+    /// The builder restores the entry's id and path after `change` runs.
+    /// Callers move an entry with [`SnapshotBuilder::rename_subtree`].
+    ///
+    /// # Errors
+    ///
+    /// `update` returns [`BuildError::UnknownEntry`] when `id` is absent.
     pub fn update(&mut self, id: EntryId, change: impl FnOnce(&mut Entry)) -> Result<(), BuildError> {
         let key = self.by_id.get(&id).cloned().ok_or(BuildError::UnknownEntry(id))?;
         self.remember(id);
@@ -409,6 +547,11 @@ impl SnapshotBuilder {
         Ok(())
     }
 
+    /// `remove_subtree` removes entry `id` with every staged descendant and
+    /// returns them.
+    ///
+    /// It clears the case rules of the removed directories. It returns an
+    /// empty list when `id` is absent.
     pub fn remove_subtree(&mut self, id: EntryId) -> Vec<Arc<Entry>> {
         let mut removed = Vec::new();
         let mut stack = vec![id];
@@ -433,6 +576,20 @@ impl SnapshotBuilder {
         removed
     }
 
+    /// `rename_subtree` moves entry `id` to `new_path` and rebases every staged
+    /// descendant.
+    ///
+    /// Each moved entry keeps its id and advances its
+    /// [`Entry::generation`] (RFC §7.4). `rename_subtree` returns the ids
+    /// of every moved entry. It accepts a new path with the same key as the
+    /// old one, such as a case-only rename under an insensitive rule.
+    ///
+    /// # Errors
+    ///
+    /// `rename_subtree` returns [`BuildError::UnknownEntry`] when `id` is
+    /// absent and [`BuildError::DuplicatePath`] when another entry occupies
+    /// the new key. It returns [`BuildError::MissingParent`] when the new
+    /// parent is absent.
     pub fn rename_subtree(&mut self, id: EntryId, new_path: RelativePath) -> Result<Vec<EntryId>, BuildError> {
         let old_key = self.by_id.get(&id).cloned().ok_or(BuildError::UnknownEntry(id))?;
         let new_key = self.key(&new_path);
@@ -490,10 +647,20 @@ impl SnapshotBuilder {
         Ok(moved)
     }
 
+    /// `touched` iterates the ids of all modified entries in unspecified order.
+    ///
+    /// The iterator also yields an entry when a later change restored it.
     pub fn touched(&self) -> impl Iterator<Item = EntryId> + '_ {
         self.before.keys().copied()
     }
 
+    /// `finish` publishes the staged state as a snapshot under `version`.
+    ///
+    /// It returns the snapshot and the net path changes against the source
+    /// snapshot in the canonical order of RFC §7.4. Removals come first and
+    /// deepest first. Renames, kind changes and load-state changes follow.
+    /// Additions come next and shallowest first, and metadata changes come
+    /// last. An entry produces no change when a later change restored it.
     pub fn finish(self, version: SnapshotVersion) -> (Snapshot, Vec<PathChange>) {
         let sort_key = |path: &RelativePath| fold(path, self.case, &self.by_path, &self.child_case).0;
         let mut changes: Vec<(SortKey, PathChange)> = Vec::new();
@@ -603,6 +770,8 @@ impl SortKey {
     }
 }
 
+/// `new_entry` builds an entry with empty metadata, no identity and generation
+/// 0.
 pub fn new_entry(id: EntryId, path: RelativePath, shape: Shape) -> Entry {
     Entry { id, path, shape, metadata: Default::default(), identity: None, generation: EntryGeneration::new(0) }
 }

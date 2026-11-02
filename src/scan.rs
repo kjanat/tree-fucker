@@ -1,3 +1,10 @@
+//! This module provides the one-shot, governed directory walk.
+//!
+//! A [`Scan`] observes a tree once and yields each observation as a
+//! [`ScanEvent`] (RFC §9.3). It shares the host governor with every
+//! [`crate::tree::Tree`] in the process. It keeps no snapshot, watcher, or
+//! command state.
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -33,15 +40,31 @@ fn failed_listing(continuation: &Continuation) -> bool {
 
 const LONGEST_WAIT: Duration = Duration::from_secs(1);
 
+/// `Clock` supplies time and waiting to a one-shot scan.
+///
+/// [`Scan::open`] uses [`SystemClock`]. Tests pass another clock to
+/// [`Scan::open_outside_host_governor`] to control time.
 pub trait Clock: Send + Sync {
+    /// `now` returns the current monotonic time.
+    ///
+    /// Implementations must never return a smaller value than before.
     fn now(&self) -> Instant;
+
+    /// `sleep` blocks the calling thread for `duration`.
+    ///
+    /// A simulated clock may advance its time instead.
     fn sleep(&self, duration: Duration);
 
+    /// `wait_for_change` blocks until the governor changes or `timeout` passes.
+    ///
+    /// The governor changes when its change counter moves past `seen`. The
+    /// default implementation calls [`HostGovernor::wait_for_change`].
     fn wait_for_change(&self, governor: &HostGovernor, seen: u64, timeout: Duration) {
         governor.wait_for_change(seen, timeout);
     }
 }
 
+/// `SystemClock` uses [`Instant::now`] and [`std::thread::sleep`].
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -54,26 +77,50 @@ impl Clock for SystemClock {
     }
 }
 
-/// Whether non-root observations may be yielded without a retained anchor.
+/// `AnchorPolicy` decides whether a scan may yield unanchored non-root entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnchorPolicy {
+    /// `Optional` lets a listing at the anchor limit run without an anchor.
     #[default]
     Optional,
+    /// `Required` turns an unanchored listing into a limited Unlisted event.
     Required,
 }
 
+/// `ScanOptions` holds the limits and choices of one [`Scan`].
+///
+/// The default takes its values from [`Config::default`] and retains no
+/// anchors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanOptions {
+    /// `crossing` sets the default crossing mode (RFC §14.3).
+    ///
+    /// The policy may refine the mode per crossing. Follow lists the child
+    /// domain. Exclude and LoadOnDemand both yield a [`ScanEvent::Boundary`].
     pub crossing: DomainCrossing,
+    /// `fields` selects the metadata fields to report.
+    ///
+    /// When a listing omits a field, enrichment reads it.
     pub fields: MetadataFields,
+    /// `entries_per_directory` sets the entry ceiling of one listing.
     pub entries_per_directory: usize,
+    /// `entries_per_lease` sets the entry count of one listing lease.
     pub entries_per_lease: usize,
+    /// `operations_per_lease` caps per-child operations per lease or batch.
     pub operations_per_lease: usize,
+    /// `ceiling` caps the worker time of the whole scan (RFC §15.4).
+    ///
+    /// The whole scan counts as one command.
     pub ceiling: Duration,
+    /// `anchors` caps the anchor slots in use at once.
+    ///
+    /// Zero disables anchors.
     pub anchors: usize,
+    /// `anchor_policy` decides the fate of a listing without an anchor.
     pub anchor_policy: AnchorPolicy,
-    /// Yield bounded listing chunks before the directory is complete.
-    /// Requires a chunk-capable policy and filesystem session.
+    /// `streaming` makes the scan yield bounded chunks before a listing ends.
+    ///
+    /// Streaming requires a chunk-capable policy and filesystem session.
     pub streaming: bool,
 }
 
@@ -95,6 +142,13 @@ impl Default for ScanOptions {
 }
 
 impl ScanOptions {
+    /// `validate` checks the counts and the ceiling.
+    ///
+    /// The entry, lease, and operation counts must be at least one, and the
+    /// ceiling must be nonzero.
+    /// `validate` returns the reason for the first failed check.
+    /// [`Scan::open`] runs this check and reports a failure as
+    /// [`Error::InvalidConfig`].
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.entries_per_directory == 0 {
             return Err("entries_per_directory must be at least 1".into());
@@ -112,14 +166,24 @@ impl ScanOptions {
     }
 }
 
+/// `Descent` tells the consumer how the scan treats an entry (RFC §9.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Descent {
+    /// `Leaf` marks a non-directory.
     Leaf,
+    /// `Descending` marks a directory, and policy selects it for listing.
     Descending,
+    /// `Withheld` marks a directory, and policy blocks its listing.
+    ///
+    /// Policy excludes the directory or leaves it unloaded.
     Withheld,
+    /// `Unresolved` marks an entry of unknown kind without traversal.
     Unresolved,
 }
 
+/// `ScanPath` locates a scan entry relative to the scan root.
+///
+/// It stores the parent directory and the name separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanPath {
     directory: Option<RelativePath>,
@@ -127,26 +191,34 @@ pub struct ScanPath {
 }
 
 impl ScanPath {
+    /// `root` returns the path of the scan root.
     pub fn root() -> ScanPath {
         ScanPath { directory: None, name: OsString::new() }
     }
 
+    /// `is_root` reports whether this path names the scan root.
     pub fn is_root(&self) -> bool {
         self.directory.is_none()
     }
 
+    /// `directory` returns the parent directory, or `None` for the root.
     pub fn directory(&self) -> Option<&RelativePath> {
         self.directory.as_ref()
     }
 
+    /// `name` returns the final component, or `None` for the root.
     pub fn name(&self) -> Option<&OsStr> {
         self.directory.as_ref().map(|_| self.name.as_os_str())
     }
 
+    /// `depth` returns the number of components.
+    ///
+    /// The root has depth zero.
     pub fn depth(&self) -> usize {
         self.directory.as_ref().map_or(0, |directory| directory.depth() + 1)
     }
 
+    /// `path` builds the joined [`RelativePath`].
     pub fn path(&self) -> RelativePath {
         match &self.directory {
             Some(directory) => directory.joined(&self.name),
@@ -154,6 +226,7 @@ impl ScanPath {
         }
     }
 
+    /// `under` builds the native path of this entry beneath `root`.
     pub fn under(&self, root: &Path) -> PathBuf {
         match &self.directory {
             Some(directory) => directory.under(root).join(&self.name),
@@ -172,24 +245,43 @@ impl std::fmt::Display for ScanPath {
     }
 }
 
+/// `ScanEntry` describes one observed entry of a scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanEntry {
+    /// `path` locates the entry relative to the scan root.
     pub path: ScanPath,
+    /// `kind` gives the kind from the listing.
     pub kind: ObservedKind,
+    /// `identity` holds the file identity, or `None` without domain support.
     pub identity: Option<FileIdentity>,
+    /// `metadata` holds the obtained subset of the requested fields.
     pub metadata: Metadata,
+    /// `fields` names the fields in `metadata`.
     pub fields: MetadataFields,
+    /// `metadata_error` holds the enrichment failure of this entry, if any.
     pub metadata_error: Option<FsError>,
+    /// `domain` names the storage domain of the parent listing.
     pub domain: StorageDomainId,
+    /// `descent` tells how the scan treats this entry.
     pub descent: Descent,
+    /// `anchor` holds the anchor of the parent listing, if the scan kept one.
     pub anchor: Option<Anchor>,
 }
 
+/// `ScanFailure` names the reason for a [`ScanEvent::Unlisted`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScanFailure {
+    /// `Fs` means domain resolution or listing failed with a classified error.
     Fs(FsError),
+    /// `ResourceLimited` means the listing reached a configured limit.
+    ///
+    /// The limit can be the entry ceiling or the anchor limit.
     ResourceLimited(ResourceLimited),
+    /// `Quarantined` means a stuck worker quarantines the domain (RFC §13.5).
     Quarantined(StorageDomainId),
+    /// `InvalidName` carries an unsafe child name.
+    ///
+    /// The scan skips that child.
     InvalidName(OsString),
 }
 
@@ -204,34 +296,80 @@ impl std::fmt::Display for ScanFailure {
     }
 }
 
+/// `ScanEvent` is one item of a scan (RFC §9.3).
+///
+/// A directory's Entry precedes its Boundary or Unlisted event and every
+/// event of its descendants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScanEvent {
+    /// `Entry` carries one observed entry.
     Entry(ScanEntry),
-    Boundary { path: RelativePath, mode: DomainCrossing, domain: StorageDomainId },
-    Unlisted { path: RelativePath, failure: ScanFailure },
+    /// `Boundary` reports a domain crossing, and the scan stops there.
+    Boundary {
+        /// `path` locates the first directory of the child domain.
+        path: RelativePath,
+        /// `mode` gives the applied crossing mode, Exclude or LoadOnDemand.
+        mode: DomainCrossing,
+        /// `domain` names the storage domain of the child.
+        domain: StorageDomainId,
+    },
+    /// `Unlisted` reports a failed resolution or listing, or a skipped child.
+    ///
+    /// The scan continues with the siblings of `path`.
+    Unlisted {
+        /// `path` locates the affected directory.
+        path: RelativePath,
+        /// `failure` names the reason for the failure.
+        failure: ScanFailure,
+    },
 }
 
+/// `ScanStats` counts the work of one scan.
+///
+/// The host governor stays authoritative for physical occupancy and cost.
+/// These counters exclude abandoned results (RFC §9.3).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
+    /// `grants` counts the governor grants of the scan.
     pub grants: u64,
+    /// `listings` counts the listing operations of the adapter.
     pub listings: u64,
+    /// `leases` counts the completed listing leases.
     pub leases: u64,
+    /// `resolutions` counts the storage-domain resolutions.
     pub resolutions: u64,
+    /// `enrichments` counts the enrichment batches.
     pub enrichments: u64,
+    /// `metadata_operations` counts metadata operations.
+    ///
+    /// The count includes kind resolutions and [`Scan::read`] calls.
     pub metadata_operations: u64,
+    /// `entries_enumerated` counts the enumerated directory entries.
+    ///
+    /// The count includes skipped entries.
     pub entries_enumerated: u64,
+    /// `entries` counts the Entry events, with the root included.
     pub entries: u64,
+    /// `boundaries` counts the Boundary events.
     pub boundaries: u64,
+    /// `unlisted` counts the Unlisted events.
     pub unlisted: u64,
+    /// `admitted` sums the worker time of the governor grants of this scan.
     pub admitted: Duration,
+    /// `throttled` sums the time of the scan in admission waits.
     pub throttled: Duration,
+    /// `buffered_bytes` counts the bytes of currently retained listings.
     pub buffered_bytes: u64,
+    /// `peak_buffered_bytes` records the maximum of `buffered_bytes`.
     pub peak_buffered_bytes: u64,
-    /// Reserved anchor slots, including active/detached cursors and retained
+    /// `anchors_live` counts the reserved anchor slots.
+    ///
+    /// The count includes active and detached cursors and retained
     /// observations.
     pub anchors_live: usize,
-    /// Maximum simultaneously reserved anchor slots.
+    /// `anchors_peak` records the maximum of simultaneously reserved slots.
     pub anchors_peak: usize,
+    /// `anchors_withheld` counts the listings at a full anchor limit.
     pub anchors_withheld: u64,
 }
 
@@ -328,6 +466,35 @@ enum Admission {
     Quarantined(StorageDomainId),
 }
 
+/// `Scan` walks a directory tree once, synchronously and governed (RFC §9.3).
+///
+/// A scan iterates depth first, and it goes deep. It lists a directory,
+/// yields its children in enumeration order, and lists a child directory
+/// before the next sibling. The root is the first event. [`ScanPolicy`] selects
+/// the directories for listing. The scan never traverses symbolic links.
+///
+/// By default each filesystem operation runs on the calling thread after
+/// the host governor grants it. [`Scan::with_listing_executor`] moves
+/// listing leases to a bounded worker pool. Every operation draws on the
+/// foreground allowance. The whole scan counts as one command against
+/// [`ScanOptions::ceiling`]. Throttling delays a scan and never truncates
+/// it.
+///
+/// Iteration ends with `None` after the last event. A scan can also end
+/// with one error item followed by `None`.
+///
+/// - Cancellation ends it with [`Error::Cancelled`].
+/// - A Fatal adapter failure ends it with [`Error::Io`].
+/// - The ceiling or the memory limit ends it with [`Error::ResourceLimited`].
+/// - A lost worker ends it with [`Error::WorkerLost`].
+/// - A failed shared authority ends it with [`Error::Coordination`].
+/// - A streaming scan ends with [`Error::InvalidConfig`] when a listing session
+///   lacks chunk support.
+///
+/// Earlier events stay valid after the error.
+///
+/// A default scan holds no grant between events. The consumer can stop at
+/// any event and drop the scan, and the drop releases its accounted memory.
 pub struct Scan {
     filesystem: Arc<dyn FileSystem>,
     root: PathBuf,
@@ -398,6 +565,22 @@ fn nanos(value: Duration) -> u64 {
 }
 
 impl Scan {
+    /// `open` opens a scan at `root` under the process-wide host governor.
+    ///
+    /// `open` canonicalizes the root, reads its metadata, and resolves its
+    /// storage domain under bootstrap grants. The root is the first event.
+    ///
+    /// # Errors
+    ///
+    /// - `open` returns [`Error::InvalidConfig`] for invalid `options` or host
+    ///   limits. It also returns it when `options.streaming` is set and
+    ///   `policy` lacks chunk support.
+    /// - It returns [`Error::NotFound`] or [`Error::NotDirectory`] for an
+    ///   absent or non-directory root.
+    /// - It returns [`Error::Io`] when the adapter fails a root read.
+    /// - It returns [`Error::ResourceLimited`] when bootstrap reaches the
+    ///   ceiling.
+    /// - It returns [`Error::Coordination`] when the shared authority fails.
     pub fn open(
         filesystem: Arc<dyn FileSystem>,
         root: PathBuf,
@@ -407,6 +590,12 @@ impl Scan {
         Scan::open_under(filesystem, root, policy, options, host_governor(), Arc::new(SystemClock))
     }
 
+    /// `open_outside_host_governor` opens a scan under the given `governor`.
+    ///
+    /// The scan reads time from `clock`. This function is the named opt-out
+    /// of RFC §9.3 and §15.9. The process-wide governor states a bound for
+    /// the process, and work of this scan falls outside it. Its errors match
+    /// [`Scan::open`].
     pub fn open_outside_host_governor(
         filesystem: Arc<dyn FileSystem>,
         root: PathBuf,
@@ -497,21 +686,27 @@ impl Scan {
         Ok(scan)
     }
 
+    /// `root` returns the canonical root path.
     pub fn root(&self) -> &std::path::Path {
         &self.root
     }
 
+    /// `cancellation` returns the cancel token of this scan.
+    ///
+    /// Any thread can cancel the scan through the token. The next check then
+    /// yields [`Error::Cancelled`]. Listing sessions poll the token between
+    /// chunks, and a call inside the kernel runs to completion.
     pub fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
     }
 
-    /// Perform one lazy, adapter-specific read under this scan's governor.
+    /// `read` performs one lazy, adapter-specific read under the scan governor.
     ///
-    /// Invoke this before advancing past the end of the scan. The callback
-    /// receives the original observation, including its retained anchor. It
-    /// must perform at most one physical read and must not reacquire this
-    /// scan. Raw reads made outside this method are outside scan accounting.
-    /// The callback runs inline; cancellation cannot interrupt a kernel call.
+    /// The consumer calls `read` before the scan reaches its end. The callback
+    /// receives the original observation, including its retained anchor. The
+    /// callback must perform at most one physical read and must not reacquire
+    /// this scan. Scan accounting excludes raw reads outside this method. The
+    /// callback runs inline, and cancellation cannot interrupt a kernel call.
     pub fn read<T>(
         &mut self,
         entry: &ScanEntry,
@@ -549,13 +744,14 @@ impl Scan {
         result.map_err(Error::from)
     }
 
-    /// Execute subsequent listing leases on a bounded, reusable worker pool.
+    /// `with_listing_executor` moves later listing leases to `executor`.
     ///
-    /// Bootstrap, domain resolution, and enrichment remain inline. A listing
-    /// exceeding the governor's stuck threshold is reported as unlisted; its
-    /// worker, grant and buffer allowance remain held until physical
-    /// completion. Healthy domains can continue only while both pool and
-    /// governor capacity remain available.
+    /// The executor is a bounded, reusable worker pool. Bootstrap, domain
+    /// resolution, and enrichment stay inline. When a listing passes the
+    /// governor's stuck threshold, the scan reports it as unlisted. Its
+    /// worker, grant, and buffer allowance stay held until the physical call
+    /// completes. Healthy domains continue only while both pool and governor
+    /// capacity remain.
     pub fn with_listing_executor(mut self, executor: ListingExecutor) -> Self {
         self.accounting
             .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
@@ -563,6 +759,7 @@ impl Scan {
         self
     }
 
+    /// `stats` returns the current counters.
     pub fn stats(&self) -> ScanStats {
         ScanStats {
             admitted: self.admitted_cost(),

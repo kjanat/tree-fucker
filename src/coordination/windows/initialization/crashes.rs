@@ -1,4 +1,5 @@
-//! Kill native writers while the production initializer retains bookkeeping.
+//! These tests kill native writers while the production initializer retains
+//! bookkeeping.
 
 use std::fs;
 use std::process::{Child, Command, Stdio};

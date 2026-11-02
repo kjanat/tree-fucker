@@ -28,10 +28,24 @@ use crate::path::CaseSensitivity;
 const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const PATH_BUFFER: usize = 512;
 
+/// `WindowsProbe` probes storage domains on Windows through directory handles
+/// (RFC §14.3).
+///
+/// It keys a domain by the volume GUID path when the volume management
+/// call succeeds, and it reports the identity as Unknown otherwise. The
+/// volume serial number keys the filesystem instance and the identity
+/// space. A changed serial between parent and child proves a crossing,
+/// and an equal serial leaves the crossing inconclusive. The probe reads
+/// the remote-protocol information of the handle for topology. It reads
+/// the volume name and flags for semantics and identity reliability, and
+/// it reads each directory's case-sensitivity flag. The probe opens the
+/// handle without following a reparse point and rejects a reparse point
+/// as a non-directory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WindowsProbe;
 
 impl WindowsProbe {
+    /// `new` creates a Windows probe.
     pub fn new() -> WindowsProbe {
         WindowsProbe
     }

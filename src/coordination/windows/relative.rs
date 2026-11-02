@@ -1,4 +1,5 @@
-//! Pinned Windows directory traversal and single-component relative opens.
+//! This module traverses pinned Windows directories and opens single
+//! relative components.
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
@@ -37,8 +38,10 @@ fn component(name: &OsStr) -> io::Result<Vec<u16>> {
     Ok(units)
 }
 
-/// Open one child against a live directory handle. A creation descriptor is
-/// supplied only for OPEN_IF; neither disposition truncates an existing file.
+/// `open` opens one child relative to a live directory handle.
+///
+/// The function supplies a creation descriptor only for `OPEN_IF`. Neither
+/// disposition truncates an existing file.
 pub(crate) fn open(
     parent: &File,
     name: &OsStr,
@@ -97,8 +100,11 @@ pub(crate) fn open(
     Ok(file)
 }
 
-/// Ancestors stay open without delete sharing until the directory is dropped.
-/// Child operations use the final handle, never reconstruct an absolute path.
+/// `Directory` pins a directory and keeps its ancestors open without delete
+/// sharing until the directory is dropped.
+///
+/// Child operations use the final handle and never reconstruct an absolute
+/// path.
 pub(crate) struct Directory {
     file: File,
     _ancestors: Vec<File>,

@@ -1,4 +1,5 @@
-//! Boot-qualified performance-counter time for cooperating processes.
+//! This module supplies boot-qualified performance-counter time to
+//! cooperating processes.
 
 use std::io;
 
@@ -140,7 +141,9 @@ impl Clock {
         self.binding
     }
 
-    /// Choose once under bookkeeping exclusion, then publish in the journal.
+    /// `retained_binding` chooses the binding once under bookkeeping exclusion.
+    ///
+    /// The caller then publishes the result in the journal.
     pub(crate) fn retained_binding(
         &self,
         retained: Option<ClockBinding>,
@@ -159,8 +162,9 @@ impl Clock {
         }
     }
 
-    /// Bind before the connection is shared. Transactions never move its
-    /// origin.
+    /// `bind` installs `binding` before the connection is shared.
+    ///
+    /// Transactions never move the binding's origin.
     pub(crate) fn bind(&mut self, binding: ClockBinding) -> io::Result<()> {
         if Epoch::decode(binding.epoch)? != self.epoch {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "coordination clock epoch changed"));

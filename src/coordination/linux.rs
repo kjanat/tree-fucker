@@ -1,7 +1,7 @@
-//! Linux coordination on private tmpfs storage under `/dev/shm`.
+//! The Linux backend coordinates on private tmpfs storage under `/dev/shm`.
 //!
-//! The scope is qualified by user, IPC, and time namespaces. Accounting lasts
-//! for the retained tmpfs mount, independently of participant lifetimes.
+//! The user, IPC, and time namespaces qualify the scope. Accounting lasts for
+//! the retained tmpfs mount, independently of participant lifetimes.
 
 use std::fs::{self, File};
 

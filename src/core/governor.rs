@@ -1,3 +1,12 @@
+//! `governor` admits filesystem work for the whole host process.
+//!
+//! [`HostGovernor`] decides whether a filesystem operation may run. It keeps
+//! worker-time token buckets per storage domain and globally. It also keeps
+//! per-domain concurrency windows, the bootstrap allowance and the
+//! accounted-memory ceilings of RFC §15. Every tree and scan in one process
+//! shares the governor from [`host_governor`] (RFC §15.9). An opt-in shared
+//! authority extends admission across processes (`rfc/coordination.md`).
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
@@ -20,24 +29,42 @@ const LOCAL_START_WINDOW: usize = 2;
 const CONSERVATIVE_START_WINDOW: usize = 1;
 const CONSERVATIVE_TOPOLOGY_CEILING: usize = 2;
 
+/// `TreeNumber` identifies one tree or scan in the accounting of a governor.
+///
+/// [`HostGovernor::next_tree`] allocates each number once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TreeNumber(u64);
 
 impl TreeNumber {
+    /// `get` returns the raw number.
     pub fn get(self) -> u64 {
         self.0
     }
 }
 
+/// `GrantId` names one grant.
+///
+/// A grant admits one physical filesystem step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GrantId {
+    /// The grant belongs to a job of the given tree.
+    ///
+    /// The watch registration of the job shares the grant.
     Job(TreeNumber, JobId),
+    /// The grant covers a watch registration outside any job.
     WatchRegistration(TreeNumber, WatchRequestId),
+    /// The grant covers a watch release.
+    ///
+    /// Watch releases bypass the duty budgets and the memory ceilings.
     WatchRelease(TreeNumber, WatchReleaseId),
+    /// The grant covers work before its storage domain is known (RFC §10.3).
+    ///
+    /// [`HostGovernor::next_bootstrap`] allocates the number.
     Bootstrap(u64),
 }
 
 impl GrantId {
+    /// `job` returns the job of a [`GrantId::Job`].
     pub fn job(self) -> Option<JobId> {
         match self {
             GrantId::Job(_, id) => Some(id),
@@ -45,6 +72,7 @@ impl GrantId {
         }
     }
 
+    /// `release` returns the release of a [`GrantId::WatchRelease`].
     pub fn release(self) -> Option<WatchReleaseId> {
         match self {
             GrantId::WatchRelease(_, id) => Some(id),
@@ -52,6 +80,9 @@ impl GrantId {
         }
     }
 
+    /// `tree` returns the owning tree.
+    ///
+    /// A [`GrantId::Bootstrap`] has no tree and returns `None`.
     pub fn tree(self) -> Option<TreeNumber> {
         match self {
             GrantId::Job(tree, _) | GrantId::WatchRegistration(tree, _) | GrantId::WatchRelease(tree, _) => Some(tree),
@@ -68,97 +99,219 @@ struct OccupancyDelta {
     tree: Option<TreeNumber>,
 }
 
+/// `AdmissionDecision` records the outcome of one admission attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionDecision {
+    /// The governor admitted the reservation.
     Granted,
+    /// The governor refused the reservation for the given cause.
     Denied(ThrottleCause),
 }
 
+/// `Grant` records one live admission.
+///
+/// The governor holds each grant until [`HostGovernor::release`]. RFC §16
+/// requires the permitted and performed operations of each grant to be
+/// observable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
+    /// `id` identifies the grant.
     pub id: GrantId,
+    /// `path` holds the root-relative path of the target.
     pub path: RelativePath,
+    /// `lease` holds the ordinal of the lease within its job.
+    ///
+    /// The first lease has ordinal 0.
     pub lease: u32,
+    /// The grant must perform this many reads and watch registrations.
     pub required: u32,
+    /// The grant permits this many per-child operations.
     pub operations: u32,
+    /// The adapter reported this many performed operations.
+    ///
+    /// `performed` stays `None` until the first report.
     pub performed: Option<u32>,
+    /// The governor charges this storage domain.
+    ///
+    /// `None` means the bootstrap scope.
     pub domain: Option<StorageDomainId>,
+    /// The grant draws on the allowance of this origin.
     pub origin: WorkOrigin,
+    /// The governor reserved this worker time at admission.
     pub reserved: Duration,
+    /// The governor has charged this worker time so far.
+    ///
+    /// The charge is at least the reservation.
     pub charged: Duration,
+    /// The governor admitted the grant at this time.
     pub admitted: MonotonicTime,
+    /// Physical occupancy began at this time.
+    ///
+    /// `started` stays `None` while the grant waits for a worker.
     pub started: Option<MonotonicTime>,
+    /// The filesystem work began at this time.
+    ///
+    /// Any watch registration precedes this point.
     pub dispatched: Option<MonotonicTime>,
+    /// `stuck` is set once the worker exceeds [`HostConfig::stuck_threshold`].
     pub stuck: bool,
-    /// A failure observed during this physical lease, including a rejected
-    /// result.
+    /// `failed` is set when this physical lease observes a failure.
+    ///
+    /// A rejected result also counts as a failure.
     pub failed: bool,
+    /// `listing` is set when the grant covers a listing lease.
     pub listing: bool,
+    /// `registration` is set when the grant includes a watch registration.
     pub registration: bool,
+    /// The watch registration took this long.
+    ///
+    /// `registration_took` stays `None` until the duration is known.
     pub registration_took: Option<Duration>,
 }
 
+/// `DomainAccount` sums worker time for one storage domain or the bootstrap
+/// scope.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DomainAccount {
+    /// The governor reserved this worker time at admission.
     pub granted: Duration,
+    /// The governor charged this worker time.
+    ///
+    /// Overshoot and surcharges are included.
     pub charged: Duration,
+    /// The governor admitted this many grants against the account.
     pub grants: u64,
 }
 
+/// `LatencySummary` describes recent worker time per filesystem operation.
+///
+/// The window holds the latest 32 samples (RFC §15.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LatencySummary {
+    /// The window holds this many samples.
     pub samples: usize,
+    /// `minimum` holds the smallest sample.
+    ///
+    /// The minimum is the standing-delay signal.
     pub minimum: Duration,
+    /// `median` holds the median sample.
     pub median: Duration,
+    /// `mean` holds the mean sample.
     pub mean: Duration,
+    /// `tail` holds the 90th-percentile sample.
     pub tail: Duration,
 }
 
+/// `DomainView` shows the governor state of one storage domain at one instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainView {
+    /// The governor reserved this worker time on the domain at admission.
     pub granted: Duration,
+    /// The governor charged this worker time on the domain.
+    ///
+    /// Overshoot and surcharges are included.
     pub charged: Duration,
+    /// The governor admitted this many grants on the domain.
     pub grants: u64,
+    /// `capacity` holds the capacity of the domain background bucket.
     pub capacity: Duration,
+    /// `level` holds the current background bucket level.
+    ///
+    /// The level reads zero while the bucket is in debt.
     pub level: Duration,
+    /// The background bucket is this far below zero.
     pub debt: Duration,
+    /// `foreground_capacity` holds the capacity of the domain foreground
+    /// bucket.
     pub foreground_capacity: Duration,
+    /// `foreground_level` holds the current foreground bucket level.
+    ///
+    /// The level reads zero while the bucket is in debt.
     pub foreground_level: Duration,
+    /// The foreground bucket is this far below zero.
     pub foreground_debt: Duration,
+    /// `bytes_estimate` holds the moving mean of listing result bytes on the
+    /// domain.
     pub bytes_estimate: u64,
+    /// `window` holds the current concurrency window (RFC §15.5).
     pub window: usize,
+    /// The window may grow to at most this size.
     pub ceiling: usize,
+    /// This many started grants run on the domain.
     pub in_flight: usize,
+    /// This many grants on the domain are stuck.
+    ///
+    /// One stuck grant quarantines the domain.
     pub stuck: usize,
+    /// The governor estimates this worker time per filesystem operation.
     pub estimate: Duration,
+    /// `latency` covers every operation kind.
     pub latency: LatencySummary,
+    /// `listing_latency` covers listing operations.
     pub listing_latency: LatencySummary,
+    /// `metadata_latency` covers every operation other than listings.
     pub metadata_latency: LatencySummary,
+    /// `registration_latency` covers watch registrations.
     pub registration_latency: LatencySummary,
+    /// `queue_delay` holds the smallest recent delay from admission to start.
     pub queue_delay: Duration,
+    /// The governor denied this many admissions on the domain.
     pub throttled_jobs: u64,
+    /// The domain spent this long with a denial outstanding.
     pub throttled_duration: Duration,
+    /// This much time passed since the governor registered the domain.
     pub elapsed: Duration,
 }
 
 impl DomainView {
+    /// `effective_duty` returns charged worker time per elapsed second.
+    ///
+    /// `effective_duty` counts from the registration of the domain.
     pub fn effective_duty(&self) -> f64 {
         let elapsed = self.elapsed.as_secs_f64();
         if elapsed <= 0.0 { 0.0 } else { self.charged.as_secs_f64() / elapsed }
     }
 }
 
+/// `Reservation` requests admission of one physical filesystem step.
+///
+/// The governor reserves the estimated cost of every required and permitted
+/// operation (RFC §15.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reservation {
+    /// `id` identifies the resulting grant.
+    ///
+    /// The id must not name a live grant.
     pub id: GrantId,
+    /// `path` holds the root-relative path of the target.
     pub path: RelativePath,
+    /// The step must perform this many reads.
     pub reads: u32,
+    /// The step must perform this many watch registrations before its read.
     pub registrations: u32,
+    /// The step requests this many per-child operations.
+    ///
+    /// The governor permits as many as the budget affords, and at least one
+    /// when the step requests any.
     pub operations: u32,
+    /// The reserved worker time may reach at most this value.
+    ///
+    /// The remaining foreground ceiling of a command sets it.
     pub ceiling: Option<Duration>,
+    /// `lease` holds the ordinal of the lease within its job.
+    ///
+    /// The first lease has ordinal 0.
     pub lease: u32,
+    /// The governor charges this storage domain.
+    ///
+    /// `None` charges the bootstrap scope.
     pub domain: Option<StorageDomainId>,
+    /// The step draws on the allowance of this origin.
     pub origin: WorkOrigin,
+    /// `listing` is set when the step is a listing lease.
+    ///
+    /// The estimated result size of a listing counts against
+    /// [`HostConfig::in_flight_listing_bytes`].
     pub listing: bool,
 }
 
@@ -174,9 +327,14 @@ impl Reservation {
     }
 }
 
+/// `Admitted` records the terms of a successful admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
+    /// The governor reserved this worker time for the grant.
     pub cost: Duration,
+    /// The grant permits this many per-child operations.
+    ///
+    /// The work must perform no more.
     pub operations: u32,
 }
 
@@ -189,11 +347,13 @@ struct Preparation {
     physical: bool,
 }
 
-/// A provisional local budget reservation for composing admission authorities.
+/// `PreparedAdmission` holds a provisional local budget reservation.
 ///
-/// Dropping this value aborts preparation without charging work. It owns no
-/// physical capacity. Commit revalidates current policy and resource limits;
-/// only the returned admission may be used to request physical start.
+/// Callers use it to compose admission authorities. Dropping
+/// `PreparedAdmission` aborts the preparation without charging work.
+/// `PreparedAdmission` owns no physical capacity. A commit revalidates current
+/// policy and resource limits. Only the admission from the commit may request a
+/// physical start.
 #[must_use = "dropping a preparation aborts its provisional reservation"]
 pub struct PreparedAdmission {
     governor: HostGovernor,
@@ -203,14 +363,17 @@ pub struct PreparedAdmission {
 }
 
 impl PreparedAdmission {
+    /// `admitted` returns the provisional terms of the preparation.
     pub fn admitted(&self) -> Admitted {
         self.admitted
     }
 
-    /// Restrict a listing lease to the other authority's operation allowance.
+    /// `limit_operations` caps the lease operations at the allowance of the
+    /// other authority.
     ///
-    /// This does not increase a grant or release its held budget prematurely.
-    /// Commit computes the final charge using the reduced operation count.
+    /// `limit_operations` never increases a grant and keeps the held budget
+    /// until commit. Commit computes the final charge from the reduced
+    /// operation count.
     pub fn limit_operations(&mut self, maximum: std::num::NonZeroU32) {
         let mut governor = guard(&self.governor.inner);
         let prepared = governor.prepared.get_mut(&self.id).expect("preparation owns its reservation");
@@ -218,11 +381,16 @@ impl PreparedAdmission {
         self.admitted.operations = self.admitted.operations.min(maximum.get());
     }
 
-    /// Commit once, or abort if current limits no longer permit this work.
+    /// `commit` commits the preparation once.
     ///
-    /// The final operation count can be smaller than the prepared count when
-    /// estimates change. A caller composing authorities must reconcile that
-    /// count before either authority permits physical dispatch.
+    /// `commit` aborts when current limits no longer permit the work. The final
+    /// operation count can be smaller than the prepared count when estimates
+    /// change. A caller with composed authorities must reconcile that count
+    /// before either authority permits physical dispatch.
+    ///
+    /// # Errors
+    ///
+    /// `commit` returns the denial causes of [`HostGovernor::try_admit`].
     pub fn commit(mut self, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
         let mut governor = guard(&self.governor.inner);
         let mut prepared = governor.prepared.remove(&self.id).expect("preparation owns its reservation");
@@ -248,9 +416,14 @@ impl Drop for PreparedAdmission {
     }
 }
 
+/// `Reported` reports the cost of one completed step of a grant (RFC §15.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reported {
+    /// The step blocked a worker for this long.
+    ///
+    /// `None` makes the governor charge measured occupancy.
     pub blocking: Option<Duration>,
+    /// The step performed this many operations.
     pub operations: u32,
 }
 
@@ -267,39 +440,86 @@ impl Account {
     }
 }
 
+/// `GovernorView` shows the process-local governor state at one instant (RFC
+/// §16).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernorView {
+    /// `capacity` holds the capacity of the global background bucket.
     pub capacity: Duration,
+    /// `level` holds the current global background level.
+    ///
+    /// The level reads zero while the bucket is in debt.
     pub level: Duration,
+    /// The global background bucket is this far below zero.
     pub debt: Duration,
+    /// `foreground_capacity` holds the capacity of the global foreground
+    /// bucket.
     pub foreground_capacity: Duration,
+    /// `foreground_level` holds the current global foreground level.
+    ///
+    /// The level reads zero while the bucket is in debt.
     pub foreground_level: Duration,
+    /// The global foreground bucket is this far below zero.
     pub foreground_debt: Duration,
+    /// `bootstrap_capacity` holds the configured bootstrap allowance.
     pub bootstrap_capacity: Duration,
+    /// Grants without a storage domain hold this much reserved worker time.
     pub bootstrap_outstanding: Duration,
+    /// All trees together account this many bytes.
+    ///
+    /// Snapshot bytes and in-flight listing bytes count toward the total.
     pub accounted_memory: u64,
+    /// `memory_ceiling` holds the configured accounted-memory ceiling in bytes.
     pub memory_ceiling: u64,
+    /// Open listing sessions of all trees hold this many result bytes.
     pub in_flight_bytes: u64,
+    /// `in_flight_bytes_ceiling` holds the configured in-flight listing byte
+    /// ceiling.
     pub in_flight_bytes_ceiling: u64,
+    /// The governor reserved this much worker time at admission in total.
     pub reserved: Duration,
-    /// Reversible budget holds, separate from permanently admitted work.
+    /// Open preparations hold this much budget.
+    ///
+    /// The governor can reverse these holds and keeps them apart from admitted
+    /// work.
     pub prepared: Duration,
+    /// This many [`PreparedAdmission`] values are open.
     pub preparations: usize,
+    /// The governor charged this much worker time in total.
+    ///
+    /// Overshoot is included.
     pub charged: Duration,
+    /// The governor charged this much in failure surcharges.
     pub surcharged: Duration,
+    /// Adapters reported this much blocking time in total.
     pub reported_blocking: Duration,
+    /// The started grants have occupied workers this long in total.
     pub running_occupancy: Duration,
+    /// This many started grants await release.
     pub in_flight: usize,
+    /// The governor granted this many admissions.
     pub grants: u64,
+    /// The governor granted this many leases after the first lease of a job.
     pub lease_grants: u64,
+    /// The governor admitted this many watch registrations.
     pub watch_registration_grants: u64,
+    /// The governor admitted this many watch releases.
     pub watch_release_grants: u64,
+    /// The governor denied this many admissions.
     pub denials: u64,
+    /// The governor spent this long with a denial outstanding.
     pub throttled_duration: Duration,
+    /// One background operation becomes affordable at this time (RFC §12).
+    ///
+    /// `None` means one is affordable now or no refill time is computable.
     pub next_admissible: Option<MonotonicTime>,
+    /// `last_decision` records the outcome of the latest admission attempt.
     pub last_decision: Option<AdmissionDecision>,
+    /// `bootstrap` sums work without a storage domain.
     pub bootstrap: DomainAccount,
+    /// The governor estimates this worker time per bootstrap operation.
     pub bootstrap_estimate: Duration,
+    /// `domains` holds the state of every registered storage domain.
     pub domains: BTreeMap<StorageDomainId, DomainView>,
 }
 
@@ -1582,6 +1802,17 @@ impl Governor {
     }
 }
 
+/// `HostGovernor` admits filesystem work for one process.
+///
+/// Clones share one governor. Every operation of a tree or scan goes through
+/// admission, start, report and release (RFC §15.1). A governor from neither
+/// [`host_governor`] nor [`HostGovernor::install`] opts out of the process-wide
+/// bound of RFC §15.9.
+///
+/// One grant moves through [`HostGovernor::try_admit`],
+/// [`HostGovernor::try_start`], one [`HostGovernor::report`] per completed
+/// step, and [`HostGovernor::release`]. Every method takes the caller's
+/// [`MonotonicTime`]. The governor clamps a time before an earlier call.
 #[derive(Clone)]
 pub struct HostGovernor {
     inner: Arc<Mutex<Governor>>,
@@ -1606,10 +1837,18 @@ pub(crate) trait ChangeWaker: Send + Sync {
 
 static PROCESS_GOVERNOR: OnceLock<HostGovernor> = OnceLock::new();
 
+/// `HostGovernorError` reports a failure to construct or install a
+/// [`HostGovernor`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostGovernorError {
+    /// The process-wide governor is already in use.
+    ///
+    /// [`host_governor`] or an earlier installation created it.
     AlreadyInstalled,
+    /// [`HostConfig::validate`] rejected the configuration with this message.
     InvalidConfig(String),
+    /// The coordination scope failed to open or join, or its options were
+    /// invalid.
     Coordination(crate::coordination::Error),
 }
 
@@ -1632,6 +1871,11 @@ impl std::error::Error for HostGovernorError {
     }
 }
 
+/// `host_governor` returns the process-wide governor.
+///
+/// The first call creates it with [`HostConfig::default`] unless
+/// [`HostGovernor::install`] ran earlier. [`Tree::open`](crate::Tree::open) and
+/// [`Scan::open`](crate::Scan::open) use it (RFC §15.9).
 pub fn host_governor() -> HostGovernor {
     PROCESS_GOVERNOR.get_or_init(|| HostGovernor::independent(&HostConfig::default())).clone()
 }
@@ -1651,11 +1895,29 @@ fn guard_changes(changes: &Mutex<Changes>) -> MutexGuard<'_, Changes> {
 }
 
 impl HostGovernor {
+    /// `install` installs a process-only governor as the process-wide one.
+    ///
+    /// # Errors
+    ///
+    /// `install` returns [`HostGovernorError::AlreadyInstalled`] after any
+    /// earlier use of the process-wide governor. It returns
+    /// [`HostGovernorError::InvalidConfig`] when `config` fails validation.
     pub fn install(config: HostConfig) -> Result<HostGovernor, HostGovernorError> {
         Self::install_with_coordination(config, crate::coordination::Mode::ProcessOnly)
     }
 
-    /// Install policy before the first use of the process-wide governor.
+    /// `install_with_coordination` installs a coordination policy as the
+    /// process-wide governor.
+    ///
+    /// `install_with_coordination` must run before the first use of the
+    /// process-wide governor.
+    ///
+    /// # Errors
+    ///
+    /// `install_with_coordination` returns
+    /// [`HostGovernorError::AlreadyInstalled`] after any earlier use of the
+    /// process-wide governor. It otherwise returns the errors of
+    /// [`HostGovernor::configured`].
     pub fn install_with_coordination(
         config: HostConfig,
         mode: crate::coordination::Mode,
@@ -1670,7 +1932,18 @@ impl HostGovernor {
         }
     }
 
-    /// Construct an explicit governor with an observable coordination policy.
+    /// `configured` builds a governor with an observable coordination policy.
+    ///
+    /// `Auto` falls back to process-only admission when the platform lacks a
+    /// native backend. It also falls back when the rendezvous is unavailable
+    /// before join. [`HostGovernor::coordination_status`] reports the fallback
+    /// reason.
+    ///
+    /// # Errors
+    ///
+    /// `configured` returns [`HostGovernorError::InvalidConfig`] for an invalid
+    /// `config`. It returns [`HostGovernorError::Coordination`] for invalid
+    /// shared options and for any other open or join failure.
     pub fn configured(config: &HostConfig, mode: crate::coordination::Mode) -> Result<Self, HostGovernorError> {
         use crate::coordination::{self, Mode};
         config.validate().map_err(HostGovernorError::InvalidConfig)?;
@@ -1713,8 +1986,10 @@ impl HostGovernor {
         Ok(governor)
     }
 
-    /// Observe effective policy and connection health separately from local
-    /// accounting.
+    /// `coordination_status` reports the effective coordination policy and
+    /// connection health.
+    ///
+    /// `coordination_status` keeps its report separate from local accounting.
     pub fn coordination_status(&self) -> crate::coordination::Status {
         use crate::coordination::{Mode, State, Status};
         let requested = self.coordination.as_ref().map_or(Mode::ProcessOnly, |selection| selection.mode.clone());
@@ -1729,6 +2004,13 @@ impl HostGovernor {
         Status { requested, state }
     }
 
+    /// `independent` builds a process-only governor outside the process-wide
+    /// bound.
+    ///
+    /// Trees and scans under it are outside the bound of RFC §15.9. The caller
+    /// must validate `config` first.
+    /// [`Tree::open_outside_host_governor`](crate::Tree::open_outside_host_governor)
+    /// rejects an invalid one.
     pub fn independent(config: &HostConfig) -> HostGovernor {
         HostGovernor {
             inner: Arc::new(Mutex::new(Governor::new(config, MonotonicTime::ZERO))),
@@ -1747,10 +2029,19 @@ impl HostGovernor {
         }
     }
 
+    /// `changes` returns the change generation.
+    ///
+    /// The generation advances whenever released capacity, memory or a dropped
+    /// preparation can let waiting work proceed.
     pub fn changes(&self) -> u64 {
         guard_changes(&self.changes.0).generation
     }
 
+    /// `wait_for_change` blocks the calling thread until the generation leaves
+    /// `seen`.
+    ///
+    /// `wait_for_change` returns the current generation, also after `timeout`
+    /// elapses.
     pub fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
         let (lock, signal) = &*self.changes;
         let mut held = guard_changes(lock);
@@ -1782,10 +2073,16 @@ impl HostGovernor {
         }
     }
 
+    /// `limits` returns the host configuration.
     pub fn limits(&self) -> &HostConfig {
         &self.limits
     }
 
+    /// `base` returns the base instant of the governor's clock.
+    ///
+    /// Every [`MonotonicTime`] under this governor counts from this instant.
+    /// The first call fixes the base at `now`, and later calls return it
+    /// unchanged.
     pub fn base(&self, now: Instant) -> Instant {
         let mut base = match self.base.lock() {
             Ok(guard) => guard,
@@ -1794,18 +2091,27 @@ impl HostGovernor {
         *base.get_or_insert(now)
     }
 
+    /// `register_domain` creates the account of a storage domain.
+    ///
+    /// The declared topology sizes the account. Remote, userspace, virtual and
+    /// removable domains start with a window of one and a ceiling of at most
+    /// two (RFC §15.5). `register_domain` leaves a known domain unchanged.
     pub fn register_domain(&self, id: StorageDomainId, capabilities: &DomainCapabilities, now: MonotonicTime) {
         guard(&self.inner).register_domain(id, capabilities, now)
     }
 
+    /// `next_tree` allocates a new [`TreeNumber`].
     pub fn next_tree(&self) -> TreeNumber {
         guard(&self.inner).next_tree()
     }
 
+    /// `next_bootstrap` allocates a number for a new [`GrantId::Bootstrap`].
     pub fn next_bootstrap(&self) -> u64 {
         guard(&self.inner).next_bootstrap()
     }
 
+    /// `report_memory` replaces the snapshot and in-flight listing bytes of
+    /// `tree`.
     pub fn report_memory(&self, tree: TreeNumber, snapshot_bytes: u64, in_flight_bytes: u64) {
         guard(&self.inner).report_memory(tree, snapshot_bytes, in_flight_bytes);
         self.changed();
@@ -1888,68 +2194,138 @@ impl HostGovernor {
         Ok(())
     }
 
+    /// `forget_tree` removes the memory and charge accounting of `tree`.
     pub fn forget_tree(&self, tree: TreeNumber) {
         guard(&self.inner).forget_tree(tree);
         self.changed();
     }
 
+    /// `accounted_memory_excluding` returns the accounted memory of every tree
+    /// except `tree`.
     pub fn accounted_memory_excluding(&self, tree: TreeNumber) -> u64 {
         guard(&self.inner).accounted_memory_excluding(tree)
     }
 
+    /// `memory_ceiling` returns [`HostConfig::accounted_memory_ceiling`].
     pub fn memory_ceiling(&self) -> u64 {
         guard(&self.inner).memory_ceiling()
     }
 
+    /// `bytes_estimate` returns the moving mean of listing result bytes on
+    /// `domain`.
+    ///
+    /// An unknown domain returns 0.
     pub fn bytes_estimate(&self, domain: Option<StorageDomainId>) -> u64 {
         guard(&self.inner).bytes_estimate(domain)
     }
 
+    /// `record_bytes` adds a listing result size sample to `domain`.
     pub fn record_bytes(&self, domain: Option<StorageDomainId>, bytes: u64, now: MonotonicTime) {
         guard(&self.inner).record_bytes(domain, bytes, now)
     }
 
+    /// `attribute` moves the reservation and charges of a grant to `domain`.
+    ///
+    /// Work on the bootstrap scope moves to its resolved domain (RFC §10.3).
     pub fn attribute(&self, id: GrantId, domain: StorageDomainId, now: MonotonicTime) {
         guard(&self.inner).attribute(id, domain, now)
     }
 
+    /// `estimate_of` returns the estimated worker time per operation on
+    /// `domain`.
+    ///
+    /// `None` and unregistered domains use the bootstrap estimate.
     pub fn estimate_of(&self, domain: Option<StorageDomainId>) -> Duration {
         guard(&self.inner).estimate_of(domain)
     }
 
+    /// `cost_of` returns the estimated worker time of `operations` operations.
     pub fn cost_of(&self, domain: Option<StorageDomainId>, operations: u32) -> Duration {
         guard(&self.inner).cost_of(domain, operations)
     }
 
+    /// `account` refills every bucket and charges running grants their
+    /// occupancy.
+    ///
+    /// The charge of each running grant rises to its elapsed occupancy at `now`
+    /// (RFC §15.2).
     pub fn account(&self, now: MonotonicTime) {
         guard(&self.inner).account(now)
     }
 
+    /// `quarantined` reports whether a stuck grant quarantines `domain` (RFC
+    /// §13.5).
+    ///
+    /// The bootstrap scope is never quarantined.
     pub fn quarantined(&self, domain: Option<StorageDomainId>) -> bool {
         guard(&self.inner).quarantined(domain)
     }
 
+    /// `window_of` returns the concurrency window of `domain`.
+    ///
+    /// `None` returns [`HostConfig::maximum_in_flight`]. An unregistered domain
+    /// returns 1.
     pub fn window_of(&self, domain: Option<StorageDomainId>) -> usize {
         guard(&self.inner).window_of(domain)
     }
 
+    /// `global_exhausted` reports whether the global `origin` bucket cannot
+    /// afford one operation.
+    ///
+    /// `global_exhausted` prices the operation at the estimate of `domain`.
+    /// Open preparations count as spent.
     pub fn global_exhausted(&self, domain: Option<StorageDomainId>, origin: WorkOrigin) -> bool {
         guard(&self.inner).global_exhausted(domain, origin)
     }
 
+    /// `may_start` checks the global in-flight limit and the window of
+    /// `domain`.
+    ///
+    /// `may_start` uses local limits only.
+    ///
+    /// # Errors
+    ///
+    /// `may_start` returns [`ThrottleCause::Concurrency`] when either is full.
     pub fn may_start(&self, domain: Option<StorageDomainId>) -> Result<(), ThrottleCause> {
         guard(&self.inner).may_start(domain)
     }
 
+    /// `in_flight` counts the unreleased started grants of this process.
     pub fn in_flight(&self) -> usize {
         guard(&self.inner).in_flight()
     }
 
+    /// `try_admit` admits `reservation` and records a grant.
+    ///
+    /// The admission charge is irrevocable. `try_admit` derives the protocol
+    /// work class from the reservation. A denial changes no grant and only
+    /// records the denial (RFC §15.3).
+    ///
+    /// # Errors
+    ///
+    /// `try_admit` returns the denial cause. A live grant with the same id
+    /// gives [`ThrottleCause::Concurrency`]. A quarantined domain gives
+    /// [`ThrottleCause::StuckWorker`]. A memory ceiling gives
+    /// [`ThrottleCause::Memory`]. An exhausted bucket or bootstrap allowance
+    /// gives [`ThrottleCause::DutyBudget`] or
+    /// [`ThrottleCause::ForegroundCeiling`]. A refusal of the shared authority
+    /// gives a coordination cause. Watch releases skip the budget and memory
+    /// checks.
     pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
         let work = reservation.work();
         self.try_admit_work(reservation, work, now)
     }
 
+    /// `try_admit_work` admits `reservation` under an explicit protocol work
+    /// class.
+    ///
+    /// `try_admit_work` behaves as [`HostGovernor::try_admit`] does. A
+    /// process-only governor ignores `work`.
+    ///
+    /// # Errors
+    ///
+    /// `try_admit_work` returns the denial causes of
+    /// [`HostGovernor::try_admit`].
     pub fn try_admit_work(
         &self,
         reservation: Reservation,
@@ -1963,10 +2339,17 @@ impl HostGovernor {
         guard(&self.inner).try_admit(reservation, now)
     }
 
-    /// Prepare local budget without making an irreversible admission charge.
+    /// `try_prepare` prepares local budget without an irreversible admission
+    /// charge.
     ///
-    /// Other admissions observe this hold. No mutex or physical worker remains
-    /// held after this call. Dropping the returned guard aborts preparation.
+    /// Other admissions observe this hold. `try_prepare` keeps no mutex and no
+    /// physical worker. Dropping the returned guard aborts the preparation.
+    ///
+    /// # Errors
+    ///
+    /// `try_prepare` returns the denial causes of [`HostGovernor::try_admit`].
+    /// It returns [`ThrottleCause::Concurrency`] while
+    /// [`HostConfig::maximum_in_flight`] preparations are open.
     pub fn try_prepare(
         &self,
         reservation: Reservation,
@@ -1977,10 +2360,15 @@ impl HostGovernor {
         Ok(PreparedAdmission { governor: self.clone(), id, admitted, armed: true })
     }
 
+    /// `report` records the cost of one completed step of grant `id`.
+    ///
+    /// The charge rises to the reported blocking time. Measured occupancy caps
+    /// the rise, and the charge stays at least the reservation (RFC §15.2).
     pub fn report(&self, id: GrantId, reported: Reported, now: MonotonicTime) {
         guard(&self.inner).report(id, reported, now)
     }
 
+    /// `overshoot_of` returns the charge of grant `id` beyond its reservation.
     pub fn overshoot_of(&self, id: GrantId) -> Duration {
         guard(&self.inner).overshoot_of(id)
     }
@@ -1989,14 +2377,26 @@ impl HostGovernor {
         guard(&self.inner).prepared.get(&id).map(|held| held.admitted.cost).unwrap_or_default()
     }
 
+    /// `charge_surcharge` charges [`HostConfig::failure_surcharge`] to the
+    /// `origin` bucket of `domain`.
     pub fn charge_surcharge(&self, domain: Option<StorageDomainId>, origin: WorkOrigin, now: MonotonicTime) {
         guard(&self.inner).charge_surcharge(domain, origin, now)
     }
 
+    /// `charged_by_tree` sums the charges of every grant of `tree`.
     pub fn charged_by_tree(&self, tree: TreeNumber) -> Duration {
         guard(&self.inner).charged_by_tree(tree)
     }
 
+    /// `try_start` begins the physical occupancy of grant `id` at `at`.
+    ///
+    /// A shared authority must also authorize the start.
+    ///
+    /// # Errors
+    ///
+    /// `try_start` returns [`ThrottleCause::Concurrency`] for an unknown grant,
+    /// a full window or a full in-flight limit. It returns a coordination cause
+    /// when a shared authority refuses.
     pub fn try_start(&self, id: GrantId, at: MonotonicTime) -> Result<(), ThrottleCause> {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
         if let Some(shared) = &self.shared {
@@ -2005,6 +2405,10 @@ impl HostGovernor {
         guard(&self.inner).try_start(id, at)
     }
 
+    /// `start` begins the physical occupancy of grant `id` without checks.
+    ///
+    /// `start` skips the concurrency checks. Under a shared authority `start`
+    /// calls [`HostGovernor::try_start`] and discards the result.
     pub fn start(&self, id: GrantId, at: MonotonicTime) {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
         if self.shared.is_some() {
@@ -2016,10 +2420,18 @@ impl HostGovernor {
         guard(&self.inner).start(id, at)
     }
 
+    /// `dispatch` records when grant `id` began its filesystem work.
+    ///
+    /// Any watch registration precedes this point. Latency samples count from
+    /// here.
     pub fn dispatch(&self, id: GrantId, at: MonotonicTime) {
         guard(&self.inner).dispatch(id, at)
     }
 
+    /// `release` ends grant `id` and returns its slot.
+    ///
+    /// A started grant adds a latency sample per performed operation and adapts
+    /// its domain window (RFC §15.5). `release` ignores an unknown grant.
     pub fn release(&self, id: GrantId, now: MonotonicTime) {
         self.release_was_stuck(id, now);
     }
@@ -2037,12 +2449,16 @@ impl HostGovernor {
         stuck
     }
 
+    /// `record_outcome` adds a success or error sample to the history of
+    /// `domain`.
+    ///
+    /// An error shrinks the domain window.
     pub fn record_outcome(&self, domain: Option<StorageDomainId>, error: bool, now: MonotonicTime) {
         guard(&self.inner).record_outcome(domain, error, now)
     }
 
-    /// Cooperatively supervise live calls even after their original waiter
-    /// left.
+    /// `account_and_quarantine` supervises live calls cooperatively, also after
+    /// their original waiter left.
     pub(crate) fn account_and_quarantine(&self, now: MonotonicTime) {
         let mut governor = guard(&self.inner);
         governor.account(now);
@@ -2061,8 +2477,9 @@ impl HostGovernor {
         guard(&self.inner).record_grant_failure(id, now);
     }
 
-    /// Preserve the physical outcome when its local surcharge is accounted by
-    /// the tree's logical completion path.
+    /// `note_grant_failure` preserves the physical outcome of a failed grant.
+    ///
+    /// The logical completion path of the tree accounts its local surcharge.
     pub(crate) fn note_grant_failure(&self, id: GrantId) {
         let mut governor = guard(&self.inner);
         if let Some(grant) = governor.grants.get_mut(&id)
@@ -2093,30 +2510,55 @@ impl HostGovernor {
         }
     }
 
+    /// `newly_stuck` returns the running grants that just crossed the stuck
+    /// threshold.
+    ///
+    /// [`HostConfig::stuck_threshold`] sets the threshold. `newly_stuck`
+    /// excludes grants with an earlier stuck mark.
     pub fn newly_stuck(&self, now: MonotonicTime) -> Vec<GrantId> {
         guard(&self.inner).newly_stuck(now)
     }
 
+    /// `mark_stuck` declares grant `id` stuck.
+    ///
+    /// `mark_stuck` quarantines the domain until the grant returns. It refunds
+    /// the global overshoot, halves the window and charges the failure
+    /// surcharge once (RFC §13.5, §15.3).
     pub fn mark_stuck(&self, id: GrantId, now: MonotonicTime) {
         guard(&self.inner).mark_stuck(id, now)
     }
 
+    /// `domain_of_grant` returns the charged domain of grant `id`.
     pub fn domain_of_grant(&self, id: GrantId) -> Option<StorageDomainId> {
         guard(&self.inner).domain_of_grant(id)
     }
 
+    /// `stuck_grants` returns every grant with a stuck mark.
     pub fn stuck_grants(&self) -> Vec<Grant> {
         guard(&self.inner).stuck_grants().cloned().collect()
     }
 
+    /// `next_stuck_deadline` returns the next time a running grant becomes
+    /// stuck.
     pub fn next_stuck_deadline(&self) -> Option<MonotonicTime> {
         guard(&self.inner).next_stuck_deadline()
     }
 
+    /// `admissible_at` returns when `domain` can afford one background
+    /// operation.
+    ///
+    /// `None` means the domain can afford it now or no refill time is
+    /// computable. Quarantine has no computable refill time (RFC §12).
     pub fn admissible_at(&self, domain: Option<StorageDomainId>, now: MonotonicTime) -> Option<MonotonicTime> {
         guard(&self.inner).admissible_at(domain, now)
     }
 
+    /// `throttle` returns the host-wide throttle cause and its resume time.
+    ///
+    /// The resume time is `None` when it is not computable. Coordination
+    /// failure and shared retry rank first. Memory ranks second. Exhausted
+    /// budgets with an outstanding denial rank third, and stuck workers rank
+    /// last. `None` means admission is nominal.
     pub fn throttle(&self, now: MonotonicTime) -> Option<(ThrottleCause, Option<MonotonicTime>)> {
         if self.coordination_error().is_some() {
             return Some((ThrottleCause::CoordinationFailed, None));
@@ -2127,6 +2569,9 @@ impl HostGovernor {
         guard(&self.inner).throttle(now)
     }
 
+    /// `resume_at` returns the earliest time throttled admission may resume.
+    ///
+    /// `resume_at` returns `None` when no time is computable.
     pub fn resume_at(&self, now: MonotonicTime) -> Option<MonotonicTime> {
         let local = guard(&self.inner).resume_at(now);
         match (local, self.coordination_retry_at(now)) {
@@ -2135,6 +2580,11 @@ impl HostGovernor {
         }
     }
 
+    /// `coordination_error` returns the failure that stopped the shared
+    /// authority.
+    ///
+    /// A process-only governor returns `None`. After a failure no new work
+    /// starts.
     pub fn coordination_error(&self) -> Option<String> {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
         if let Some(shared) = &self.shared {
@@ -2143,6 +2593,10 @@ impl HostGovernor {
         None
     }
 
+    /// `coordination_retry_at` returns the next retry time for a refused shared
+    /// admission.
+    ///
+    /// A process-only governor returns `None`.
     pub fn coordination_retry_at(&self, _now: MonotonicTime) -> Option<MonotonicTime> {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
         if let Some(shared) = &self.shared {
@@ -2159,6 +2613,10 @@ impl HostGovernor {
         BTreeSet::new()
     }
 
+    /// `timer_hints` returns three timer hints in one call.
+    ///
+    /// The hints are the resume time, the background resume time and the next
+    /// stuck deadline.
     pub fn timer_hints(
         &self,
         now: MonotonicTime,
@@ -2167,6 +2625,11 @@ impl HostGovernor {
         (governor.resume_at(now), governor.background_resume_at(now), governor.next_stuck_deadline())
     }
 
+    /// `domain_health_map` sets each domain entry of `into` to its resource
+    /// health.
+    ///
+    /// `queued` names the domains with waiting work. A full window reports
+    /// [`ThrottleCause::Concurrency`] only for those domains (RFC §15.6).
     pub fn domain_health_map(
         &self,
         now: MonotonicTime,
@@ -2187,14 +2650,20 @@ impl HostGovernor {
         }
     }
 
+    /// `grants` returns every live grant.
     pub fn grants(&self) -> Vec<Grant> {
         guard(&self.inner).grants().cloned().collect()
     }
 
+    /// `new_grants_into` appends every unseen live grant to `into`.
+    ///
+    /// The `seen` callback receives the id and lease of each grant. It returns
+    /// `true` for a known grant.
     pub fn new_grants_into(&self, into: &mut Vec<Grant>, seen: &dyn Fn(GrantId, u32) -> bool) {
         into.extend(guard(&self.inner).grants().filter(|grant| !seen(grant.id, grant.lease)).cloned());
     }
 
+    /// `view` returns the governor state at `now`.
     pub fn view(&self, now: MonotonicTime) -> GovernorView {
         guard(&self.inner).view(now)
     }

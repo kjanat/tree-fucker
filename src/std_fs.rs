@@ -1,3 +1,11 @@
+//! [`StdFileSystem`] implements [`FileSystem`] over `std::fs` and platform
+//! calls.
+//!
+//! It lists directories through a [`StdSession`] over a [`PlatformSource`]. On
+//! Unix a listing holds a directory descriptor, opens with `O_NOFOLLOW`, and
+//! can retain the descriptor as a [`DirectoryAnchor`]. The adapter offers no
+//! watcher.
+
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +23,11 @@ use crate::fs::{
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
 
+/// `StdFileSystem` adapts the operating system's filesystem to [`FileSystem`].
+///
+/// It resolves storage domains with a [`DomainProbe`]. It reports
+/// [`WatcherKind::None`] and answers [`FileSystem::watch`] with
+/// [`FsError::Unsupported`].
 pub struct StdFileSystem {
     case: CaseSensitivity,
     probe: Arc<dyn DomainProbe>,
@@ -54,6 +67,11 @@ fn platform_probe() -> Arc<dyn DomainProbe> {
     }
 }
 
+/// `inline_metadata_sources` reports how the platform enumeration supplies each
+/// metadata field (RFC §10.1).
+///
+/// On Windows timestamps and size are inline and permissions need a
+/// per-child read. Elsewhere every field needs a per-child read.
 pub fn inline_metadata_sources() -> MetadataSources {
     if cfg!(windows) {
         MetadataSources {
@@ -68,6 +86,11 @@ pub fn inline_metadata_sources() -> MetadataSources {
 }
 
 impl StdFileSystem {
+    /// `new` creates an adapter with the platform's case sensitivity and domain
+    /// probe.
+    ///
+    /// Paths are case-insensitive on Windows and macOS and case-sensitive
+    /// elsewhere.
     pub fn new() -> StdFileSystem {
         StdFileSystem {
             case: if cfg!(any(windows, target_os = "macos")) {
@@ -79,10 +102,14 @@ impl StdFileSystem {
         }
     }
 
+    /// `with_case` creates an adapter with `case` and the platform domain
+    /// probe.
     pub fn with_case(case: CaseSensitivity) -> StdFileSystem {
         StdFileSystem { case, probe: platform_probe() }
     }
 
+    /// `with_probe` creates an adapter with `case` and a caller-supplied domain
+    /// probe.
     pub fn with_probe(case: CaseSensitivity, probe: Arc<dyn DomainProbe>) -> StdFileSystem {
         StdFileSystem { case, probe }
     }
@@ -131,6 +158,10 @@ impl StdFileSystem {
     }
 }
 
+/// [`StdFileSystem`] retains a `DirectoryAnchor` for an anchored listing.
+///
+/// On Unix it owns a duplicate of the listed directory's descriptor.
+/// [`Anchor::get`] returns it from an [`Anchor`].
 pub struct DirectoryAnchor {
     path: PathBuf,
     #[cfg(unix)]
@@ -138,6 +169,7 @@ pub struct DirectoryAnchor {
 }
 
 impl DirectoryAnchor {
+    /// `path` returns the directory's path from when the listing opened it.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -306,27 +338,57 @@ impl FileSystem for StdFileSystem {
 
 const STD_CHUNK: usize = 1024;
 
+/// An [`EntrySource`] yields each child as a `RawEntry`.
 pub struct RawEntry {
+    /// `name` holds the child's file name exactly as the platform reports it.
     pub name: OsString,
+    /// `kind` holds the child's kind, and `None` means the enumeration left it
+    /// unknown.
     pub kind: Option<EntryKind>,
+    /// `identity` holds the child's identity when the enumeration supplies it
+    /// inline.
     pub identity: Option<FileIdentity>,
+    /// Enumeration supplies the fields in `metadata` inline.
     pub metadata: Metadata,
 }
 
+/// An `EntrySource` enumerates directory entries under a [`StdSession`].
 pub trait EntrySource: Send {
+    /// `next_entry` yields the next child and skips `.` and `..`.
+    ///
+    /// A `None` result ends the enumeration.
     fn next_entry(&mut self) -> Option<Result<RawEntry, FsError>>;
+
+    /// `resolve_kind` reads the kind of child `name` without following a
+    /// symbolic link.
     fn resolve_kind(&mut self, name: &OsStr) -> Result<EntryKind, FsError>;
+
+    /// `resolve_identity` reads the identity of child `name` with a per-child
+    /// operation.
     fn resolve_identity(&mut self, name: &OsStr) -> Result<Option<FileIdentity>, FsError>;
+
+    /// `resolves_by_descriptor` reports whether resolution reads go through the
+    /// held directory handle.
+    ///
+    /// When true, [`FsError::NotFound`] proves the child vanished and the
+    /// session drops it. When false, the session keeps the child with an
+    /// unresolved kind or absent identity (RFC §10.1).
     fn resolves_by_descriptor(&self) -> bool;
 
+    /// `anchor` returns an anchor for the directory at `path` when the source
+    /// can retain one.
     fn anchor(&self, _path: &Path) -> Option<Anchor> {
         None
     }
 }
 
+/// A [`StdSession`] opener returns the opened directory as `Opened`.
 pub struct Opened<S> {
+    /// `directory` describes the opened directory.
     pub directory: EntryInfo,
+    /// `domain` identifies the opened directory's storage domain.
     pub domain: ProbeResult,
+    /// `source` enumerates the directory's children.
     pub source: S,
 }
 
@@ -382,6 +444,11 @@ fn open_platform(
     Ok(Opened { directory, domain, source })
 }
 
+/// [`StdFileSystem`] lists directories with `PlatformSource`, the platform
+/// [`EntrySource`].
+///
+/// On Unix it reads a held directory descriptor. Elsewhere it wraps
+/// [`std::fs::ReadDir`].
 pub struct PlatformSource {
     #[cfg(not(unix))]
     full: PathBuf,
@@ -530,6 +597,12 @@ enum ChunkEnd {
     Suspended,
 }
 
+/// `StdSession` implements [`ListingSession`] over any [`EntrySource`].
+///
+/// The session runs its opener on the first resume and enumerates in
+/// fixed-size chunks. When the operations lease runs out before a kind or
+/// identity read, it holds that entry and yields. It drains buffered entries
+/// through [`ListingSession::take_chunk`].
 pub struct StdSession<S> {
     full: PathBuf,
     ceilings: Ceilings,
@@ -544,6 +617,9 @@ pub struct StdSession<S> {
 }
 
 impl<S: EntrySource + 'static> StdSession<S> {
+    /// `new` creates a session for the directory at `full`.
+    ///
+    /// The session runs `opener` on its first resume.
     pub fn new(
         full: PathBuf,
         ceilings: Ceilings,
@@ -564,6 +640,8 @@ impl<S: EntrySource + 'static> StdSession<S> {
         }
     }
 
+    /// `anchored` makes the session attach an anchor of the listed directory to
+    /// every returned listing.
     pub fn anchored(mut self) -> StdSession<S> {
         self.anchored = true;
         self
@@ -713,6 +791,7 @@ impl<S: EntrySource + 'static> StdSession<S> {
         self.stashed.is_none() && matches!(self.stream, Stream::Exhausted(_))
     }
 
+    /// `path` returns the full path of the listed directory.
     pub fn path(&self) -> &Path {
         &self.full
     }

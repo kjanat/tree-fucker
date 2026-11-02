@@ -1,4 +1,4 @@
-//! FreeBSD retained tmpfs coordination.
+//! The FreeBSD backend coordinates on retained tmpfs storage.
 //!
 //! Discovery uses an administrator-mounted tmpfs at `/var/run/tree-fucker`.
 //! Explicit scopes must also reside on tmpfs. The filesystem root and effective

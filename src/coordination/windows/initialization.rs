@@ -1,4 +1,6 @@
-//! Initialize only unpublished state; retain committed debt through reopen.
+//! The initializer initializes only unpublished state.
+//!
+//! Reopening retains committed debt.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 

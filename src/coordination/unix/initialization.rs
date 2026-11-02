@@ -1,4 +1,5 @@
-//! Process interruption during the first anchor and journal publication.
+//! These tests interrupt the process during the first anchor and journal
+//! publication.
 
 #[path = "../../../tests/coordination_support/fifo.rs"]
 mod native_fifo;

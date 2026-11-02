@@ -1,8 +1,10 @@
-//! Shared admission policy, independent of any transport or storage mapping.
+//! This module implements the shared admission policy independently of any
+//! transport or storage mapping.
 //!
 //! One authority owns the buckets for its entire lifetime, including periods
-//! with no participants. A backend must persist the whole transaction, not
-//! only the ownership ledger, before publishing an admission decision.
+//! with no participants. A backend must persist the whole transaction,
+//! including the buckets and the ownership ledger, before it publishes an
+//! admission decision.
 
 use super::clock_binding::ClockBinding;
 use super::protocol::{self, Generation, Ledger, Limits, OperationId, Participant, Phase, Progress, Work};
@@ -11,39 +13,89 @@ use crate::HostConfig;
 mod codec;
 
 const SECOND: u128 = 1_000_000_000;
+/// `MAX_DOMAINS` is the largest domain-table length an authority accepts.
 pub const MAX_DOMAINS: u32 = 4096;
 
+/// `Origin` selects the foreground or background buckets for a request.
+///
+/// RFC §15.4 assigns command reads and one-shot scans to the foreground
+/// allowance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
+    /// The request draws on the background buckets.
     Background,
+    /// The request draws on the foreground buckets.
     Foreground,
 }
 
-/// Exact fixed-point refill and burst configuration, in worker nanoseconds.
+/// `Budget` configures one token bucket over worker time in exact fixed
+/// point.
+///
+/// RFC §15.3 defines the bucket semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
+    /// `refill_ns_per_second` holds the worker nanoseconds that the bucket
+    /// regains per wall-clock second.
+    ///
+    /// The rate must be positive and at most one worker-second per second for
+    /// each unit of the physical ceiling.
     pub refill_ns_per_second: u64,
+    /// `burst_ns` caps the bucket level in worker nanoseconds and must be
+    /// positive.
     pub burst_ns: u64,
 }
 
+/// `Config` holds the authoritative limits of a shared authority.
+///
+/// Every participant must present the same configuration, and a joiner
+/// cannot replace it. [`Config::from_host`] derives one from a
+/// [`HostConfig`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// `ownership` sizes the ownership tables and sets the global physical
+    /// ceiling.
     pub ownership: Limits,
+    /// `domains` bounds the domain accounts, from 1 to [`MAX_DOMAINS`].
     pub domains: u32,
+    /// `background` configures the global background bucket.
     pub background: Budget,
+    /// `foreground` configures the global foreground bucket.
     pub foreground: Budget,
+    /// `domain_background` configures each domain's background bucket.
     pub domain_background: Budget,
+    /// `domain_foreground` configures each domain's foreground bucket.
     pub domain_foreground: Budget,
+    /// `bootstrap_ns` bounds the worker time that domainless work may hold in
+    /// reservations at once, and it must be positive.
     pub bootstrap_ns: u64,
+    /// `per_domain_physical` bounds the operations of one domain that hold
+    /// physical capacity at once.
+    ///
+    /// It must be positive and at most `ownership.physical`.
     pub per_domain_physical: u32,
+    /// `initial_estimate_ns` holds the positive per-operation cost that the
+    /// authority assumes before a domain has samples, and for all domainless
+    /// work.
     pub initial_estimate_ns: u64,
+    /// `stuck_after_ns` holds the occupancy after which an operation becomes
+    /// stuck and quarantines its domain.
     pub stuck_after_ns: u64,
+    /// `failure_surcharge_ns` holds the worker time that the authority charges
+    /// to the domain once for each failed or stuck operation.
     pub failure_surcharge_ns: u64,
 }
 
 impl Config {
-    /// Convert local policy units without truncating a duration or counter.
-    /// Accounted process memory is intentionally not a shared-memory ceiling.
+    /// `from_host` converts local policy units without truncating a duration
+    /// or counter.
+    ///
+    /// The caller supplies the table sizes. The shared configuration carries
+    /// no ceiling for accounted process memory, and that limit stays local.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when `host` fails validation, a value
+    /// does not fit, or the result fails the authority's bounds.
     pub fn from_host(host: &HostConfig, participants: u32, operations: u32, domains: u32) -> Result<Self, Error> {
         host.validate().map_err(|_| Error::InvalidConfig)?;
         let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).map_err(|_| Error::InvalidConfig);
@@ -100,18 +152,29 @@ impl Config {
     }
 }
 
-/// Positive identity evidence established by the backend, not a local
-/// StorageDomainId or pathname hash. All three components qualify equality.
+/// `SharedDomainKey` carries positive domain identity evidence from the
+/// backend.
+///
+/// A process-local [`StorageDomainId`](crate::StorageDomainId) or a pathname
+/// hash never qualifies as such evidence. Two keys match only when all three
+/// components are equal (coordination.md, "Identities and bounded state").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SharedDomainKey {
+    /// `namespace` identifies the namespace that qualifies the filesystem
+    /// identity.
     pub namespace: [u8; 16],
+    /// `filesystem` identifies the filesystem or mount within the namespace.
     pub filesystem: [u8; 16],
+    /// `incarnation` bounds the lifetime of the filesystem identity.
     pub incarnation: [u8; 16],
 }
 
+/// `DomainId` names one domain account within an authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DomainId {
+    /// `generation` names the authority that registered the account.
     pub generation: Generation,
+    /// `slot` indexes the account in the domain table.
     pub slot: u32,
 }
 
@@ -121,39 +184,73 @@ enum DomainKey {
     Private(Participant, u64),
 }
 
+/// `Request` describes the work a participant asks the authority to admit.
+///
+/// The grant covers the required operations plus as many desired operations
+/// as the buckets afford, and at least one when any are desired (RFC §15.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
+    /// `work` names the source of the work.
     pub work: Work,
+    /// `origin` selects the foreground or background buckets.
     pub origin: Origin,
+    /// `domain` names the domain account, and `None` marks domainless
+    /// bootstrap work.
     pub domain: Option<DomainId>,
+    /// `required` holds the operation count that the grant must cover.
     pub required: u32,
+    /// `desired` holds the maximum number of optional operations that the
+    /// caller asks for.
     pub desired: u32,
-    /// A caller may tighten the scope allowance, never raise it.
+    /// `ceiling_ns` caps the reserved worker time in nanoseconds.
+    ///
+    /// A caller may tighten the scope allowance and can never raise it.
     pub ceiling_ns: u64,
 }
 
+/// `Admission` describes the lease that the authority granted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admission {
+    /// `cost_ns` holds the worker time in nanoseconds that the authority
+    /// reserved.
     pub cost_ns: u64,
-    /// Total permitted operations, including required operations.
+    /// `operations` counts the total permitted operations, including required
+    /// operations.
     pub operations: u32,
+    /// `optional_operations` counts the permitted operations beyond the
+    /// required ones.
     pub optional_operations: u32,
 }
 
+/// `Error` reports why the authority refused a request or transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The ownership ledger rejected the transition.
     Protocol(protocol::Error),
+    /// The configuration fails validation.
     InvalidConfig,
+    /// The domain table is full, and the authority never evicts an account.
     DomainCapacity,
+    /// The domain ID belongs to another generation or names no account.
     UnknownDomain,
+    /// The global or domain bucket cannot afford the lease after subtracting
+    /// the holds of other preparations.
     Budget,
-    /// The minimum lease exceeds the caller limit; refill cannot admit it.
+    /// The minimum lease exceeds the caller's ceiling, and refill can never
+    /// admit it.
     Ceiling {
+        /// `minimum_ns` holds the cost in nanoseconds of the smallest
+        /// admissible lease.
         minimum_ns: u64,
     },
+    /// Domainless work would exceed the bootstrap allowance.
     Bootstrap,
+    /// The domain has a stuck operation, and the authority admits no new work
+    /// on it.
     Quarantined,
+    /// The domain already has the configured number of physical operations.
     DomainPhysical,
+    /// The reported elapsed time exceeds the occupancy since authorization.
     InvalidReport,
 }
 
@@ -240,26 +337,47 @@ struct Account {
     failed: bool,
 }
 
-/// Values are separate from local governor totals and must not be added to
-/// them as if two filesystem operations occurred.
+/// `View` reports the shared accounting of an authority.
+///
+/// `View` describes the same operations as the local governor totals a second
+/// time. The caller must not add the two views together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct View {
+    /// `participants` counts the registered participants.
     pub participants: usize,
+    /// `domains` counts the registered domain accounts.
     pub domains: usize,
+    /// `physical` counts the operations that occupy physical capacity.
     pub physical: u32,
+    /// `prepared` counts the operations in the prepared phase.
     pub prepared: usize,
+    /// `charged_ns` totals every worker nanosecond charged since the authority
+    /// was created.
     pub charged_ns: u128,
+    /// `surcharged_ns` totals every failure surcharge since the authority was
+    /// created.
     pub surcharged_ns: u128,
+    /// `withheld_ns` holds the global debt that stuck operations defer until
+    /// they settle or the backend reclaims them.
     pub withheld_ns: u128,
+    /// `background_level_ns` holds the global background bucket level, and it
+    /// is negative while the bucket is in debt.
     pub background_level_ns: i128,
+    /// `foreground_level_ns` holds the global foreground bucket level, and it
+    /// is negative while the bucket is in debt.
     pub foreground_level_ns: i128,
+    /// `bootstrap_reserved_ns` holds the reservations of live domainless
+    /// operations.
     pub bootstrap_reserved_ns: u128,
 }
 
-/// The deterministic shared authority used by storage adapters.
+/// `Authority` is the deterministic shared admission state that native
+/// backends persist.
 ///
-/// Configuration cannot be replaced by joiners. Domain accounts deliberately
-/// survive departure and are not evicted to manufacture a fresh allowance.
+/// Joiners cannot replace the configuration. Domain accounts survive
+/// participant departure, and the authority never evicts one to manufacture a
+/// fresh allowance. Every method that takes `now` first refills buckets and
+/// charges running occupancy up to that authority time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authority {
     config: Config,
@@ -275,6 +393,12 @@ pub struct Authority {
 }
 
 impl Authority {
+    /// `new` creates an authority with full buckets at authority time `now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] for an invalid configuration, and a
+    /// protocol error for a zero generation or a failed table allocation.
     pub fn new(generation: Generation, config: Config, now: u64) -> Result<Self, Error> {
         config.validate()?;
         let ledger = Ledger::new(generation, config.ownership)?;
@@ -301,15 +425,17 @@ impl Authority {
         })
     }
 
+    /// `config` returns the authoritative configuration.
     pub fn config(&self) -> Config {
         self.config
     }
 
+    /// `ledger` returns the ownership ledger.
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
     }
 
-    /// Latest committed logical timestamp used by the shared authority.
+    /// `now` returns the latest committed logical timestamp of the authority.
     #[cfg(windows)]
     pub(crate) fn now(&self) -> u64 {
         self.now
@@ -325,25 +451,38 @@ impl Authority {
         self.clock_binding = Some(binding);
     }
 
+    /// `join` registers a participant through [`Ledger::join`].
     pub fn join(&mut self, version: u32) -> Result<Participant, Error> {
         Ok(self.ledger.join(version)?)
     }
 
+    /// `join_owned` registers a participant with lifetime evidence through
+    /// [`Ledger::join_owned`].
     pub fn join_owned(&mut self, version: u32, slot: u32, owner: [u8; 16]) -> Result<Participant, Error> {
         Ok(self.ledger.join_owned(version, slot, owner)?)
     }
 
+    /// `leave` removes a participant through [`Ledger::leave`].
+    ///
+    /// The participant's private domain accounts survive its departure.
     pub fn leave(&mut self, participant: Participant) -> Result<(), Error> {
         Ok(self.ledger.leave(participant)?)
     }
 
+    /// `register_shared_domain` returns the account for `key` and creates it
+    /// on first use.
+    ///
+    /// Every participant that presents an equal key shares the account.
     pub fn register_shared_domain(&mut self, key: SharedDomainKey) -> Result<DomainId, Error> {
         self.register_domain(DomainKey::Shared(key))
     }
 
-    /// Inconclusive identities get private domain accounts under the same
+    /// `register_private_domain` returns a participant-private account for a
+    /// local domain number.
+    ///
+    /// Inconclusive identities receive private accounts under the same
     /// aggregate envelope. Matching local numbers in two participants never
-    /// establishes cross-process filesystem identity.
+    /// establish cross-process filesystem identity.
     pub fn register_private_domain(&mut self, participant: Participant, local: u64) -> Result<DomainId, Error> {
         self.ledger.next_operation(participant)?;
         self.register_domain(DomainKey::Private(participant, local))
@@ -446,7 +585,12 @@ impl Authority {
             .sum()
     }
 
-    /// Prepare budget without spending it; all participants observe the hold.
+    /// `prepare` holds budget for `id` without spending it.
+    ///
+    /// All participants observe the hold. The caller passes
+    /// [`Ledger::next_operation`] as `id`, and a retry with the same request
+    /// returns the original admission. Watch release bypasses the budget,
+    /// ceiling, and bootstrap checks.
     pub fn prepare(&mut self, id: OperationId, request: Request, now: u64) -> Result<Admission, Error> {
         self.advance(now)?;
         match self.ledger.record(id) {
@@ -514,7 +658,11 @@ impl Authority {
         Ok(Admission { cost_ns, operations, optional_operations: optional })
     }
 
-    /// Reduce a prepared lease using its original price, before authorization.
+    /// `narrow` reduces a prepared lease to `optional_operations` at its
+    /// original price.
+    ///
+    /// The method applies only before authorization, and the count cannot
+    /// grow.
     pub fn narrow(&mut self, id: OperationId, optional_operations: u32) -> Result<Admission, Error> {
         let slot = self.account_slot(id)?;
         let account = self.accounts[slot].expect("account");
@@ -529,7 +677,11 @@ impl Authority {
         Ok(Admission { cost_ns, operations, optional_operations })
     }
 
-    /// Consume shared physical capacity before the caller can dispatch.
+    /// `authorize` consumes shared physical capacity before the caller
+    /// dispatches.
+    ///
+    /// The reserved cost becomes an irreversible charge. A retry after
+    /// authorization succeeds without effect.
     pub fn authorize(&mut self, id: OperationId, now: u64) -> Result<(), Error> {
         self.advance(now)?;
         let slot = self.account_slot(id)?;
@@ -600,8 +752,12 @@ impl Authority {
         }
     }
 
-    /// Account elapsed physical work and detect stuck ownership on access.
-    /// No background ticker is required to refill buckets or supervise work.
+    /// `advance` refills buckets, charges elapsed occupancy, and detects
+    /// stuck operations up to `now`.
+    ///
+    /// Every access performs this accounting, and no background ticker
+    /// supervises work. A stuck operation moves its global overshoot to
+    /// withheld debt and receives the failure surcharge once.
     pub fn advance(&mut self, now: u64) -> Result<(), Error> {
         let elapsed = now.checked_sub(self.now).ok_or(protocol::Error::ClockRegression)?;
         self.background.refill(elapsed);
@@ -638,6 +794,12 @@ impl Authority {
         Ok(())
     }
 
+    /// `cancel` withdraws the caller's interest in `id`.
+    ///
+    /// The method returns `true` when the operation already holds physical
+    /// capacity. Such an operation only detaches, and its owner must still
+    /// settle it. The method returns `false` after it releases a prepared hold
+    /// or finds the operation already retired.
     pub fn cancel(&mut self, id: OperationId, now: u64) -> Result<bool, Error> {
         self.advance(now)?;
         let slot = match self.account_slot(id) {
@@ -651,6 +813,9 @@ impl Authority {
         Ok(effect.detached)
     }
 
+    /// `report` applies cumulative progress for an authorized operation.
+    ///
+    /// The first failed report charges the failure surcharge.
     pub fn report(&mut self, id: OperationId, progress: Progress, now: u64) -> Result<(), Error> {
         self.advance(now)?;
         let slot = self.account_slot(id)?;
@@ -666,6 +831,11 @@ impl Authority {
         Ok(())
     }
 
+    /// `settle` applies the final report, retires the operation, and restores
+    /// its withheld debt.
+    ///
+    /// A settlement for an operation that already retired has no effect. A
+    /// successful settlement on a domain updates that domain's cost estimate.
     pub fn settle(&mut self, id: OperationId, progress: Progress, now: u64) -> Result<(), Error> {
         self.advance(now)?;
         let slot = match self.account_slot(id) {
@@ -696,7 +866,11 @@ impl Authority {
         }
     }
 
-    /// The backend must establish incarnation-qualified owner exit first.
+    /// `reclaim_after_owner_exit` retires `id` after its owner exited.
+    ///
+    /// The backend must establish incarnation-qualified owner exit first. A
+    /// physical operation receives the failure surcharge, and its occupancy
+    /// up to `now` stays charged.
     pub fn reclaim_after_owner_exit(&mut self, id: OperationId, now: u64) -> Result<(), Error> {
         self.advance(now)?;
         let slot = match self.account_slot(id) {
@@ -712,6 +886,7 @@ impl Authority {
         Ok(())
     }
 
+    /// `view` returns the shared accounting as of the last committed time.
     pub fn view(&self) -> View {
         View {
             participants: self.ledger.participant_count(),

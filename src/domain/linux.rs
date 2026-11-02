@@ -29,12 +29,26 @@ const MOUNTINFO: &str = "/proc/self/mountinfo";
 const PROBE_MASK: StatxFlags = StatxFlags::TYPE.union(STATX_MNT_ID_UNIQUE).union(StatxFlags::MNT_ID);
 const PROBE_FLAGS: AtFlags = AtFlags::NO_AUTOMOUNT.union(AtFlags::SYMLINK_NOFOLLOW).union(STATX_DONT_SYNC);
 
+/// `Declarations` overrides the built-in declaration tables per filesystem
+/// type.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Declarations {
     timestamp_granularity: HashMap<String, TimestampGranularity>,
     case: HashMap<String, DomainCaseSensitivity>,
 }
 
+/// `LinuxProbe` probes storage domains on Linux with `statx` and the mount
+/// table (RFC §14.3).
+///
+/// It keys a domain by the unique mount id where the kernel reports one.
+/// Otherwise it falls back to a [`WeakDomainKey`] from the reusable mount
+/// id or the device number. It resolves the filesystem type through
+/// `statmount` or `/proc/self/mountinfo` and reads transport and media
+/// hints from sysfs. Where the domain declares per-directory case, it
+/// reads each directory's casefold flag. A built-in table per filesystem
+/// type supplies timestamp granularity and case, and the `declare_`
+/// methods override that table. The probe caches capabilities per unique
+/// mount id for its lifetime.
 #[derive(Default)]
 pub struct LinuxProbe {
     declarations: Declarations,
@@ -42,10 +56,16 @@ pub struct LinuxProbe {
 }
 
 impl LinuxProbe {
+    /// `new` creates a probe with only the built-in tables.
     pub fn new() -> LinuxProbe {
         LinuxProbe::default()
     }
 
+    /// `declare_timestamp_granularity` declares the timestamp granularity of
+    /// every mount of type `fs_type`.
+    ///
+    /// `fs_type` is the kernel's filesystem type name, such as `ext4`.
+    /// The declaration replaces the built-in value for that type.
     pub fn declare_timestamp_granularity(
         mut self,
         fs_type: impl Into<String>,
@@ -55,6 +75,10 @@ impl LinuxProbe {
         self
     }
 
+    /// `declare_case` declares the case rule of every mount of type `fs_type`.
+    ///
+    /// `fs_type` is the kernel's filesystem type name, such as `ext4`.
+    /// The declaration replaces the built-in value for that type.
     pub fn declare_case(mut self, fs_type: impl Into<String>, case: DomainCaseSensitivity) -> LinuxProbe {
         self.declarations.case.insert(fs_type.into(), case);
         self

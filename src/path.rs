@@ -1,18 +1,40 @@
+//! This module validates root-relative paths and derives their case-folded
+//! comparison keys.
+//!
+//! A [`RelativePath`] keeps the display casing of every component. A
+//! [`PathKey`] folds those components under a [`CaseSensitivity`] rule
+//! and serves as the comparison key (RFC §14.1). Snapshots index entries
+//! by [`PathKey`] and report paths as [`RelativePath`].
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// `CaseSensitivity` states how one directory compares the names of its
+/// children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CaseSensitivity {
+    /// The directory compares names byte for byte.
     Sensitive,
+    /// The directory lowercases every UTF-8 name before it compares names.
+    ///
+    /// The directory compares a name byte for byte when the name is not
+    /// valid UTF-8.
     Insensitive,
 }
 
+/// `PathError` explains why this module rejected a path or component (RFC
+/// §14.1, §20).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathError {
+    /// The path has a root or a platform prefix.
     Absolute(PathBuf),
+    /// A `..` component climbs above the root.
     EscapesRoot(PathBuf),
+    /// A component is empty, `.` or `..`, or it contains `/` or NUL.
+    ///
+    /// On Windows a component with `\` is also invalid.
     InvalidComponent(OsString),
 }
 
@@ -28,16 +50,36 @@ impl fmt::Display for PathError {
 
 impl std::error::Error for PathError {}
 
+/// `RelativePath` names a location below the tree root as normalized, validated
+/// components.
+///
+/// The empty path names the root and displays as `.`. The ordering
+/// compares components in turn and places every directory directly before
+/// its descendants. Each component keeps its original bytes, and names
+/// that are not valid Unicode survive unchanged (RFC §20). Clones share
+/// storage.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelativePath {
     components: Arc<[OsString]>,
 }
 
 impl RelativePath {
+    /// `root` returns the path of the tree root.
     pub fn root() -> Self {
         RelativePath { components: Arc::from(Vec::new()) }
     }
 
+    /// `parse` parses and normalizes a relative path.
+    ///
+    /// It drops `.` components, and each `..` removes the preceding
+    /// component.
+    ///
+    /// # Errors
+    ///
+    /// `parse` returns [`PathError::Absolute`] for a rooted or prefixed
+    /// path and [`PathError::EscapesRoot`] when `..` climbs above the root.
+    /// It returns [`PathError::InvalidComponent`] when [`validate_name`]
+    /// rejects a component.
     pub fn parse(path: impl AsRef<Path>) -> Result<Self, PathError> {
         let path = path.as_ref();
         let mut components: Vec<OsString> = Vec::new();
@@ -61,26 +103,37 @@ impl RelativePath {
         Ok(RelativePath { components: Arc::from(components) })
     }
 
+    /// `components` returns the components from the root downward.
     pub fn components(&self) -> &[OsString] {
         &self.components
     }
 
+    /// `depth` returns the number of components; the root has depth 0.
     pub fn depth(&self) -> usize {
         self.components.len()
     }
 
+    /// `is_root` reports whether this path names the root.
     pub fn is_root(&self) -> bool {
         self.components.is_empty()
     }
 
+    /// `file_name` returns the last component, or `None` for the root.
     pub fn file_name(&self) -> Option<&OsStr> {
         self.components.last().map(|c| c.as_os_str())
     }
 
+    /// `parent` returns the containing directory, or `None` for the root.
     pub fn parent(&self) -> Option<RelativePath> {
         self.components.split_last().map(|(_, rest)| RelativePath { components: Arc::from(rest.to_vec()) })
     }
 
+    /// `join` appends one component.
+    ///
+    /// # Errors
+    ///
+    /// `join` returns [`PathError::InvalidComponent`] when
+    /// [`validate_name`] rejects `name`.
     pub fn join(&self, name: &OsStr) -> Result<RelativePath, PathError> {
         validate_name(name)?;
         Ok(self.joined(name))
@@ -92,11 +145,18 @@ impl RelativePath {
         RelativePath { components: Arc::from(components) }
     }
 
+    /// `starts_with` reports whether `prefix` equals this path or one of its
+    /// ancestors.
+    ///
+    /// It compares components byte for byte.
     pub fn starts_with(&self, prefix: &RelativePath) -> bool {
         self.components.len() >= prefix.components.len()
             && self.components[..prefix.components.len()] == prefix.components[..]
     }
 
+    /// `rebase` replaces the leading `from` components with `to`.
+    ///
+    /// It returns `None` when this path does not start with `from`.
     pub fn rebase(&self, from: &RelativePath, to: &RelativePath) -> Option<RelativePath> {
         if !self.starts_with(from) {
             return None;
@@ -106,6 +166,9 @@ impl RelativePath {
         Some(RelativePath { components: Arc::from(components) })
     }
 
+    /// `to_path_buf` converts this path to a platform relative path.
+    ///
+    /// The root becomes an empty path.
     pub fn to_path_buf(&self) -> PathBuf {
         let mut out = PathBuf::new();
         for c in self.components.iter() {
@@ -114,6 +177,7 @@ impl RelativePath {
         out
     }
 
+    /// `under` resolves this path against `root`.
     pub fn under(&self, root: &Path) -> PathBuf {
         let mut out = root.to_path_buf();
         for c in self.components.iter() {
@@ -122,6 +186,10 @@ impl RelativePath {
         out
     }
 
+    /// `key` folds every component under the single rule `case`.
+    ///
+    /// Directories can declare their own case rule. For those trees,
+    /// [`crate::snapshot::Snapshot::key`] derives the correct key.
     pub fn key(&self, case: CaseSensitivity) -> PathKey {
         match case {
             CaseSensitivity::Sensitive => PathKey { folded: self.clone() },
@@ -140,6 +208,13 @@ fn fold_component(name: &OsStr) -> OsString {
     }
 }
 
+/// `validate_name` checks that `name` can serve as one path component.
+///
+/// # Errors
+///
+/// `validate_name` returns [`PathError::InvalidComponent`] when `name` is
+/// empty, `.` or `..`, or when it contains `/` or NUL. On Windows it also
+/// rejects `\`.
 pub fn validate_name(name: &OsStr) -> Result<(), PathError> {
     let bytes = name.as_encoded_bytes();
     let invalid = bytes.is_empty()
@@ -189,37 +264,62 @@ impl TryFrom<&Path> for RelativePath {
     }
 }
 
+/// `PathKey` is the comparison key of a path.
+///
+/// `PathKey` folds each component under the case rule of its directory. Two
+/// paths that name the same entry produce equal keys. Keys order like
+/// [`RelativePath`] and place a directory directly before its
+/// descendants.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PathKey {
     folded: RelativePath,
 }
 
 impl PathKey {
+    /// `root` returns the key of the tree root.
     pub fn root() -> PathKey {
         PathKey { folded: RelativePath::root() }
     }
 
+    /// `depth` returns the number of components; the root has depth 0.
     pub fn depth(&self) -> usize {
         self.folded.depth()
     }
 
+    /// `is_root` reports whether this key names the root.
     pub fn is_root(&self) -> bool {
         self.folded.is_root()
     }
 
+    /// `parent` returns the key of the containing directory, or `None` for the
+    /// root.
     pub fn parent(&self) -> Option<PathKey> {
         self.folded.parent().map(|folded| PathKey { folded })
     }
 
+    /// `starts_with` reports whether `prefix` equals this key or one of its
+    /// ancestors.
     pub fn starts_with(&self, prefix: &PathKey) -> bool {
         self.folded.starts_with(&prefix.folded)
     }
 
+    /// `child` folds `name` under `case` and appends it.
+    ///
+    /// The caller passes the case rule of this key's directory as `case`.
+    ///
+    /// # Errors
+    ///
+    /// `child` returns [`PathError::InvalidComponent`] when
+    /// [`validate_name`] rejects `name`.
     pub fn child(&self, name: &OsStr, case: CaseSensitivity) -> Result<PathKey, PathError> {
         validate_name(name)?;
         Ok(self.descend(name, case))
     }
 
+    /// `descend` folds `name` under `case` and appends it without validation.
+    ///
+    /// The caller must pass a component of a [`RelativePath`] or a name
+    /// that passed [`validate_name`].
     pub fn descend(&self, name: &OsStr, case: CaseSensitivity) -> PathKey {
         let folded_name = match case {
             CaseSensitivity::Sensitive => name.to_os_string(),

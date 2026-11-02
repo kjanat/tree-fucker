@@ -1,4 +1,6 @@
-//! Explicit little-endian fields; no native Rust layouts enter shared state.
+//! This module encodes shared state as explicit little-endian fields.
+//!
+//! No native Rust layout enters shared state.
 
 use super::protocol::Error;
 
@@ -79,7 +81,9 @@ impl Reader<'_> {
     }
 }
 
-/// Accidental-corruption detection, not authentication of cooperating peers.
+/// `checksum` detects accidental corruption.
+///
+/// The checksum never authenticates cooperating peers.
 pub(crate) fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3))
 }

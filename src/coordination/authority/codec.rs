@@ -102,10 +102,12 @@ impl Request {
 }
 
 impl Authority {
-    /// Encode bounded, checked fields and a corruption checksum.
+    /// `encode` writes bounded, checked fields followed by a corruption
+    /// checksum.
     ///
-    /// The bytes are a snapshot, not a commit protocol. A backend must retain
-    /// a recoverable previous snapshot while publishing a replacement.
+    /// The bytes form a snapshot and carry no commit protocol. A backend must
+    /// retain a recoverable previous snapshot while it publishes a
+    /// replacement.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let capacity = 1024
             + self.ledger.participant_count() * 64
@@ -171,8 +173,10 @@ impl Authority {
         Ok(w.0)
     }
 
-    /// Decode a complete snapshot, validating bounds and cross-record
-    /// ownership before it can admit work. Trailing or truncated data fails.
+    /// `decode` reads a complete snapshot and validates bounds and cross-record
+    /// ownership before the result can admit work.
+    ///
+    /// Trailing or truncated data fails.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < 24 || bytes.len() > MAX_STATE_BYTES {
             return Err(malformed());
