@@ -351,3 +351,133 @@ fn token_identity_and_revision_changes_retain_outstanding_liabilities() {
     .join()
     .unwrap();
 }
+
+#[test]
+fn low_integrity_and_restricted_callers_cannot_reset_a_retained_scope() {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, GetLengthSid, IsTokenRestricted, RevertToSelf,
+        SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE,
+        TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenImpersonation, TokenIntegrityLevel,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
+
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: restores only the dedicated fixture thread.
+            assert_ne!(unsafe { RevertToSelf() }, 0);
+        }
+    }
+    std::thread::spawn(|| {
+        for restricted in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("scope");
+            let config = authority().config();
+            let scope = Scope::open(&path, config).unwrap();
+            let generation = scope.diagnostics().unwrap().generation;
+            let client = scope.join().unwrap();
+            client
+                .prepare(request())
+                .unwrap()
+                .try_run(|_| Completion { value: (), operations: 1, failed: false })
+                .unwrap();
+            let charged = scope.view().unwrap().charged_ns;
+            drop((client, scope));
+            let retained = fs::read(path.join("authority.state")).unwrap();
+            let mut source = null_mut();
+            let mut duplicate = null_mut();
+            // SAFETY: owned output handles and a token belonging to this
+            // process.
+            let duplicate = unsafe {
+                assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut source), 0);
+                let source = OwnedHandle::from_raw_handle(source);
+                assert_ne!(
+                    DuplicateTokenEx(
+                        source.as_raw_handle(),
+                        TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_ADJUST_DEFAULT,
+                        std::ptr::null(),
+                        SecurityImpersonation,
+                        TokenImpersonation,
+                        &mut duplicate,
+                    ),
+                    0
+                );
+                OwnedHandle::from_raw_handle(duplicate)
+            };
+            let sid_text = if restricted { "S-1-1-0" } else { "S-1-16-4096" };
+            let text: Vec<_> = sid_text.encode_utf16().chain([0]).collect();
+            let mut sid = null_mut();
+            // SAFETY: terminated SID text and a LocalFree-owned allocation.
+            assert_ne!(unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) }, 0);
+            let _sid = Allocation(sid);
+            let caller = if restricted {
+                let restricting = SID_AND_ATTRIBUTES { Sid: sid, Attributes: 0 };
+                let mut caller = null_mut();
+                // SAFETY: one restricting SID and no disabled-SID/privilege
+                // arrays.
+                assert_ne!(
+                    unsafe {
+                        CreateRestrictedToken(
+                            duplicate.as_raw_handle(),
+                            DISABLE_MAX_PRIVILEGE,
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            1,
+                            &restricting,
+                            &mut caller,
+                        )
+                    },
+                    0
+                );
+                assert_ne!(unsafe { IsTokenRestricted(caller) }, 0);
+                unsafe { OwnedHandle::from_raw_handle(caller) }
+            } else {
+                let label = TOKEN_MANDATORY_LABEL {
+                    Label: SID_AND_ATTRIBUTES {
+                        Sid: sid,
+                        Attributes: windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY as u32,
+                    },
+                };
+                // SAFETY: lowering only our duplicate's label, with a live SID.
+                assert_ne!(
+                    unsafe {
+                        SetTokenInformation(
+                            duplicate.as_raw_handle(),
+                            TokenIntegrityLevel,
+                            (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+                            size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(sid),
+                        )
+                    },
+                    0
+                );
+                duplicate
+            };
+            // SAFETY: installs this owned impersonation token only on this
+            // thread.
+            assert_ne!(unsafe { SetThreadToken(std::ptr::null(), caller.as_raw_handle()) }, 0);
+            let revert = Revert;
+            let options = Options { scope: Rendezvous::Directory(path.clone()), limits: config };
+            let automatic = HostGovernor::configured(&HostConfig::default(), Mode::Auto(options.clone())).unwrap();
+            assert!(matches!(
+                automatic.coordination_status().state,
+                State::Fallback { reason: coordination::Error::Unavailable(_) }
+            ));
+            assert!(matches!(
+                HostGovernor::configured(&HostConfig::default(), Mode::Required(options)),
+                Err(HostGovernorError::Coordination(coordination::Error::Unavailable(_)))
+            ));
+            drop(revert);
+            assert_eq!(fs::read(path.join("authority.state")).unwrap(), retained);
+            let reopened = Scope::open(&path, config).unwrap();
+            assert_eq!(reopened.diagnostics().unwrap().generation, generation);
+            assert_eq!(reopened.view().unwrap().charged_ns, charged);
+        }
+    })
+    .join()
+    .unwrap();
+}

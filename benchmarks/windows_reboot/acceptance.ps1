@@ -7,18 +7,26 @@ try {
 	& C:\OEM\coordination_power.exe --exact $phase --ignored --nocapture *> $log
 	if ($LASTEXITCODE -ne 0) { throw "Fixture exited $LASTEXITCODE" }
 	if ($phase -ne 'windows_after_reboot' -or !(Test-Path "$env:TF_POWER_ROOT\verified")) { throw 'Missing post-reboot verification' }
-	$result = @{ status = 'passed'; phase = $phase; log = (Get-Content $log -Raw) }
+	$sessions = & C:\OEM\sessions.ps1
+	if ($sessions.status -ne 'passed') { throw 'Missing real-session verification' }
+	$result = @{ status = 'passed'; phase = $phase; log = (Get-Content $log -Raw); sessions = $sessions }
 }
 catch {
 	$result = @{ status = 'failed'; phase = $phase; error = $_.ToString(); log = (Get-Content $log -Raw -ErrorAction SilentlyContinue) }
+	if (Test-Path 'C:\coordination-sessions') {
+		$result.sessionLogs = @{}
+		foreach ($sessionLog in Get-ChildItem 'C:\coordination-sessions\*.log') {
+			$result.sessionLogs[$sessionLog.Name] = Get-Content $sessionLog.FullName -Raw
+		}
+	}
 }
-$result | ConvertTo-Json | Set-Content -Encoding UTF8 "$env:TF_POWER_ROOT\result.json"
+$result | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 "$env:TF_POWER_ROOT\result.json"
 # QEMU user networking reaches the Linux controller through Docker's bridge
-# gateway without exposing RDP or depending on a guest-agent installation.
+# gateway. RDP is forwarded only on the controller's loopback interface.
 $gateway = (Get-Content C:\OEM\controller.txt -Raw).Trim()
 for ($attempt = 0; $attempt -lt 60; $attempt++) {
 	try {
-		Invoke-RestMethod -Uri "http://${gateway}:8765/result" -Method Post -ContentType 'application/json' -Body ($result | ConvertTo-Json) |
+		Invoke-RestMethod -Uri "http://${gateway}:8765/result" -Method Post -ContentType 'application/json' -Body ($result | ConvertTo-Json -Depth 6) |
 			Out-Null
 		exit 0
 	}

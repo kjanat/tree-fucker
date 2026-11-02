@@ -457,6 +457,12 @@ fn removing_the_anchor_cannot_reset_retained_accounting() {
     let anchor = root.path().join("scope.authority.lock");
     #[cfg(windows)]
     assert!(fs::remove_file(&anchor).is_err(), "live Windows handles must pin the anchor");
+    #[cfg(unix)]
+    {
+        fs::remove_file(&anchor).unwrap();
+        assert!(matches!(scope.view(), Err(Error::Replaced)), "the retained handle must also fence");
+        assert!(matches!(Scope::open(&path, config()), Err(Error::Replaced)));
+    }
     drop((client, scope));
     let state = path.join("authority.state");
     let retained = fs::read(&state).unwrap();

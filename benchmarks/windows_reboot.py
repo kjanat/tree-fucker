@@ -4,7 +4,11 @@ import argparse
 import http.server
 import ipaddress
 import json
+import os
+import queue
+import secrets
 import shutil
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -19,11 +23,34 @@ def main() -> None:
     redacted("")
     if shutil.which("guestfish") is None:
         raise RuntimeError("guestfish is required to recover offline guest evidence")
+    freerdp = shutil.which("xfreerdp3") or shutil.which("xfreerdp")
+    if freerdp is None or shutil.which("xvfb-run") is None:
+        raise RuntimeError(
+            "FreeRDP and xvfb-run are required for real session acceptance"
+        )
     root = Path("target/benchmarks/windows-reboot").resolve()
     root.mkdir(parents=True, exist_ok=False)
     oem = root / "oem"
     shutil.copytree(Path(__file__).parent / "windows_reboot", oem)
     shutil.copyfile(args.executable, oem / "coordination_power.exe")
+    accounts = {
+        "standard": ("CoordinationUser", "Tf!" + secrets.token_hex(16)),
+        "admin": ("CoordinationAdmin", "Tf!" + secrets.token_hex(16)),
+    }
+    # Disposable credentials stay out of command lines, reports and artifacts.
+    # The guest consumes this private OEM input; FreeRDP reads its copy on stdin.
+    account_input = oem / "accounts.ps1"
+    with os.fdopen(
+        os.open(account_input, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w"
+    ) as stream:
+        stream.write(
+            "$Accounts = @{\n"
+            + "\n".join(
+                f"  {role} = @{{ Name = '{name}'; Password = '{password}' }}"
+                for role, (name, password) in accounts.items()
+            )
+            + "\n}\n"
+        )
     gateway = subprocess.run(
         [
             "docker",
@@ -42,10 +69,14 @@ def main() -> None:
     (oem / "controller.txt").write_text(address)
     complete = threading.Event()
     outcome = {}
+    rdp_requests: queue.Queue[tuple[str, int]] = queue.Queue()
+    rdp_connections = []
+    rdp_requested = 0
 
     class Receiver(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
-            if self.path != "/result" or complete.is_set():
+            nonlocal rdp_requested
+            if self.path not in ("/result", "/rdp") or complete.is_set():
                 self.send_error(409)
                 return
             length = int(self.headers.get("Content-Length", "0"))
@@ -53,6 +84,24 @@ def main() -> None:
                 self.send_error(413)
                 return
             result = json.loads(self.rfile.read(length))
+            if self.path == "/rdp":
+                role, count = result.get("role"), result.get("count")
+                if (
+                    role not in accounts
+                    or type(count) is not int
+                    or not 1 <= count <= 2
+                ):
+                    self.send_error(400)
+                    return
+                if rdp_requested + count > 4:
+                    self.send_error(409)
+                    return
+                rdp_requested += count
+                rdp_requests.put((role, count))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+                return
             (root / "result.json").write_text(
                 redacted(json.dumps(result, indent=2)) + "\n"
             )
@@ -65,7 +114,7 @@ def main() -> None:
         def log_message(self, *_args):
             pass
 
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", 8765), Receiver)
+    server = http.server.HTTPServer(("0.0.0.0", 8765), Receiver)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     # The controller remains on Linux while the Windows kernel and all its
     # processes restart. The guest disk is retained for both fixture phases.
@@ -77,6 +126,8 @@ def main() -> None:
         "coordination-reboot",
         "--device",
         "/dev/kvm",
+        "-p",
+        "127.0.0.1:13389:3389/tcp",
         "-e",
         "VERSION=2022",
         "-e",
@@ -110,6 +161,45 @@ def main() -> None:
         process.stdout.close()
         try:
             for _ in range(45 * 60):
+                while not rdp_requests.empty():
+                    role, count = rdp_requests.get_nowait()
+                    name, password = accounts[role]
+                    for _ in range(count):
+                        logfile = (root / f"rdp-{len(rdp_connections)}.log").open("w")
+                        connection = subprocess.Popen(
+                            [
+                                "xvfb-run",
+                                "-a",
+                                freerdp,
+                                "/v:127.0.0.1:13389",
+                                f"/u:{name}",
+                                "/d:.",
+                                f"/client-hostname:tf-fixture-{len(rdp_connections)}",
+                                "/from-stdin:force",
+                                "/cert:ignore",
+                                "/sec:nla",
+                                "/size:800x600",
+                                "/log-level:WARN",
+                            ],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            start_new_session=True,
+                        )
+                        rdp_sanitizer = subprocess.Popen(
+                            ["envctl", "redact"],
+                            stdin=connection.stdout,
+                            stdout=logfile,
+                        )
+                        assert (
+                            connection.stdout is not None
+                            and connection.stdin is not None
+                        )
+                        connection.stdout.close()
+                        rdp_connections.append((connection, rdp_sanitizer, logfile))
+                        connection.stdin.write(password + "\n")
+                        connection.stdin.close()
                 if complete.wait(1):
                     break
                 if process.poll() is not None:
@@ -133,6 +223,7 @@ def main() -> None:
                         ],
                         capture_output=True,
                         timeout=120,
+                        check=False,
                     )
                     if recovered.returncode:
                         (root / "recovery.log").write_text(
@@ -153,6 +244,30 @@ def main() -> None:
                     "Windows did not report reboot acceptance within 45 minutes"
                 )
         finally:
+            cleanup_errors = []
+            for connection, rdp_sanitizer, logfile in rdp_connections:
+                try:
+                    if connection.poll() is None:
+                        try:
+                            os.killpg(connection.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        connection.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(connection.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        connection.wait(timeout=10)
+                    if rdp_sanitizer.wait(timeout=10):
+                        cleanup_errors.append("RDP log redaction failed")
+                except subprocess.TimeoutExpired:
+                    cleanup_errors.append("RDP cleanup timed out")
+                    rdp_sanitizer.kill()
+                    rdp_sanitizer.wait(timeout=10)
+                finally:
+                    logfile.close()
             if process.poll() is None:
                 subprocess.run(
                     ["docker", "stop", "--timeout", "30", "coordination-reboot"],
@@ -160,18 +275,21 @@ def main() -> None:
                 )
             process.wait(timeout=60)
             if sanitizer.wait(timeout=60):
-                raise RuntimeError("Guest log redaction failed")
+                cleanup_errors.append("Guest log redaction failed")
             server.shutdown()
             server.server_close()
+            if cleanup_errors:
+                raise RuntimeError("; ".join(cleanup_errors))
     if (
         outcome.get("status") != "passed"
         or outcome.get("phase") != "windows_after_reboot"
+        or outcome.get("sessions", {}).get("status") != "passed"
     ):
         raise RuntimeError(
             f"Windows reboot acceptance failed; see {root / 'result.json'}"
         )
     print(
-        "Windows reboot: retained generation, debt, recovered ownership, and shared clock verified"
+        "Windows reboot and real user sessions: retained accounting, ownership, UAC and principal isolation verified"
     )
 
 

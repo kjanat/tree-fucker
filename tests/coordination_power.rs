@@ -3,6 +3,10 @@
 
 mod coordination_support;
 
+#[cfg(windows)]
+#[path = "coordination_power/windows_sessions.rs"]
+mod windows_sessions;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
