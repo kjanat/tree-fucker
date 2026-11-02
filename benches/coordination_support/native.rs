@@ -37,6 +37,7 @@ struct Options {
     waves: usize,
     hold_ms: u64,
     ready_hold_ms: u64,
+    sample_barrier: Option<PathBuf>,
 }
 
 impl Options {
@@ -52,6 +53,7 @@ impl Options {
             waves: 4,
             hold_ms: 100,
             ready_hold_ms: 0,
+            sample_barrier: None,
         };
         if args == ["--test"] {
             return Self { workers: 2, iterations: 2, files: 4, runs: 1, warmups: 0, waves: 2, hold_ms: 20, ..options };
@@ -70,6 +72,7 @@ impl Options {
                 "--waves" => options.waves = value.parse().expect("waves"),
                 "--hold-ms" => options.hold_ms = value.parse().expect("hold milliseconds"),
                 "--ready-hold-ms" => options.ready_hold_ms = value.parse().expect("ready hold milliseconds"),
+                "--sample-barrier" => options.sample_barrier = Some(value.into()),
                 other => panic!("unknown option {other}"),
             }
         }
@@ -383,6 +386,20 @@ fn cohort(scenario: &str, mode: &str, options: &Options, scope: &Path, roots: &[
     if options.ready_hold_ms != 0 {
         std::thread::sleep(Duration::from_millis(options.ready_hold_ms));
     }
+    if let Some(directory) = &options.sample_barrier {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed).to_string();
+        let ready = directory.join("ready");
+        let acknowledged = directory.join("sampled");
+        fs::write(&ready, &sequence).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        while fs::read_to_string(&acknowledged).ok().as_deref() != Some(&sequence) {
+            assert!(Instant::now() < deadline, "resource collector did not sample the ready cohort");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::remove_file(ready).unwrap();
+    }
     let start = Instant::now();
     for child in &mut children.0 {
         child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
@@ -440,7 +457,8 @@ pub fn main(allocations: bool) {
             "Usage: cargo bench --bench coordination_processes -- [--test | OPTIONS]\n\
             --scenario all|tiny|disjoint|contention|churn|slow|idle --mode both|local|shared\n\
             --workers 8 --iterations 100 --files 64 --runs 5 --warmups 1 --waves 4 --hold-ms 100\n\
-            --ready-hold-ms 0 (resource sampling only; maximum 10000)"
+            --ready-hold-ms 0 (resource sampling only; maximum 10000)\n\
+            --sample-barrier DIRECTORY (collector acknowledgement before each cohort)"
         );
         return;
     }

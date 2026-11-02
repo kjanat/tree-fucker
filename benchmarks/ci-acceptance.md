@@ -30,15 +30,15 @@ Build the optimized benchmark and obtain its executable from Cargo's artifact ou
 mkdir -p target/benchmarks
 cargo bench --bench coordination_processes --no-run --message-format=json >target/benchmarks/resource-build.jsonl
 binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_processes") | .executable // empty' target/benchmarks/resource-build.jsonl)
-uv run benchmarks/native_resources.py --minimum-processes 5 \
+uv run benchmarks/native_resources.py --synchronize-cohort --minimum-processes 5 \
   target/benchmarks/resources-contention-shared.json "$binary" \
   --scenario contention --mode shared --workers 4 --iterations 2000 \
-  --ready-hold-ms 500 --runs 1 --warmups 0 2>&1 | envctl redact
+  --runs 1 --warmups 0 2>&1 | envctl redact
 ```
 
 Use a shell with pipefail enabled. The collector requires envctl and obtains psutil through uv's script dependencies. On macOS, task-memory inspection requires running the collector with sudo; the workflow preserves only PATH and supplies a separate uv cache. Shared macOS runs also require the tmpfs rendezvous used by the native tests.
 
-The sampling hold keeps the entire ready cohort alive before dispatch. It defaults to zero in normal benchmarks and is outside the cohort timer. Sampled peaks include startup, ready state, work, and teardown; they are lower bounds. The collector rejects an unsuccessful workload, redaction failure, or absence of a complete cohort. A macOS USS region-enumeration failure discards the entire sample only after a bounded check confirms that the original process identity exited; live-process failures remain errors. The resource jobs run `benchmarks/test_native_resources.py` before measurement to verify exit handling and rejection of partial samples. Windows virtual bytes include committed and reserved address ranges from VirtualQueryEx; Windows pagefile usage is not substituted for virtual address space. RSS counts shared pages in each process; USS counts unique resident memory. Windows handles and Unix descriptors retain their native meanings in the report.
+The synchronized collector passes a private `--sample-barrier` directory to the benchmark. Each cohort announces readiness after all workers initialize, then waits up to sixty seconds for a complete sample to acknowledge that cohort number. The collector checks readiness before inspection and never acknowledges a partial or failed sample. Each churn wave uses a new number, so an old acknowledgement cannot release it. The handshake ends before the cohort timer starts; ordinary timing runs use neither the handshake nor a startup hold. Sampled peaks include startup, ready state, work, and teardown; they are lower bounds. The collector rejects an unsuccessful workload, redaction failure, or absence of a complete cohort. A macOS USS region-enumeration failure discards the entire sample only after a bounded check confirms that the original process identity exited; live-process failures remain errors. The resource jobs run `benchmarks/test_native_resources.py` before measurement to verify exit handling and rejection of partial samples. Windows virtual bytes include committed and reserved address ranges from VirtualQueryEx; Windows pagefile usage is not substituted for virtual address space. RSS counts shared pages in each process; USS counts unique resident memory. Windows handles and Unix descriptors retain their native meanings in the report.
 
 ## Reproduce syscall collection
 

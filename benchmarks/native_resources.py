@@ -12,11 +12,11 @@ import ctypes
 import json
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import psutil
-
 from resources import redacted
 
 
@@ -140,7 +140,13 @@ def sample(root: psutil.Process) -> dict[str, int]:
         if created != child["created"]:
             raise psutil.NoSuchProcess(child["pid"])
         processes.append(process)
-    totals = dict(processes=0, private_bytes=0, rss_bytes=0, virtual_bytes=0, handles=0)
+    totals = {
+        "processes": 0,
+        "private_bytes": 0,
+        "rss_bytes": 0,
+        "virtual_bytes": 0,
+        "handles": 0,
+    }
     for process in processes:
         data = inspect(process)
         if not data["same_identity"]:
@@ -165,6 +171,7 @@ def sample(root: psutil.Process) -> dict[str, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--minimum-processes", type=int, default=2)
+    parser.add_argument("--synchronize-cohort", action="store_true")
     parser.add_argument("output", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -173,10 +180,19 @@ def main() -> None:
     redacted("")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     samples = []
+    acknowledged = None
+    ready_cohorts = 0
     started = time.monotonic()
-    with args.output.with_suffix(".stdout").open("w") as log:
+    with (
+        tempfile.TemporaryDirectory(
+            prefix="coordination-sample-", dir=args.output.parent
+        ) as directory,
+        args.output.with_suffix(".stdout").open("w") as log,
+    ):
+        barrier = Path(directory).resolve() if args.synchronize_cohort else None
+        command = args.command + (["--sample-barrier", str(barrier)] if barrier else [])
         child = subprocess.Popen(
-            args.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
         sanitizer = subprocess.Popen(
             ["envctl", "redact"], stdin=child.stdout, stdout=log
@@ -189,9 +205,25 @@ def main() -> None:
                 if time.monotonic() - started > 300:
                     raise TimeoutError("Resource workload exceeded five minutes")
                 try:
+                    # Capture readiness before inspection. Sampling startup
+                    # while only part of the cohort is ready cannot release it.
+                    ready = None
+                    if barrier:
+                        try:
+                            ready = (barrier / "ready").read_text()
+                        except FileNotFoundError:
+                            pass
                     values = sample(root)
                     if values["processes"] >= args.minimum_processes:
                         samples.append(values)
+                        if (
+                            ready is not None
+                            and ready.isdecimal()
+                            and ready != acknowledged
+                        ):
+                            (barrier / "sampled").write_text(ready)
+                            acknowledged = ready
+                            ready_cohorts += 1
                 except (psutil.NoSuchProcess, psutil.ZombieProcess):
                     # A cohort can exit during a sample. Never accept a partial
                     # cohort or silently replace denied measurements with zero.
@@ -224,12 +256,15 @@ def main() -> None:
         )
     if not samples:
         raise RuntimeError("No complete cohort sampled; increase workload duration")
+    if args.synchronize_cohort and not ready_cohorts:
+        raise RuntimeError("The workload did not establish a sampled ready cohort")
     report = {
         "platform": sys.platform,
         "command": args.command,
         "samples": samples,
         "peak_aggregate": {key: max(row[key] for row in samples) for key in samples[0]},
         "minimum_processes": args.minimum_processes,
+        "ready_cohorts_sampled": ready_cohorts,
         "scope": "benchmark controller and live descendants",
         "private_bytes": "sum of unique resident bytes (USS)",
         "rss_bytes": "sum of working sets; shared pages count once per process",

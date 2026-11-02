@@ -129,10 +129,10 @@ jobs:
               iterations=2000
               if [[ "$scenario" == tiny ]]; then processes=2; fi
               if [[ "$scenario" == disjoint ]]; then iterations=100; fi
-              "${measure[@]}" --minimum-processes "$processes" \
+              "${measure[@]}" --synchronize-cohort --minimum-processes "$processes" \
                 "target/benchmarks/resources-${scenario}-${mode}.json" \
                 "$RESOURCE_FIXTURE" --scenario "$scenario" --mode "$mode" \
-                --workers 4 --iterations "$iterations" --ready-hold-ms 500 --hold-ms 3000 --runs 1 --warmups 0 \
+                --workers 4 --iterations "$iterations" --hold-ms 3000 --runs 1 --warmups 0 \
                 2>&1 | envctl redact | tee "target/benchmarks/resources-${scenario}-${mode}-controller.log"
             done
           done
