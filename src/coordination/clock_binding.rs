@@ -1,4 +1,5 @@
-//! One persisted mapping from a boot-qualified counter to authority time.
+//! A binding persists one mapping from a boot-qualified counter to authority
+//! time.
 
 use std::io;
 

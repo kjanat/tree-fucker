@@ -3,6 +3,9 @@ name    = "tree-fucker"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [workspace]
 [workspace.lints]
 cargo   = { implicit_features = "warn" }

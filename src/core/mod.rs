@@ -1,3 +1,11 @@
+//! `core` holds the deterministic coordinator of a [`Tree`](crate::Tree).
+//!
+//! [`Coordinator`] owns all mutable synchronization state of one tree (RFC §6).
+//! A driver feeds it [`Input`] values with the current [`MonotonicTime`]. The
+//! driver then executes the [`Output`] values from the coordinator. The
+//! coordinator performs no I/O and reads no clock. Admission goes through the
+//! shared [`HostGovernor`].
+
 mod apply;
 mod commands;
 mod governor;
@@ -47,82 +55,177 @@ const RESOURCE_LIMIT_HISTORY: usize = 64;
 const CROSSING_HISTORY: usize = 64;
 const LARGEST_DIRECTORIES: usize = 16;
 
+/// `ObligationCounts` describes the obligations of one reconciliation round
+/// (RFC §16).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ObligationCounts {
+    /// The round froze this many loaded directories.
     pub total: usize,
+    /// An accepted listing satisfied this many obligations.
     pub accepted: usize,
+    /// This many obligations ended unsatisfied.
+    ///
+    /// Their designated jobs failed, went stale or got stuck.
     pub unsatisfied: usize,
+    /// This many obligations ended removed.
+    ///
+    /// Their directories were removed, unloaded or excluded.
     pub removed: usize,
 }
 
+/// `DirectorySize` gives the child count of one large directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectorySize {
+    /// `path` holds the root-relative path of the directory.
     pub path: RelativePath,
+    /// The latest complete or resource-limited listing counted this many
+    /// children.
     pub children: usize,
 }
 
+/// `CrossingEvent` describes one domain-crossing decision during traversal (RFC
+/// §14.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossingEvent {
+    /// `path` holds the root-relative path of the directory in the child
+    /// domain.
     pub path: RelativePath,
+    /// `parent` holds the domain of the parent directory, when the tree knows
+    /// it.
     pub parent: Option<StorageDomainId>,
+    /// `child` holds the domain of the directory itself.
     pub child: StorageDomainId,
+    /// Scan policy returned this decision for the crossing.
     pub mode: DomainCrossing,
 }
 
+/// `DomainStat` describes one storage domain of a tree (RFC §16).
+///
+/// The governor fields repeat the [`DomainView`] of the same domain.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomainStat {
+    /// `id` identifies the domain.
     pub id: StorageDomainId,
+    /// The adapter reported this identity for the domain.
     pub identity: DomainIdentity,
+    /// The adapter declared these capabilities and their sources.
     pub capabilities: DomainCapabilities,
+    /// The tree resolves Unknown entries of these watcher capabilities against
+    /// the backend.
     pub watcher: WatcherCapabilities,
+    /// `watcher_health` holds the watcher health on the domain.
     pub watcher_health: WatcherHealth,
+    /// This many paths on the domain hold a pending or registered watch.
     pub paths_watched: usize,
+    /// The watcher path limit left this many directories on the domain
+    /// unwatched.
     pub paths_unwatched_by_cap: usize,
+    /// The governor reserved this worker time on the domain at admission.
     pub granted: Duration,
+    /// The governor charged this worker time on the domain.
+    ///
+    /// Overshoot and surcharges are included.
     pub charged: Duration,
+    /// `capacity` holds the capacity of the domain background bucket.
     pub capacity: Duration,
+    /// `level` holds the current background bucket level.
+    ///
+    /// The level reads zero while the bucket is in debt.
     pub level: Duration,
+    /// The background bucket is this far below zero.
     pub debt: Duration,
+    /// `window` holds the current concurrency window (RFC §15.5).
     pub window: usize,
+    /// The window may grow to at most this size.
     pub ceiling: usize,
+    /// This many started grants run on the domain.
     pub in_flight: usize,
+    /// This many grants on the domain are stuck.
+    ///
+    /// One stuck grant quarantines the domain.
     pub stuck: usize,
+    /// The governor estimates this worker time per filesystem operation.
     pub estimate: Duration,
+    /// `foreground_capacity` holds the capacity of the domain foreground
+    /// bucket.
     pub foreground_capacity: Duration,
+    /// `foreground_level` holds the current foreground bucket level.
+    ///
+    /// The level reads zero while the bucket is in debt.
     pub foreground_level: Duration,
+    /// The foreground bucket is this far below zero.
     pub foreground_debt: Duration,
+    /// `bytes_estimate` holds the moving mean of listing result bytes on the
+    /// domain.
     pub bytes_estimate: u64,
+    /// `latency` covers every operation kind.
     pub latency: LatencySummary,
+    /// `listing_latency` covers listing operations.
     pub listing_latency: LatencySummary,
+    /// `metadata_latency` covers every operation other than listings.
     pub metadata_latency: LatencySummary,
+    /// `registration_latency` covers watch registrations.
     pub registration_latency: LatencySummary,
+    /// The governor denied this many admissions on the domain.
     pub throttled_jobs: u64,
+    /// The domain spent this long with a denial outstanding.
     pub throttled_duration: Duration,
+    /// `effective_duty` holds charged worker time per elapsed second.
+    ///
+    /// `effective_duty` counts from the registration of the domain.
     pub effective_duty: f64,
+    /// `resource` holds the resource health of the domain (RFC §15.6).
     pub resource: ResourceHealth,
+    /// This tree performed this many listing operations on the domain.
     pub listings: u64,
+    /// This tree performed this many metadata operations on the domain.
     pub metadata_operations: u64,
+    /// This tree enumerated this many directory entries on the domain.
     pub entries_enumerated: u64,
+    /// This tree performed this many per-child operations on the domain.
     pub per_child_lookups: u64,
+    /// This tree performed this many kind resolutions on the domain.
     pub kind_resolutions: u64,
+    /// This tree performed this many identity reads on the domain.
     pub identity_reads: u64,
+    /// This tree enumerated this many entries per second on the domain.
+    ///
+    /// `entries_per_second` counts from the registration of the domain.
     pub entries_per_second: f64,
+    /// This tree performed this many per-child operations per second.
+    ///
+    /// `per_child_lookups_per_second` counts from the registration of the
+    /// domain.
     pub per_child_lookups_per_second: f64,
+    /// The tree first bound a directory to the domain at this path.
     pub entry_path: Option<RelativePath>,
+    /// The latest complete listing on the domain counted this many children.
     pub last_listing_children: Option<usize>,
+    /// `last_limited_listing` holds the latest resource-limited listing on the
+    /// domain.
     pub last_limited_listing: Option<ResourceLimited>,
+    /// This many listing sessions on the domain wait for their next lease.
     pub suspended_sessions: usize,
 }
 
+/// `DomainOps` records the operations of one tree on one storage domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DomainOps {
+    /// The tree performed this many listing operations.
     pub listings: u64,
+    /// The tree performed this many metadata operations.
     pub metadata_operations: u64,
+    /// The tree enumerated this many directory entries.
     pub entries_enumerated: u64,
+    /// The tree performed this many per-child operations.
     pub per_child_lookups: u64,
+    /// The tree performed this many kind resolutions.
     pub kind_resolutions: u64,
+    /// The tree performed this many identity reads.
     pub identity_reads: u64,
+    /// The latest complete listing counted this many children.
     pub last_listing_children: Option<usize>,
+    /// `last_limited_listing` holds the latest resource-limited listing.
     pub last_limited_listing: Option<ResourceLimited>,
 }
 
@@ -200,51 +303,100 @@ pub(super) enum WatchDecision {
     Capped,
 }
 
+/// `Command` carries one consumer request to the coordinator.
+///
+/// Each variant matches one [`TreeHandle`](crate::TreeHandle) method. RFC §9
+/// and §9.1 specify the completion and target resolution of each command.
 #[derive(Clone, Debug)]
 pub enum Command {
+    /// The consumer asks the tree to read each path again after the barrier.
     Refresh(Vec<RelativePath>),
+    /// The consumer asks the tree to load a represented directory.
     Load(RelativePath),
+    /// The consumer asks the tree to unload a directory and its descendants.
     Unload(RelativePath),
+    /// The consumer asks the tree to reevaluate policy beneath each root.
     InvalidatePolicy(Vec<RelativePath>),
+    /// The consumer replaces the priority set.
     SetPriority(Vec<RelativePath>),
+    /// The consumer waits for the initial scan of the current root incarnation.
     InitialScanComplete,
+    /// The consumer stops the tree.
     Shutdown,
 }
 
+/// `JobOperation` names the filesystem operation in a worker slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobOperation {
+    /// The worker runs a listing session step.
     Listing,
+    /// The worker reads metadata.
     Metadata,
+    /// The worker resolves a storage domain (RFC §10.3).
     DomainResolution,
-    Enrichment { fields: MetadataFields },
+    /// The worker reads configured metadata of children (RFC §10.1).
+    Enrichment {
+        /// The enrichment reads these fields.
+        fields: MetadataFields,
+    },
+    /// The worker registers a watch.
     WatchRegistration,
+    /// The worker releases a watch.
     WatchRelease,
 }
 
+/// `ListingWork` bounds one listing session step (RFC §10.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListingWork {
+    /// The step may perform the entries and per-child operations of this lease.
     pub lease: Lease,
+    /// `ceilings` bounds the entries and bytes of the whole listing.
     pub ceilings: Ceilings,
+    /// The session polls this token between chunks.
     pub cancel: CancellationToken,
+    /// `resume` tells the worker to continue the suspended session of the job.
+    ///
+    /// A `false` value opens a new session.
     pub resume: bool,
 }
 
+/// `Work` describes the filesystem work of one [`JobSpec`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Work {
+    /// The worker runs one listing session step.
     Listing(ListingWork),
+    /// The worker reads the metadata of the target.
     Metadata,
-    ResolveDomain { parent: Option<Box<ProbeResult>> },
-    Enrichment { batch: EnrichmentBatch },
+    /// The worker resolves the storage domain of the target.
+    ResolveDomain {
+        /// `parent` holds the domain probe of the parent, when the tree knows
+        /// it.
+        parent: Option<Box<ProbeResult>>,
+    },
+    /// The worker reads configured metadata of the target's children.
+    Enrichment {
+        /// `batch` names the children and fields to read.
+        ///
+        /// The grant bounds `batch`.
+        batch: EnrichmentBatch,
+    },
 }
 
+/// The driver runs this job on a blocking worker.
+///
+/// The driver answers with [`Input::JobCompleted`] or [`Input::WorkerLost`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSpec {
+    /// `id` identifies the job.
     pub id: JobId,
+    /// `path` holds the root-relative path of the target.
     pub path: RelativePath,
+    /// `work` describes the work to perform.
     pub work: Work,
 }
 
 impl JobSpec {
+    /// `operation` returns the operation kind of the work.
     pub fn operation(&self) -> JobOperation {
         match &self.work {
             Work::Listing(_) => JobOperation::Listing,
@@ -255,58 +407,149 @@ impl JobSpec {
     }
 }
 
+/// `JobResult` carries the result of one [`Work`] item.
+///
+/// Each variant matches the variant of its work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobResult {
+    /// The listing session step ended suspended or finished.
     Listing(SessionStep),
+    /// The metadata read returned this result.
     Metadata(Result<EntryInfo, FsError>),
+    /// The domain resolution returned this result.
     Domain(Result<ProbeResult, FsError>),
+    /// The enrichment read returned this result.
     Enrichment(Result<Enrichment, FsError>),
 }
 
+/// A worker ended without a result for this work (RFC §13.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WorkerLoss {
+    /// The worker for this job panicked or lost its channel.
     Job(JobId),
+    /// The worker for this watch registration panicked or lost its channel.
     WatchRegistration(WatchRequestId),
+    /// The worker for this watch release panicked or lost its channel.
     WatchRelease(WatchReleaseId),
 }
 
+/// `Input` reports one event to [`Coordinator::handle`].
+///
+/// The driver delivers each input.
 #[derive(Clone, Debug)]
 pub enum Input {
-    Command { id: CommandId, command: Command },
+    /// The consumer issued a command.
+    ///
+    /// The `id` must be unique per tree.
+    Command {
+        /// [`Output::CommandFinished`] echoes this identity.
+        id: CommandId,
+        /// `command` holds the command.
+        command: Command,
+    },
+    /// The watcher backend reported an event.
     Watcher(WatcherEvent),
-    JobCompleted { job: JobId, result: JobResult },
-    WatchRegistered { request: WatchRequestId, result: Result<WatchId, FsError> },
-    WatchReleased { release: WatchReleaseId },
+    /// A worker finished a job from [`Output::StartJob`].
+    JobCompleted {
+        /// `job` identifies the job.
+        job: JobId,
+        /// `result` holds the result of the job.
+        result: JobResult,
+    },
+    /// A watch registration from [`Output::RegisterWatch`] returned.
+    WatchRegistered {
+        /// `request` identifies the registration request.
+        request: WatchRequestId,
+        /// `result` holds the new watch or the failure.
+        result: Result<WatchId, FsError>,
+    },
+    /// A watch release from [`Output::Unwatch`] returned.
+    WatchReleased {
+        /// `release` identifies the release request.
+        release: WatchReleaseId,
+    },
+    /// A worker ended without delivering its result.
     WorkerLost(WorkerLoss),
+    /// The timer from [`Output::SetTimer`] with this id fired.
     Timer(TimerId),
 }
 
+/// `TerminalOutcome` tells how the coordinator stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalOutcome {
+    /// A `shutdown` command completed.
     ShutDown,
+    /// A Fatal filesystem failure terminated the tree (RFC §13.1).
     Terminated,
 }
 
+/// `Output` names one effect for the driver.
+///
+/// The driver performs the outputs in the returned order.
 #[derive(Clone, Debug)]
 pub enum Output {
+    /// The driver runs the job on a blocking worker.
+    ///
+    /// The coordinator has already started the grant of the job.
     StartJob(JobSpec),
+    /// The driver discards the eventual result of the job.
+    ///
+    /// The coordinator has already set the cancellation token of the job.
     CancelJob(JobId),
-    RegisterWatch { request: WatchRequestId, path: RelativePath, recursive: bool },
-    Unwatch { release: WatchReleaseId, watch: WatchId },
+    /// The driver registers a watch and answers with
+    /// [`Input::WatchRegistered`].
+    RegisterWatch {
+        /// `request` identifies the registration.
+        request: WatchRequestId,
+        /// `path` holds the root-relative path to watch.
+        path: RelativePath,
+        /// `recursive` asks for a watch on the whole subtree.
+        ///
+        /// A `false` value watches the directory alone.
+        recursive: bool,
+    },
+    /// The driver releases a watch and answers with [`Input::WatchReleased`].
+    Unwatch {
+        /// `release` identifies the release.
+        release: WatchReleaseId,
+        /// `watch` names the watch to release.
+        watch: WatchId,
+    },
+    /// The driver delivers the event to the update stream.
     Publish(Box<UpdateEvent>),
-    CommandFinished { id: CommandId, result: Result<(), Error> },
-    SetTimer { id: TimerId, at: MonotonicTime },
+    /// The driver completes the command with this result.
+    CommandFinished {
+        /// `id` echoes the identity from [`Input::Command`].
+        id: CommandId,
+        /// `result` holds the outcome of the command.
+        result: Result<(), Error>,
+    },
+    /// The driver replaces any armed timer with one for `at`.
+    ///
+    /// The new timer delivers [`Input::Timer`].
+    SetTimer {
+        /// The timer input must carry this identity.
+        id: TimerId,
+        /// The timer fires at this monotonic time.
+        at: MonotonicTime,
+    },
+    /// The coordinator accepts no further commands.
     Stopped(TerminalOutcome),
 }
 
+/// `SlotOwner` names the work in a physical worker slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SlotOwner {
+    /// A job holds the slot, its watch registration included.
     Job(JobId),
+    /// A watch registration outside any job holds the slot.
     WatchRegistration(WatchRequestId),
+    /// A watch release holds the slot.
     WatchRelease(WatchReleaseId),
 }
 
 impl SlotOwner {
+    /// `job` returns the job of a [`SlotOwner::Job`].
     pub fn job(self) -> Option<JobId> {
         match self {
             SlotOwner::Job(id) => Some(id),
@@ -314,6 +557,7 @@ impl SlotOwner {
         }
     }
 
+    /// `release` returns the release of a [`SlotOwner::WatchRelease`].
     pub fn release(self) -> Option<WatchReleaseId> {
         match self {
             SlotOwner::WatchRelease(id) => Some(id),
@@ -329,92 +573,190 @@ struct PendingRelease {
     domain: Option<StorageDomainId>,
 }
 
+/// `BlockingSlot` describes a physical worker slot of a tree (RFC §13.5).
+///
+/// The tree holds the slot until the call returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockingSlot {
+    /// `owner` names the work in the slot.
     pub owner: SlotOwner,
+    /// `path` holds the root-relative path of the target.
     pub path: RelativePath,
+    /// `operation` names the operation in progress.
     pub operation: JobOperation,
+    /// The tree took the slot at this time.
     pub started: MonotonicTime,
 }
 
 impl BlockingSlot {
+    /// `job` returns the job in the slot, if any.
     pub fn job(&self) -> Option<JobId> {
         self.owner.job()
     }
 }
 
+/// `BatchView` describes the open closed batch of a dispatch cycle (RFC §11.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchView {
+    /// `periodic` is set when the periodic timer started this cycle.
     pub periodic: bool,
+    /// `members` holds the admitted jobs without a terminal outcome.
     pub members: BTreeSet<JobId>,
 }
 
+/// `Stats` describes one tree at one instant (RFC §16).
+///
+/// The governor fields cover every tree on the governor. The other fields cover
+/// this tree.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stats {
+    /// The coordinator took the observation at this time.
     pub observed_at: MonotonicTime,
+    /// The governor charged this worker time to the grants of this tree after
+    /// open.
     pub charged_worker_time_after_open: Duration,
+    /// `version` holds the current snapshot version.
     pub version: SnapshotVersion,
+    /// `initial_scan` holds the initial scan state.
     pub initial_scan: InitialScanState,
+    /// `reconciliation_generation` holds the generation of the active round or
+    /// of the latest round.
     pub reconciliation_generation: ReconciliationGeneration,
+    /// Every loaded directory needs coverage at this generation or later.
+    ///
+    /// Overflow and watcher restart raise the minimum (RFC §11.6).
     pub minimum_coverage_generation: ReconciliationGeneration,
+    /// The latest completed round started at this time and took this long.
     pub last_round: Option<(MonotonicTime, Duration)>,
+    /// The latest successful round started at this time and took this long.
     pub last_successful_round: Option<(MonotonicTime, Duration)>,
+    /// `baseline_cursor` holds the baseline cursor position and the obligation
+    /// count.
+    ///
+    /// Both values refer to the active round.
     pub baseline_cursor: (usize, usize),
+    /// `obligations` counts the obligations of the active round or the latest
+    /// completed round.
     pub obligations: ObligationCounts,
+    /// `priority_cursor` holds the priority cursor position and the priority
+    /// set size.
     pub priority_cursor: (usize, usize),
+    /// This many directories are in Loaded state.
     pub loaded_directories: usize,
+    /// The snapshot represents this many entries.
     pub represented_entries: usize,
+    /// The snapshot accounts this many bytes.
     pub snapshot_bytes: u64,
+    /// All trees on the governor together account this many bytes.
     pub accounted_memory: u64,
+    /// This many admitted jobs wait for a worker or for their next lease.
     pub queued_jobs: usize,
+    /// This many jobs have a started worker.
     pub in_flight_jobs: usize,
+    /// This tree holds this many physical worker slots.
     pub blocking_slots_held: usize,
+    /// `blocking_slots` holds every physical worker slot of this tree.
     pub blocking_slots: Vec<BlockingSlot>,
+    /// `stuck_workers` holds the slots of this tree with a stuck worker.
     pub stuck_workers: Vec<BlockingSlot>,
+    /// `governor` shows the governor state at `observed_at`.
     pub governor: GovernorView,
+    /// `grants` holds every live grant of the governor.
     pub grants: Vec<Grant>,
+    /// `resource` holds the resource health of the tree (RFC §15.6).
     pub resource: ResourceHealth,
+    /// This many reads wait for admission.
+    ///
+    /// A pending root probe counts as one read.
     pub pending_requests: usize,
+    /// `watcher` names the watcher backend of the filesystem.
     pub watcher: WatcherKind,
+    /// `watcher_path_limit` repeats [`Config::watcher_path_limit`].
     pub watcher_path_limit: usize,
+    /// Snapshot commits computed this many case-folded path keys.
     pub path_folds: u64,
+    /// This many paths hold a pending or registered watch.
     pub paths_watched: usize,
+    /// The watcher path limit left this many directories unwatched.
     pub paths_unwatched_by_cap: usize,
+    /// The tree dropped this many watcher hints at the watcher path limit.
     pub dropped_hints: u64,
+    /// The tree merged this many watcher hints into an already pending read.
     pub coalesced_hints: u64,
+    /// The tree received this many complete listings.
     pub listings: u64,
+    /// This many listings failed, met rejection or reached a resource limit.
     pub listing_failures: u64,
+    /// The tree discarded this many results for a stale publication guard.
     pub stale_results: u64,
+    /// The driver reported this many workers lost after start.
     pub lost_workers: u64,
+    /// The latest listing result arrived this long after its job started.
     pub last_listing_duration: Option<Duration>,
+    /// The latest complete listing counted this many children.
     pub last_listing_children: Option<usize>,
+    /// `last_limited_listing` holds the latest resource-limited listing.
     pub last_limited_listing: Option<ResourceLimited>,
+    /// `largest_directories` holds up to 16 of the largest directories, largest
+    /// first.
     pub largest_directories: Vec<DirectorySize>,
+    /// `degraded_paths` holds every path with an active degradation cause.
     pub degraded_paths: BTreeSet<RelativePath>,
+    /// `degraded_path_causes` gives the cause of each degraded path.
     pub degraded_path_causes: BTreeMap<RelativePath, DegradedCause>,
+    /// Metadata enrichment failed for these paths.
     pub metadata_degraded_paths: BTreeSet<RelativePath>,
+    /// Sessions and enrichment reported this many metadata operations.
     pub metadata_operations: u64,
+    /// Sessions reported this many listing operations.
     pub listing_operations: u64,
+    /// Sessions enumerated this many directory entries.
+    ///
+    /// Filtered entries are included.
     pub entries_enumerated: u64,
+    /// Finished listing results held this many bytes in total.
     pub listing_bytes: u64,
+    /// Open listing sessions of this tree hold this many bytes.
     pub in_flight_listing_bytes: u64,
+    /// Adapters reported this much blocking time to the governor.
     pub reported_blocking: Duration,
+    /// Sessions reported this many kind resolutions.
     pub kind_resolutions: u64,
+    /// Sessions reported this many identity reads.
     pub identity_reads: u64,
+    /// This many listings contained a child of unresolved kind.
     pub unresolved_listings: u64,
+    /// This many listing sessions wait for their next lease.
     pub suspended_sessions: usize,
+    /// The governor granted this many leases after the first lease of a job.
     pub lease_grants: u64,
+    /// This many listing sessions ended Cancelled.
     pub cancelled_sessions: u64,
+    /// `resource_limits` holds the latest 64 resource-limit events.
     pub resource_limits: Vec<ResourceLimitEvent>,
+    /// The tree applied this many enrichment results.
     pub enrichments: u64,
+    /// This many enrichment jobs failed in whole or in part.
     pub enrichment_failures: u64,
+    /// This many directories wait for enrichment.
     pub pending_enrichments: usize,
+    /// `domains` holds statistics for every storage domain of the tree.
     pub domains: Vec<DomainStat>,
+    /// `crossings` holds the latest 64 domain-crossing decisions.
     pub crossings: Vec<CrossingEvent>,
+    /// The tree applied this many domain resolution results.
     pub domain_resolutions: u64,
+    /// This many directories wait for domain resolution.
     pub pending_domain_resolutions: usize,
 }
 
+/// `Coordinator` runs the synchronization state machine of one tree.
+///
+/// The coordinator is the only writer of its snapshot (RFC §6). The same inputs
+/// at the same times give the same outputs. A driver such as
+/// [`Tree`](crate::Tree) runs the coordinator on one task. The driver executes
+/// every [`Output`] and feeds back the matching [`Input`]. Dropping the
+/// coordinator releases all of its grants.
 pub struct Coordinator {
     config: Config,
     governor: HostGovernor,
@@ -532,6 +874,16 @@ impl Drop for Coordinator {
 }
 
 impl Coordinator {
+    /// `new` creates the coordinator and schedules the first root listing.
+    ///
+    /// The caller obtains `root_info` under bootstrap grants.
+    /// [`Coordinator::take_outputs`] returns the initial outputs.
+    ///
+    /// # Errors
+    ///
+    /// `new` returns [`Error::InvalidConfig`] when `config` or the governor
+    /// limits fail validation. It returns [`Error::NotDirectory`] when the root
+    /// is a non-directory.
     pub fn new(
         config: Config,
         policy: Arc<dyn ScanPolicy>,
@@ -656,6 +1008,10 @@ impl Coordinator {
         Ok(coordinator)
     }
 
+    /// `open_gate` reports whether the tree may publish its handle.
+    ///
+    /// `None` means the initial root watch registration is still pending (RFC
+    /// §11.1). An error means that open must fail with it.
     pub fn open_gate(&self) -> Option<Result<(), Error>> {
         match &self.open_gate {
             OpenGate::Pending => None,
@@ -664,26 +1020,32 @@ impl Coordinator {
         }
     }
 
+    /// `take_outputs` drains the queued outputs.
     pub fn take_outputs(&mut self) -> Vec<Output> {
         std::mem::take(&mut self.outputs)
     }
 
+    /// `snapshot` returns the current snapshot.
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
 
+    /// `health` returns the current health.
     pub fn health(&self) -> Health {
         self.compute_health()
     }
 
+    /// `config` returns the tree configuration.
     pub fn config(&self) -> &Config {
         &self.config
     }
 
+    /// `job_class` returns the admission class of an active job.
     pub fn job_class(&self, id: JobId) -> Option<Class> {
         self.jobs.get(&id).map(|job| job.reasons.class())
     }
 
+    /// `job_operation` returns the operation of an active job.
     pub fn job_operation(&self, id: JobId) -> Option<JobOperation> {
         self.jobs.get(&id).map(|job| Coordinator::operation_for(job.need))
     }
@@ -773,10 +1135,15 @@ impl Coordinator {
         GrantId::WatchRelease(self.tree, release)
     }
 
+    /// `grants` returns every live grant of the shared governor.
     pub fn grants(&self) -> Vec<Grant> {
         self.governor.grants()
     }
 
+    /// `new_grants_into` appends every unseen live grant to `into`.
+    ///
+    /// The `seen` callback receives the id and lease of each grant. It returns
+    /// `true` for a known grant.
     pub fn new_grants_into(&self, into: &mut Vec<Grant>, seen: &dyn Fn(GrantId, u32) -> bool) {
         self.governor.new_grants_into(into, seen)
     }
@@ -832,20 +1199,27 @@ impl Coordinator {
         ResourceLimited { limit, configured, observed, domain: self.domain_of(entry) }
     }
 
+    /// `governor` returns the governor state at the coordinator's current time.
     pub fn governor(&self) -> GovernorView {
         self.governor.view(self.now)
     }
 
+    /// `last_round` returns the start and duration of the latest completed
+    /// round.
     pub fn last_round(&self) -> Option<(MonotonicTime, Duration)> {
         self.last_round
     }
 
+    /// `open_batch` returns the open closed batch.
+    ///
+    /// `open_batch` returns `None` between dispatch cycles.
     pub fn open_batch(&self) -> Option<BatchView> {
         self.batch
             .as_ref()
             .map(|batch| BatchView { periodic: batch.periodic, members: batch.members.iter().copied().collect() })
     }
 
+    /// `is_stopped` reports whether the tree shut down or was terminated.
     pub fn is_stopped(&self) -> bool {
         matches!(self.shutdown, ShutdownState::Stopped | ShutdownState::Terminated { .. })
     }
@@ -854,12 +1228,22 @@ impl Coordinator {
         !self.pending_releases.is_empty()
     }
 
+    /// `observe` advances the clock to `now` and runs scheduling.
+    ///
+    /// `observe` returns the resulting outputs. The coordinator ignores a `now`
+    /// before its current time.
     pub fn observe(&mut self, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         self.after_input();
         self.take_outputs()
     }
 
+    /// `handle` applies one input at `now`.
+    ///
+    /// The driver executes the returned outputs in order. The coordinator
+    /// ignores a `now` before its current time. After the coordinator stops,
+    /// commands fail with [`Error::Shutdown`] or [`Error::TreeTerminated`].
+    /// Late results then only release their grants.
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         self.finish_stuck_jobs();
@@ -991,6 +1375,7 @@ impl Coordinator {
         self.take_outputs()
     }
 
+    /// `stats` returns the statistics at the coordinator's current time.
     pub fn stats(&self) -> Stats {
         let queued = self.jobs.values().filter(|j| matches!(j.phase, JobPhase::Queued | JobPhase::Suspended)).count();
         let in_flight = self.jobs.values().filter(|j| j.phase.started().is_some()).count();
@@ -1516,6 +1901,10 @@ impl Coordinator {
         self.governor.in_flight() >= self.maximum_in_flight && !self.queue_order.is_empty()
     }
 
+    /// `throttled` reports whether admission is throttled.
+    ///
+    /// Host throttling, a full host with queued work and a throttled domain of
+    /// this tree all count.
     pub fn throttled(&self) -> bool {
         if self.governor.throttle(self.now).is_some() {
             return true;

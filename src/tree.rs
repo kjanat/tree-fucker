@@ -1,3 +1,14 @@
+//! This module provides the live reconciled tree and its update stream.
+//!
+//! [`Tree::open`] validates a root, starts a coordinator task on the
+//! supplied [`Runtime`], and returns a [`TreeHandle`] and an
+//! [`UpdateStream`]. The coordinator keeps the [`Snapshot`] in agreement
+//! with the filesystem through the initial scan, watcher hints, and
+//! periodic reconciliation rounds (RFC §5, §11). The handle reads the
+//! current state and sends commands. The stream delivers every committed
+//! transition and health change until [`TreeHandle::shutdown`] or a fatal
+//! failure ends the tree.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -115,11 +126,23 @@ impl StreamInner {
     }
 }
 
+/// `UpdateStream` delivers the [`UpdateEvent`] items of one tree (RFC §9).
+///
+/// [`Tree::open`] returns the only stream of a tree. Events arrive in
+/// snapshot version order. The stream holds at most
+/// [`Config::update_stream_capacity`] undelivered events. When a consumer
+/// falls behind under [`LagMode::Reset`], it receives one
+/// [`UpdateEvent::Reset`]. Under [`LagMode::Disconnect`], it receives a
+/// [`StreamError::Lagged`], and then the stream ends. After shutdown or
+/// fatal termination the stream yields [`UpdateEvent::Terminal`] and ends.
+///
+/// `UpdateStream` implements [`Stream`] for use with stream combinators.
 pub struct UpdateStream {
     inner: Arc<Mutex<StreamInner>>,
 }
 
 impl UpdateStream {
+    /// `next` waits for the next event, or returns `None` after the end.
     pub async fn next(&mut self) -> Option<std::result::Result<UpdateEvent, StreamError>> {
         StreamExt::next(self).await
     }
@@ -476,9 +499,53 @@ impl Actor {
     }
 }
 
+/// `Tree` opens a live, reconciled view of one directory tree.
+///
+/// A tree runs through four stages.
+///
+/// 1. [`Tree::open`] validates the configuration, canonicalizes the root,
+///    confirms the root is a directory, completes the root watch registration
+///    attempt, and spawns the coordinator on the runtime. It returns a
+///    [`TreeHandle`] and an [`UpdateStream`].
+/// 2. The initial scan runs as governed background work (RFC §11.1).
+///    [`TreeHandle::initial_scan_complete`] waits for it.
+/// 3. The consumer reads [`UpdateStream`] events and calls
+///    [`TreeHandle::snapshot`] whenever it needs the current state. Watcher
+///    hints and reconciliation rounds keep the snapshot current.
+/// 4. [`TreeHandle::shutdown`] stops the tree. The stream then yields
+///    [`UpdateEvent::Terminal`] and ends.
+///
+/// The tree keeps running after the caller drops every handle. The caller
+/// must call [`TreeHandle::shutdown`] to stop it.
 pub struct Tree;
 
 impl Tree {
+    /// `open` opens a tree at `root` under the process-wide host governor.
+    ///
+    /// Every tree and scan in one process shares that governor (RFC §9,
+    /// §15.9).
+    ///
+    /// `filesystem` performs every read. `policy` decides the loading of
+    /// directories. `config` sets per-tree limits. `runtime` supplies task
+    /// spawning, blocking workers, timers, and the monotonic clock. The
+    /// caller must poll the returned future on that runtime.
+    ///
+    /// `open` returns after the root watch registration attempt finishes.
+    /// The initial scan continues in the background.
+    ///
+    /// # Errors
+    ///
+    /// - `open` returns [`Error::InvalidConfig`] for an invalid `config` or
+    ///   invalid host limits.
+    /// - It returns [`Error::NotFound`] or [`Error::NotDirectory`] for an
+    ///   absent or non-directory root (RFC §13.2).
+    /// - It returns [`Error::WatcherRegistrationFailed`] when root registration
+    ///   fails under
+    ///   [`crate::config::WatchRegistrationFailure::RequireWatcher`].
+    /// - It returns [`Error::Io`] when the adapter fails a root read.
+    /// - It returns [`Error::Coordination`] when the shared authority fails.
+    /// - It returns [`Error::WorkerLost`] when a bootstrap worker ends without
+    ///   a result.
     pub async fn open(
         filesystem: Arc<dyn FileSystem>,
         root: PathBuf,
@@ -489,6 +556,12 @@ impl Tree {
         Tree::open_under(filesystem, root, policy, config, runtime, host_governor()).await
     }
 
+    /// `open_outside_host_governor` opens a tree under the given `governor`.
+    ///
+    /// This function is the named opt-out of RFC §15.9. The process-wide
+    /// governor states a bound for the process, and work of this tree falls
+    /// outside it. Tests call it with [`HostGovernor::independent`]. Its
+    /// arguments and errors match [`Tree::open`].
     pub async fn open_outside_host_governor(
         filesystem: Arc<dyn FileSystem>,
         root: PathBuf,
@@ -674,24 +747,49 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
+/// `TreeHandle` reads and commands one open tree (RFC §9).
+///
+/// Clones address the same tree. Reads return the latest published state
+/// and never wait for filesystem I/O. Commands go to the coordinator and
+/// complete when the coordinator finishes them.
+///
+/// The coordinator accepts a command when it assigns the command a causal
+/// barrier. A read satisfies the command only when the coordinator
+/// dispatched it after that barrier. Dropping a command future leaves an
+/// accepted command running. No command has a wall-clock bound, and
+/// throttling delays commands without failing them (RFC §15.4).
+///
+/// Every command can fail with [`Error::Shutdown`] after shutdown began,
+/// [`Error::TreeTerminated`] after a fatal failure, [`Error::Capacity`]
+/// when the pending command capacity is full, and [`Error::Coordination`]
+/// when the shared admission authority failed. While the root is
+/// unavailable, a refresh of the root starts recovery and every other
+/// root-dependent command fails with [`Error::RootUnavailable`] (RFC §9.1).
 #[derive(Clone)]
 pub struct TreeHandle {
     shared: Arc<Shared>,
 }
 
 impl TreeHandle {
+    /// `snapshot` returns the latest published snapshot.
     pub fn snapshot(&self) -> Snapshot {
         lock(&self.shared.snapshot).clone()
     }
 
+    /// `health` returns the latest published health.
     pub fn health(&self) -> Health {
         lock(&self.shared.health).clone()
     }
 
+    /// `stats` returns the coordinator statistics of RFC §16.
     pub fn stats(&self) -> Stats {
         lock(&self.shared.stats).clone()
     }
 
+    /// `held_listing_sessions` counts the suspended listing sessions.
+    ///
+    /// A session suspends between leases. It then holds its buffer and
+    /// handle and no worker slot (RFC §10.2).
     pub fn held_listing_sessions(&self) -> u64 {
         self.shared.held_sessions.load(Ordering::SeqCst)
     }
@@ -710,30 +808,104 @@ impl TreeHandle {
         }
     }
 
+    /// `initial_scan_complete` waits for the initial scan of the current root.
+    ///
+    /// The call succeeds when traversal is exhausted and the tree accepted
+    /// or removed every initial directory. It fails with
+    /// [`Error::InitialScanDegraded`], and the error lists the unsatisfied
+    /// paths. Background retries continue after that failure, and
+    /// [`Health::initial_scan`] reports their progress. The call fails with
+    /// [`Error::RootUnavailable`] when the root vanishes. The caller can call
+    /// it again after the root recovers, and the new call waits for the new
+    /// incarnation (RFC §9, §11.1).
     pub async fn initial_scan_complete(&self) -> Result<()> {
         self.command(Command::InitialScanComplete).await
     }
 
+    /// `refresh` rereads `paths` and waits for an accepted fresh read of each.
+    ///
+    /// The coordinator counts a read as fresh after it dispatches the read
+    /// past the command barrier (RFC §9, §9.1).
+    ///
+    /// A Loaded or Loading directory gets a listing. An Unloaded or Excluded
+    /// directory and a non-directory get a metadata read. For an
+    /// unrepresented target, the coordinator lists its deepest Loaded or
+    /// Loading ancestor and walks down one component at a time. The walk
+    /// fails with [`Error::NotLoaded`], [`Error::PolicyDenied`], or
+    /// [`Error::NotDirectory`] at an Unloaded, Excluded, or non-directory
+    /// component. When a listing proves the target absent, the command
+    /// succeeds. Refresh draws on the foreground allowance (RFC §15.4).
+    ///
+    /// A failed required read fails the command with [`Error::Io`],
+    /// [`Error::ResourceLimited`], [`Error::Stuck`], [`Error::InvalidListing`],
+    /// [`Error::UnresolvedKind`], [`Error::AncestorNotDirectory`], or
+    /// [`Error::WatcherRegistrationFailed`]. A command over the configured
+    /// path limit fails with [`Error::PathLimit`] before acceptance.
     pub async fn refresh(&self, paths: Vec<RelativePath>) -> Result<()> {
         self.command(Command::Refresh(paths)).await
     }
 
+    /// `load` loads the represented directory at `path` (RFC §9.1).
+    ///
+    /// An Unloaded target becomes Loading. The command succeeds after an
+    /// accepted post-barrier listing makes the target Loaded. A Loading or
+    /// Loaded target also waits for such a listing. Policy selects further
+    /// descendants, and they load as ordinary background work.
+    ///
+    /// The command fails with [`Error::PolicyDenied`] for an Excluded target
+    /// and with [`Error::NotDirectory`] for a non-directory. It fails with
+    /// [`Error::NotFound`] for an unrepresented target and for a target
+    /// removed during loading. Required reads fail it as they fail
+    /// [`TreeHandle::refresh`].
     pub async fn load(&self, path: RelativePath) -> Result<()> {
         self.command(Command::Load(path)).await
     }
 
+    /// `unload` unloads the directory at `path` without filesystem I/O.
+    ///
+    /// The command follows RFC §9.1.
+    ///
+    /// A Loaded or Loading target becomes Unloaded. Its represented
+    /// descendants leave the snapshot and its pending work is cancelled. An
+    /// Unloaded, Excluded, or unrepresented target succeeds unchanged. A
+    /// non-directory fails with [`Error::NotDirectory`].
     pub async fn unload(&self, path: RelativePath) -> Result<()> {
         self.command(Command::Unload(path)).await
     }
 
+    /// `invalidate_policy` reevaluates policy below `roots`.
+    ///
+    /// The reevaluation covers each root and its represented descendants.
+    ///
+    /// The caller invokes it after the policy changes its decisions for
+    /// those subtrees. Results from before the call cannot commit within
+    /// them. The command succeeds after the reevaluation commits its loads,
+    /// unloads, and exclusions. Every newly Loading directory must also have
+    /// an accepted listing. An unrepresented root succeeds unchanged.
+    /// Required reads fail the command as they fail [`TreeHandle::refresh`]
+    /// (RFC §8, §9).
     pub async fn invalidate_policy(&self, roots: Vec<RelativePath>) -> Result<()> {
         self.command(Command::InvalidatePolicy(roots)).await
     }
 
+    /// `set_priority` replaces the priority set with `paths` (RFC §9.1, §11.3).
+    ///
+    /// Loaded directories in the set get lower-latency reconciliation.
+    /// Other paths stay dormant until they match a Loaded directory. The
+    /// command succeeds after the coordinator replaces the set. A set over
+    /// the priority-set limit fails with [`Error::PathLimit`], and the
+    /// existing set stays.
     pub async fn set_priority(&self, paths: impl IntoIterator<Item = RelativePath>) -> Result<()> {
         self.command(Command::SetPriority(paths.into_iter().collect())).await
     }
 
+    /// `shutdown` stops the tree (RFC §9).
+    ///
+    /// Shutdown stops command acceptance, fails every unfinished command
+    /// with [`Error::Shutdown`], cancels queued and in-flight work, releases
+    /// watches, publishes [`UpdateEvent::Terminal`], and closes the stream.
+    /// Blocked filesystem calls keep their worker slots until they return.
+    /// A second call fails with [`Error::Shutdown`].
     pub async fn shutdown(&self) -> Result<()> {
         self.command(Command::Shutdown).await
     }

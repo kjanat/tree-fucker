@@ -1,4 +1,4 @@
-//! illumos coordination on zone-local retained tmpfs storage.
+//! The illumos backend coordinates on zone-local retained tmpfs storage.
 //!
 //! Discovery uses an administrator-created sticky directory at
 //! `/var/run/tree-fucker`, which must reside on tmpfs. The kernel's monotonic

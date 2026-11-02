@@ -1,9 +1,10 @@
-//! Two bounded snapshots with an explicit commit decision.
+//! The journal keeps two bounded snapshots with an explicit commit decision.
 //!
 //! The caller holds the backend's interprocess lock for every method. Storage
 //! must be unbuffered, host-local, and preserve completed writes across process
-//! exit. This is a process-crash protocol, not a power-loss durability claim.
-//! A corrupt committed slot fails closed; it never falls back to older debt.
+//! exit. The protocol survives process crashes and makes no power-loss
+//! durability claim. A corrupt committed slot fails closed, and the journal
+//! never falls back to older debt.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -20,13 +21,29 @@ const FORMAT: u32 = 1;
 const PREPARING: u8 = 0x5a;
 const COMMITTED: u8 = 0xa5;
 
+/// `Error` reports a journal failure.
+///
+/// An error after a transaction starts writing leaves an uncertain outcome.
+/// The caller must reconnect and recover before it dispatches any work.
 #[derive(Debug)]
 pub enum Error {
+    /// A read, write, seek, or flush on the storage failed.
     Io(io::Error),
+    /// The authority rejected a transition, or its snapshot failed to encode
+    /// or decode.
     State(AuthorityError),
+    /// The header, a committed snapshot, the storage length, or the recorded
+    /// generation is damaged or inconsistent.
+    ///
+    /// [`Journal::create`] also returns this error when the storage is
+    /// nonempty.
     Malformed,
+    /// The journal uses another format version, or a transaction tried to
+    /// change the authority's configuration.
     Incompatible,
+    /// Neither snapshot slot holds a recoverable initial state.
     Uninitialized,
+    /// The transaction sequence counter reached its maximum value.
     SequenceExhausted,
 }
 
@@ -65,7 +82,11 @@ impl From<AuthorityError> for Error {
     }
 }
 
-/// A journal handle. It does not acquire an OS lock by itself.
+/// `Journal` stores an [`Authority`] in two bounded snapshot slots.
+///
+/// The journal acquires no OS lock itself. The caller holds the backend's
+/// exclusive bookkeeping lock across every method call (coordination.md,
+/// "Crash consistency and recovery").
 pub struct Journal<S> {
     storage: S,
     capacity: u32,
@@ -98,7 +119,11 @@ struct Candidate {
 }
 
 impl<S: Read + Write + Seek> Journal<S> {
-    /// Initialize a new empty object; never overwrite an existing rendezvous.
+    /// `create` initializes empty storage and publishes `authority` as the
+    /// first snapshot.
+    ///
+    /// The method refuses nonempty storage with [`Error::Malformed`], and it
+    /// never overwrites an existing rendezvous.
     pub fn create(mut storage: S, authority: &Authority) -> Result<Self, Error> {
         if storage.seek(SeekFrom::End(0))? != 0 {
             return Err(Error::Malformed);
@@ -126,6 +151,11 @@ impl<S: Read + Write + Seek> Journal<S> {
         Ok(journal)
     }
 
+    /// `open` validates the journal header and storage length of existing
+    /// storage.
+    ///
+    /// The method reads no snapshot. [`Journal::load`] or a transaction
+    /// recovers the current state.
     pub fn open(mut storage: S) -> Result<Self, Error> {
         let mut bytes = [0; HEADER as usize];
         storage.seek(SeekFrom::Start(0))?;
@@ -261,15 +291,24 @@ impl<S: Read + Write + Seek> Journal<S> {
         Ok(Snapshot { sequence, authority })
     }
 
-    /// Recover a complete state under the backend's exclusive lock.
+    /// `load` recovers the latest complete snapshot under the backend's
+    /// exclusive lock.
+    ///
+    /// A complete snapshot without its commit byte is adopted and marked
+    /// committed. A damaged committed snapshot fails with
+    /// [`Error::Malformed`], and the journal never falls back to the older
+    /// slot.
     pub fn load(&mut self) -> Result<Authority, Error> {
         Ok(self.latest()?.authority)
     }
 
-    /// Commit ownership and accounting together. No target-filesystem work
-    /// may execute in this closure. An error after writing begins is an
-    /// uncertain outcome: callers must reconnect/recover, never mint fallback
-    /// capacity or blindly dispatch the requested operation.
+    /// `transaction` applies `operation` to the latest state and publishes
+    /// ownership and accounting together.
+    ///
+    /// The closure must not run target-filesystem work. A callback error
+    /// publishes nothing. An error after writing begins leaves an uncertain
+    /// outcome. The caller must then reconnect and recover, and it must not
+    /// mint fallback capacity or dispatch the requested operation.
     pub fn transaction<T>(
         &mut self,
         operation: impl FnOnce(&mut Authority) -> Result<T, AuthorityError>,
@@ -277,9 +316,13 @@ impl<S: Read + Write + Seek> Journal<S> {
         self.transaction_with(|state| operation(state).map_err(Error::from))
     }
 
-    /// Include backend lifetime checks in the same loaded-state transaction.
-    /// A callback error publishes nothing. Native backends can preserve their
-    /// own I/O and identity errors without loading and decoding state twice.
+    /// `transaction_with` runs backend lifetime checks and `operation` in one
+    /// loaded-state transaction.
+    ///
+    /// A callback error publishes nothing. The callback returns its own error
+    /// type, and native backends use it to preserve their I/O and identity
+    /// errors. A change to the authority's configuration fails with
+    /// [`Error::Incompatible`].
     pub fn transaction_with<T, E: From<Error>>(
         &mut self,
         operation: impl FnOnce(&mut Authority) -> Result<T, E>,
@@ -321,6 +364,7 @@ impl<S: Read + Write + Seek> Journal<S> {
         Ok(())
     }
 
+    /// `into_inner` returns the underlying storage and drops the journal.
     pub fn into_inner(self) -> S {
         self.storage
     }

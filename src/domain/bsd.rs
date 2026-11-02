@@ -14,10 +14,20 @@ use super::{
     WatcherScope,
 };
 
+/// `FreeBsdProbe` probes storage domains on FreeBSD with `fstatfs` (RFC §14.3).
+///
+/// It keys a domain by the `f_fsid` of the mount and keys the identity
+/// space by the device number. A changed mount or device between parent
+/// and child proves a crossing. The probe derives topology, transport and
+/// media from `MNT_LOCAL` and the filesystem type name. A built-in table
+/// per filesystem type supplies case and identity reliability. The probe
+/// declares timestamp granularity as Unknown. It opens each directory
+/// without following a symbolic link.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FreeBsdProbe;
 
 impl FreeBsdProbe {
+    /// `new` creates a FreeBSD probe.
     pub fn new() -> FreeBsdProbe {
         FreeBsdProbe
     }

@@ -1,3 +1,9 @@
+//! This module runs a [`crate::tree::Tree`] on simulated time for tests.
+//!
+//! [`DeterministicRuntime`] runs every task and blocking job on the calling
+//! thread and advances time only on request. [`HoldingRuntime`] wraps it and
+//! holds blocking work back to model stuck workers (RFC §13.5).
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -11,10 +17,16 @@ use futures_util::task::{ArcWake, waker_ref};
 
 use crate::runtime::{BoxFuture, BoxTaskHandle, Runtime, TaskHandle};
 
+/// `BlockingMode` decides how [`DeterministicRuntime`] treats blocking work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockingMode {
+    /// `Queued` queues work for the next drive.
+    ///
+    /// A cancel before the start skips the work.
     Queued,
+    /// `Discarded` drops work unrun to model a lost worker.
     Discarded,
+    /// `Uninterruptible` queues work and runs it even after cancellation.
     Uninterruptible,
 }
 
@@ -66,6 +78,12 @@ struct Inner {
     blocking_mode: BlockingMode,
 }
 
+/// `DeterministicRuntime` is a single-threaded [`Runtime`] on manual time.
+///
+/// [`Runtime::now`] starts at the real instant of construction. Only
+/// [`DeterministicRuntime::advance`] and [`DeterministicRuntime::block_on`]
+/// move it. The driving thread runs spawned tasks and blocking work.
+/// Tests on this runtime never sleep.
 pub struct DeterministicRuntime {
     inner: Mutex<Inner>,
     woken: Arc<Flag>,
@@ -95,6 +113,7 @@ impl Default for DeterministicRuntime {
 }
 
 impl DeterministicRuntime {
+    /// `new` creates a runtime in [`BlockingMode::Queued`] at offset zero.
     pub fn new() -> DeterministicRuntime {
         DeterministicRuntime {
             inner: Mutex::new(Inner {
@@ -111,18 +130,25 @@ impl DeterministicRuntime {
         }
     }
 
+    /// `elapsed` returns the simulated time since construction.
     pub fn elapsed(&self) -> Duration {
         lock(&self.inner).offset
     }
 
+    /// `set_blocking_mode` sets the treatment of later blocking work.
     pub fn set_blocking_mode(&self, mode: BlockingMode) {
         lock(&self.inner).blocking_mode = mode;
     }
 
+    /// `cancel_requests` counts the cancels on queued blocking job handles.
     pub fn cancel_requests(&self) -> u64 {
         self.cancel_requests.load(Ordering::SeqCst)
     }
 
+    /// `run_until_stalled` runs blocking work and polls tasks until idle.
+    ///
+    /// Time stays still. The runtime catches and counts panics in blocking
+    /// work.
     pub fn run_until_stalled(&self) {
         loop {
             let blocking: Vec<BlockingWork> = lock(&self.inner).blocking.drain(..).collect();
@@ -160,6 +186,7 @@ impl DeterministicRuntime {
         }
     }
 
+    /// `advance` moves time forward, fires due timers, and runs until stalled.
     pub fn advance(&self, duration: Duration) {
         {
             let mut inner = lock(&self.inner);
@@ -182,11 +209,20 @@ impl DeterministicRuntime {
         self.run_until_stalled();
     }
 
+    /// `next_timer` returns the delay until the earliest pending timer.
     pub fn next_timer(&self) -> Option<Duration> {
         let inner = lock(&self.inner);
         inner.timers.iter().map(|(at, _)| *at).min().map(|at| at.saturating_sub(inner.offset))
     }
 
+    /// `block_on` drives `future` to completion on simulated time.
+    ///
+    /// When everything stalls, time jumps to the next timer.
+    ///
+    /// # Panics
+    ///
+    /// `block_on` panics when `future` is pending without a runnable task or
+    /// a timer.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         let main = Arc::new(Flag(AtomicBool::new(false)));
@@ -229,6 +265,12 @@ impl Drop for InertHandle {
     }
 }
 
+/// `HoldingRuntime` holds blocking work back to model stuck workers.
+///
+/// It wraps a [`DeterministicRuntime`] and implements [`Runtime`]. Held work
+/// runs only on [`HoldingRuntime::release`]. Its task handle counts
+/// cancellations and drops and never stops the work (RFC §13.5). Every other
+/// call goes to the inner runtime.
 pub struct HoldingRuntime {
     inner: Arc<DeterministicRuntime>,
     hold: AtomicBool,
@@ -239,6 +281,7 @@ pub struct HoldingRuntime {
 }
 
 impl HoldingRuntime {
+    /// `new` wraps `inner` and leaves holding off.
     pub fn new(inner: Arc<DeterministicRuntime>) -> HoldingRuntime {
         HoldingRuntime {
             inner,
@@ -250,26 +293,37 @@ impl HoldingRuntime {
         }
     }
 
+    /// `hold` makes the runtime hold every later blocking job.
     pub fn hold(&self) {
         self.hold.store(true, Ordering::SeqCst);
     }
 
+    /// `hold_next` holds the next `count` blocking jobs.
+    ///
+    /// A new count replaces any earlier count.
     pub fn hold_next(&self, count: usize) {
         self.budget.store(u64::try_from(count).unwrap_or(u64::MAX), Ordering::SeqCst);
     }
 
+    /// `held` counts the currently held jobs.
     pub fn held(&self) -> usize {
         self.held.lock().map(|held| held.len()).unwrap_or(0)
     }
 
+    /// `cancels` counts the cancels on held job handles.
     pub fn cancels(&self) -> usize {
         usize::try_from(self.cancels.load(Ordering::SeqCst)).unwrap_or(usize::MAX)
     }
 
+    /// `dropped_handles` counts the drops of held job handles.
     pub fn dropped_handles(&self) -> usize {
         usize::try_from(self.drops.load(Ordering::SeqCst)).unwrap_or(usize::MAX)
     }
 
+    /// `release` runs every held job on the calling thread, in spawn order.
+    ///
+    /// After [`HoldingRuntime::hold`], the runtime keeps holding later
+    /// blocking work.
     pub fn release(&self) {
         let work: Vec<Box<dyn FnOnce() + Send + 'static>> = match self.held.lock() {
             Ok(mut held) => held.drain(..).collect(),

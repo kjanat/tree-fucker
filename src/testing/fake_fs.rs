@@ -1,3 +1,10 @@
+//! This module provides a deterministic in-memory filesystem for tests.
+//!
+//! [`FakeFileSystem`] implements [`FileSystem`] over an in-memory tree
+//! (RFC §10.5). Tests mutate the tree with or without watcher events,
+//! inject failures and panics, charge simulated worker time to operations,
+//! and assign paths to storage domains with their own capabilities.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,28 +23,49 @@ use crate::fs::{
 use crate::ids::WatchId;
 use crate::path::{CaseSensitivity, RelativePath};
 
+/// `FakeOp` names a [`FakeFileSystem`] operation.
+///
+/// Tests can fail, cost, or count each operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FakeOp {
+    /// `Metadata` names a metadata read of one path.
     Metadata,
+    /// `ReadDir` names the first lease of a listing session.
+    ///
+    /// This lease opens the directory.
     ReadDir,
+    /// `Chunk` names a later lease of a listing session.
+    ///
+    /// Tests use it only for costs.
     Chunk,
+    /// `ResolveKind` names a per-child kind resolution inside a listing.
     ResolveKind,
+    /// `ResolveIdentity` names a per-child identity read inside a listing.
     ResolveIdentity,
+    /// `ResolveDomain` names a storage-domain resolution.
     ResolveDomain,
+    /// `Enrich` names a metadata enrichment of a directory or one child.
     Enrich,
+    /// `Watch` names a watcher registration.
     Watch,
 }
 
+/// `DomainId` labels a fake storage domain.
+///
+/// Paths without an assigned domain belong to [`DomainId::ROOT`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DomainId(u64);
 
 impl DomainId {
+    /// `ROOT` labels the domain of every path without an assigned domain.
     pub const ROOT: DomainId = DomainId(0);
 
+    /// `new` creates the domain label `value`.
     pub const fn new(value: u64) -> DomainId {
         DomainId(value)
     }
 
+    /// `get` returns the numeric label.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -49,23 +77,41 @@ impl std::fmt::Display for DomainId {
     }
 }
 
+/// `CostScope` scopes a simulated cost for [`FakeFileSystem::set_cost`].
+///
+/// A path cost overrides a domain cost, and a domain cost overrides the
+/// cost for everything.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CostScope {
+    /// `Path` covers operations on exactly this path.
     Path(RelativePath),
+    /// `Domain` covers operations on paths in this domain.
     Domain(DomainId),
+    /// `Everything` covers every operation without a narrower cost.
     Everything,
 }
 
 impl CostScope {
+    /// `path` builds a path scope from a test path string.
+    ///
+    /// # Panics
+    ///
+    /// `path` panics when `p` fails to parse as a [`RelativePath`].
     pub fn path(p: &str) -> CostScope {
         CostScope::Path(FakeFileSystem::path(p))
     }
 }
 
+/// `FailureMode` sets how often an injected failure fires.
 #[derive(Clone, Debug)]
 pub enum FailureMode {
+    /// `Once` fails the next matching operation, and later ones succeed.
     Once(FsError),
+    /// `Times` fails the next `n` matching operations.
     Times(u32, FsError),
+    /// `Always` fails every matching operation until the test clears it.
+    ///
+    /// [`FakeFileSystem::clear_failures`] clears it.
     Always(FsError),
 }
 
@@ -87,9 +133,12 @@ struct InjectedChild {
     info: EntryInfo,
 }
 
+/// `InjectedPosition` places injected children in the enumeration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InjectedPosition {
+    /// `Last` places injected children after the real children.
     Last,
+    /// `First` places injected children before the real children.
     First,
 }
 
@@ -131,6 +180,19 @@ struct Inner {
     own_identities: HashMap<RelativePath, FileIdentity>,
 }
 
+/// `FakeFileSystem` is an in-memory [`FileSystem`] for tests.
+///
+/// It supports injected faults, costs, and storage domains. It covers the
+/// test implementation requirements of RFC §10.5.
+///
+/// The fake starts with an empty root directory at `/fake`. Its clock starts
+/// at a fixed time and advances one second per timestamped mutation. Each
+/// mutation method states whether it sends a watcher hint. The `*_silently`
+/// methods send no hint and leave every existing mtime unchanged.
+///
+/// [`FakeFileSystem::set_cost`] sets simulated worker time.
+/// [`crate::testing::Harness`] charges it without sleeping. Every method
+/// with a `&str` path panics when the path fails to parse.
 pub struct FakeFileSystem {
     root: PathBuf,
     inner: Arc<Mutex<Inner>>,
@@ -146,10 +208,15 @@ fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
 }
 
 impl FakeFileSystem {
+    /// `new` creates a case-sensitive fake with the `watcher` backend.
     pub fn new(watcher: WatcherKind) -> FakeFileSystem {
         FakeFileSystem::with_capabilities(FsCapabilities { case: CaseSensitivity::Sensitive, watcher })
     }
 
+    /// `with_capabilities` creates a fake with tree-wide capabilities `caps`.
+    ///
+    /// Every domain starts with [`DomainCapabilities::inline`], and listings
+    /// report child domains inline.
     pub fn with_capabilities(caps: FsCapabilities) -> FakeFileSystem {
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let mut nodes = BTreeMap::new();
@@ -208,11 +275,16 @@ impl FakeFileSystem {
         }
     }
 
+    /// `set_synthetic_children` makes listings of `p` yield `count` files.
+    ///
+    /// The files carry the names `f0`, `f1`, and so on. They exist only in
+    /// listings, and they replace the real children of `p`.
     pub fn set_synthetic_children(&self, p: &str, count: usize) {
         let path = Self::path(p);
         lock(&self.inner).synthetic.insert(path, count);
     }
 
+    /// `report_own_identity` makes reads of `p` report `identity` for `p`.
     pub fn report_own_identity(&self, p: &str, identity: FileIdentity) {
         let path = Self::path(p);
         lock(&self.inner).own_identities.insert(path, identity);
@@ -226,10 +298,16 @@ impl FakeFileSystem {
         Ok(info)
     }
 
+    /// `root` returns the native root path, `/fake`.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// `path` parses a test path string into a [`RelativePath`].
+    ///
+    /// # Panics
+    ///
+    /// `path` panics when `p` fails to parse.
     pub fn path(p: &str) -> RelativePath {
         RelativePath::parse(p).expect("valid test path")
     }
@@ -247,6 +325,9 @@ impl FakeFileSystem {
         }
     }
 
+    /// `mkdir` creates the directory `p` and sends a Create hint.
+    ///
+    /// The parent mtime advances.
     pub fn mkdir(&self, p: &str) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -265,14 +346,24 @@ impl FakeFileSystem {
         Self::emit(&mut inner, vec![path], HintKind::Create);
     }
 
+    /// `create_file` creates the file `p` with `size` bytes.
+    ///
+    /// It delegates to [`Self::create_kind`].
     pub fn create_file(&self, p: &str, size: u64) {
         self.create_kind(p, EntryKind::File, size);
     }
 
+    /// `create_symlink` creates the symbolic link `p`.
+    ///
+    /// It delegates to [`Self::create_kind`].
     pub fn create_symlink(&self, p: &str) {
         self.create_kind(p, EntryKind::Symlink, 0);
     }
 
+    /// `create_kind` creates `p` with `kind` and `size`.
+    ///
+    /// It sends a Create hint, and the parent mtime advances. The new entry
+    /// replaces any existing entry at `p`, and the old descendants stay.
     pub fn create_kind(&self, p: &str, kind: EntryKind, size: u64) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -296,6 +387,9 @@ impl FakeFileSystem {
         Self::emit(&mut inner, vec![path], HintKind::Create);
     }
 
+    /// `remove` removes `p` and its descendants, and sends a Remove hint.
+    ///
+    /// The parent mtime advances.
     pub fn remove(&self, p: &str) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -307,6 +401,10 @@ impl FakeFileSystem {
         Self::emit(&mut inner, vec![path], HintKind::Remove);
     }
 
+    /// `rename` moves `from` and its descendants to `to`.
+    ///
+    /// The moved entries keep their identities. Both parent mtimes advance,
+    /// and one Rename hint names both paths.
     pub fn rename(&self, from: &str, to: &str) {
         let from = Self::path(from);
         let to = Self::path(to);
@@ -326,6 +424,9 @@ impl FakeFileSystem {
         Self::emit(&mut inner, vec![from, to], HintKind::Rename);
     }
 
+    /// `set_size_silently` sets the size of `p`.
+    ///
+    /// It sends no hint and leaves every mtime unchanged.
     pub fn set_size_silently(&self, p: &str, size: u64) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -334,6 +435,9 @@ impl FakeFileSystem {
         }
     }
 
+    /// `add_silently` creates `p` with `kind`.
+    ///
+    /// It sends no hint and leaves the parent mtime unchanged.
     pub fn add_silently(&self, p: &str, kind: EntryKind) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -350,6 +454,9 @@ impl FakeFileSystem {
         );
     }
 
+    /// `remove_silently` removes `p` and its descendants.
+    ///
+    /// It sends no hint and leaves the parent mtime unchanged.
     pub fn remove_silently(&self, p: &str) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -359,6 +466,7 @@ impl FakeFileSystem {
         }
     }
 
+    /// `clear_identity` removes the file identity of `p` without a hint.
     pub fn clear_identity(&self, p: &str) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -367,6 +475,9 @@ impl FakeFileSystem {
         }
     }
 
+    /// `set_mtime` sets the mtime of `p` without a hint.
+    ///
+    /// The time can lie in the future or before the current mtime.
     pub fn set_mtime(&self, p: &str, mtime: SystemTime) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -375,11 +486,13 @@ impl FakeFileSystem {
         }
     }
 
+    /// `mtime` returns the mtime of `p`, or `None` when `p` is absent.
     pub fn mtime(&self, p: &str) -> Option<SystemTime> {
         let path = Self::path(p);
         lock(&self.inner).nodes.get(&path).and_then(|i| i.metadata.modified)
     }
 
+    /// `touch` advances the mtime of `p` and sends a Modify hint.
     pub fn touch(&self, p: &str) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -390,6 +503,10 @@ impl FakeFileSystem {
         Self::emit(&mut inner, vec![path], HintKind::Modify);
     }
 
+    /// `replace_with_kind` replaces `p` with a new entry of `kind`.
+    ///
+    /// It removes the descendants of `p`, gives the new entry a fresh
+    /// identity, and sends an Unknown hint. The parent mtime stays unchanged.
     pub fn replace_with_kind(&self, p: &str, kind: EntryKind) {
         let path = Self::path(p);
         let mut inner = lock(&self.inner);
@@ -412,12 +529,18 @@ impl FakeFileSystem {
         Self::emit(&mut inner, vec![path], HintKind::Unknown);
     }
 
+    /// `remove_root` makes every read return NotFound.
+    ///
+    /// It sends a Remove hint for the root.
     pub fn remove_root(&self) {
         let mut inner = lock(&self.inner);
         inner.root_present = false;
         Self::emit(&mut inner, vec![RelativePath::root()], HintKind::Remove);
     }
 
+    /// `restore_root` brings the root back empty with a fresh identity.
+    ///
+    /// It sends no hint.
     pub fn restore_root(&self) {
         let mut inner = lock(&self.inner);
         inner.root_present = true;
@@ -431,6 +554,7 @@ impl FakeFileSystem {
         }
     }
 
+    /// `set_root_kind` makes the root report `kind` without a hint.
     pub fn set_root_kind(&self, kind: EntryKind) {
         let mut inner = lock(&self.inner);
         inner.root_kind = kind;
@@ -439,15 +563,24 @@ impl FakeFileSystem {
         }
     }
 
+    /// `fail` makes `op` on exactly `p` fail according to `mode`.
+    ///
+    /// [`FakeOp::Chunk`] never fails. Failures for one path and operation
+    /// fire in insertion order.
     pub fn fail(&self, p: &str, op: FakeOp, mode: FailureMode) {
         let path = Self::path(p);
         lock(&self.inner).failures.push(Failure { path, op, mode });
     }
 
+    /// `clear_failures` removes every injected failure.
     pub fn clear_failures(&self) {
         lock(&self.inner).failures.clear();
     }
 
+    /// `panic_once` makes the next `op` on `p` panic inside the adapter.
+    ///
+    /// Metadata, ReadDir, ResolveDomain, Watch, and directory Enrich
+    /// operations support panics.
     pub fn panic_once(&self, p: &str, op: FakeOp) {
         let path = Self::path(p);
         lock(&self.inner).panics.push((path, op));
@@ -463,6 +596,10 @@ impl FakeFileSystem {
         }
     }
 
+    /// `inject_child` adds the child `name` to listings of `dir` only.
+    ///
+    /// The fake keeps the name verbatim, and tests can inject invalid names
+    /// this way. Metadata reads of the child return NotFound.
     pub fn inject_child(&self, dir: &str, name: impl Into<std::ffi::OsString>, kind: EntryKind) {
         let dir = Self::path(dir);
         let mut inner = lock(&self.inner);
@@ -480,22 +617,31 @@ impl FakeFileSystem {
         });
     }
 
+    /// `clear_injected_children` removes every injected child.
     pub fn clear_injected_children(&self) {
         lock(&self.inner).injected.clear();
     }
 
+    /// `set_injected_position` sets the position of injected children.
+    ///
+    /// The real children of the directory are the reference point.
     pub fn set_injected_position(&self, position: InjectedPosition) {
         lock(&self.inner).injected_position = position;
     }
 
+    /// `drop_events` discards every later hint while `drop` is true.
     pub fn drop_events(&self, drop: bool) {
         lock(&self.inner).drop_events = drop;
     }
 
+    /// `pause_events` queues later hints.
+    ///
+    /// [`FakeFileSystem::resume_events`] delivers them.
     pub fn pause_events(&self) {
         lock(&self.inner).paused = true;
     }
 
+    /// `resume_events` delivers queued hints in order and resumes delivery.
     pub fn resume_events(&self) {
         let mut inner = lock(&self.inner);
         inner.paused = false;
@@ -507,6 +653,7 @@ impl FakeFileSystem {
         }
     }
 
+    /// `set_cost` charges `cost` of simulated worker time to `op` in `scope`.
     pub fn set_cost(&self, scope: CostScope, op: FakeOp, cost: Duration) {
         let mut inner = lock(&self.inner);
         let counted = match scope {
@@ -527,56 +674,80 @@ impl FakeFileSystem {
         }
     }
 
+    /// `cost_of` returns the cost of `op` on `path` after scope precedence.
     pub fn cost_of(&self, op: FakeOp, path: &RelativePath) -> Duration {
         Self::scoped_cost(&lock(&self.inner), op, path)
     }
 
+    /// `set_capabilities` sets the declared capabilities of `domain`.
     pub fn set_capabilities(&self, domain: DomainId, capabilities: DomainCapabilities) {
         lock(&self.inner).capabilities.insert(domain, capabilities);
     }
 
+    /// `set_default_capabilities` sets the fallback domain capabilities.
+    ///
+    /// Every domain without its own capabilities uses them.
     pub fn set_default_capabilities(&self, capabilities: DomainCapabilities) {
         lock(&self.inner).default_capabilities = capabilities;
     }
 
+    /// `set_identity_space` places `domain` in identity space `space`.
+    ///
+    /// The default space is 0.
     pub fn set_identity_space(&self, domain: DomainId, space: u64) {
         lock(&self.inner).identity_spaces.insert(domain, space);
     }
 
+    /// `report_directory_case` makes domain probes of `p` report `case`.
+    ///
+    /// The probe reports it as a per-directory case sensitivity.
     pub fn report_directory_case(&self, p: &str, case: CaseSensitivity) {
         let path = Self::path(p);
         lock(&self.inner).directory_cases.insert(path, case);
     }
 
+    /// `report_unknown_domain_identity` gives `domain` an Unknown identity.
     pub fn report_unknown_domain_identity(&self, domain: DomainId) {
         lock(&self.inner).unknown_identities.insert(domain);
     }
 
+    /// `report_weak_domain_identity` gives `domain` the weak identity `key`.
     pub fn report_weak_domain_identity(&self, domain: DomainId, key: WeakDomainKey) {
         lock(&self.inner).weak_identities.insert(domain, key);
     }
 
+    /// `report_domain_key` makes `domain` report the known identity `key`.
+    ///
+    /// Without this call a domain reports [`FakeFileSystem::domain_key`].
     pub fn report_domain_key(&self, domain: DomainId, key: DomainKey) {
         lock(&self.inner).known_identities.insert(domain, key);
     }
 
+    /// `report_not_domain_root` makes probes in `domain` deny a domain root.
     pub fn report_not_domain_root(&self, domain: DomainId) {
         lock(&self.inner).non_domain_roots.insert(domain);
     }
 
+    /// `report_inline_domains` sets inline reporting of child domains.
     pub fn report_inline_domains(&self, inline: bool) {
         lock(&self.inner).inline_domains = inline;
     }
 
+    /// `report_unknown_kind` makes listings report the kind of `p` as unknown.
+    ///
+    /// This applies when the domain kind source is Sometimes or Unknown.
+    /// The listing then resolves the kind with a [`FakeOp::ResolveKind`].
     pub fn report_unknown_kind(&self, p: &str) {
         let path = Self::path(p);
         lock(&self.inner).unknown_kinds.insert(path);
     }
 
+    /// `domain_key` returns the default declared key of `domain`.
     pub fn domain_key(domain: DomainId) -> DomainKey {
         DomainKey::declared(domain.get())
     }
 
+    /// `capabilities_of` returns the domain capabilities at `path`.
     pub fn capabilities_of(&self, path: &RelativePath) -> DomainCapabilities {
         let inner = lock(&self.inner);
         Self::capabilities_for(&inner, path)
@@ -700,22 +871,35 @@ impl FakeFileSystem {
         total
     }
 
+    /// `domain_resolution_cost` returns the domain resolution cost at `path`.
     pub fn domain_resolution_cost(&self, path: &RelativePath) -> Duration {
         Self::scoped_cost(&lock(&self.inner), FakeOp::ResolveDomain, path)
     }
 
+    /// `ignore_cancellation` makes later sessions ignore cancellation.
+    ///
+    /// The setting applies while `ignore` is true.
     pub fn ignore_cancellation(&self, ignore: bool) {
         lock(&self.inner).ignore_cancellation = ignore;
     }
 
+    /// `set_chunk_size` sets the entry count of one listing chunk.
+    ///
+    /// The fake raises values below 1 to 1. The default is 1024.
     pub fn set_chunk_size(&self, chunk: usize) {
         lock(&self.inner).chunk = chunk.max(1);
     }
 
+    /// `chunk_size` returns the entry count of one listing chunk.
     pub fn chunk_size(&self) -> usize {
         lock(&self.inner).chunk
     }
 
+    /// `lease_cost` returns the simulated cost of one listing lease of `path`.
+    ///
+    /// `first` selects the ReadDir cost over the Chunk cost. The lease
+    /// covers `entries` children after the first `skip`. The per-child
+    /// costs stop after the lease spends `operations` per-child operations.
     pub fn lease_cost(
         &self,
         path: &RelativePath,
@@ -767,6 +951,7 @@ impl FakeFileSystem {
         })
     }
 
+    /// `enrichment_cost` returns the simulated cost of `batch` under `path`.
     pub fn enrichment_cost(&self, path: &RelativePath, batch: &EnrichmentBatch) -> Duration {
         let inner = lock(&self.inner);
         let mut total = if batch.directory { Self::scoped_cost(&inner, FakeOp::Enrich, path) } else { Duration::ZERO };
@@ -793,12 +978,22 @@ impl FakeFileSystem {
         inner.costs.get(&(CostScope::Everything, op)).copied().unwrap_or(Duration::ZERO)
     }
 
+    /// `set_domain` assigns `prefix` and every path beneath it to `domain`.
+    ///
+    /// The deepest assigned prefix of a path decides its domain.
     pub fn set_domain(&self, prefix: &str, domain: DomainId) {
         let path = Self::path(prefix);
         let mut inner = lock(&self.inner);
         Self::assign_domain(&mut inner, path, domain);
     }
 
+    /// `remount` moves the existing subtree at `prefix` to `domain`.
+    ///
+    /// It sends no hint.
+    ///
+    /// # Panics
+    ///
+    /// `remount` panics when `prefix` is absent.
     pub fn remount(&self, prefix: &str, domain: DomainId) {
         let path = Self::path(prefix);
         let mut inner = lock(&self.inner);
@@ -806,6 +1001,7 @@ impl FakeFileSystem {
         Self::assign_domain(&mut inner, path, domain);
     }
 
+    /// `domain_of` returns the domain at `path`.
     pub fn domain_of(&self, path: &RelativePath) -> DomainId {
         Self::domain_for(&lock(&self.inner), path)
     }
@@ -827,6 +1023,10 @@ impl FakeFileSystem {
             .unwrap_or(DomainId::ROOT)
     }
 
+    /// `emit_storm` sends `repeat` hints of `kind` for all of `paths`.
+    ///
+    /// The tree stays unchanged. `emit_storm` returns `repeat` times the
+    /// number of paths.
     pub fn emit_storm(&self, paths: &[&str], kind: HintKind, repeat: usize) -> usize {
         let targets: Vec<RelativePath> = paths.iter().map(|p| Self::path(p)).collect();
         let mut inner = lock(&self.inner);
@@ -836,6 +1036,7 @@ impl FakeFileSystem {
         repeat * targets.len()
     }
 
+    /// `emit_overflow` sends an Overflow event to every watch.
     pub fn emit_overflow(&self) {
         let inner = lock(&self.inner);
         for watch in inner.watches.values() {
@@ -843,6 +1044,7 @@ impl FakeFileSystem {
         }
     }
 
+    /// `emit_watcher_failure` fails and removes every watch with `message`.
     pub fn emit_watcher_failure(&self, message: &str) {
         let mut inner = lock(&self.inner);
         let watches: Vec<Arc<dyn WatcherSink>> = inner.watches.drain().map(|(_, w)| w.sink).collect();
@@ -851,6 +1053,10 @@ impl FakeFileSystem {
         }
     }
 
+    /// `emit_watcher_failure_under` fails the watches at or beneath `prefix`.
+    ///
+    /// It also removes them. Each failure names `prefix` as its scope. The
+    /// method returns the number of failed watches.
     pub fn emit_watcher_failure_under(&self, prefix: &str, message: &str) -> usize {
         let scope = Self::path(prefix);
         let mut inner = lock(&self.inner);
@@ -867,23 +1073,30 @@ impl FakeFileSystem {
         delivered
     }
 
+    /// `watch_count` counts the registered watches.
     pub fn watch_count(&self) -> usize {
         lock(&self.inner).watches.len()
     }
 
+    /// `ops` returns every recorded operation in call order.
+    ///
+    /// The log records every [`FakeOp`] except Chunk.
     pub fn ops(&self) -> Vec<(FakeOp, RelativePath)> {
         lock(&self.inner).ops.clone()
     }
 
+    /// `clear_ops` empties the operation log.
     pub fn clear_ops(&self) {
         lock(&self.inner).ops.clear();
     }
 
+    /// `count_ops` returns how often `op` ran on exactly `p`.
     pub fn count_ops(&self, op: FakeOp, p: &str) -> usize {
         let path = Self::path(p);
         lock(&self.inner).ops.iter().filter(|(o, k)| *o == op && *k == path).count()
     }
 
+    /// `contains` reports whether the tree holds an entry at `p`.
     pub fn contains(&self, p: &str) -> bool {
         lock(&self.inner).nodes.contains_key(&Self::path(p))
     }

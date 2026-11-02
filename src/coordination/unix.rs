@@ -1,6 +1,9 @@
-//! Retained tmpfs authority with open-description lifetime locks.
-//! Authority files are retained, never automatically replaced. All lock
-//! acquisition for admission is nonblocking. No target paths are stored.
+//! This module provides the retained tmpfs authority with open-description
+//! lifetime locks.
+//!
+//! The backend retains authority files and never replaces them automatically.
+//! All lock acquisition for admission is nonblocking. The backend stores no
+//! target paths.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -125,7 +128,8 @@ struct Store {
     recovery_slot: u32,
 }
 
-/// An independently opened connection to one retained authority.
+/// `Scope` is one independently opened connection to a retained tmpfs
+/// authority.
 ///
 /// Clone the returned `Arc` within a process. Independently opened connections
 /// use distinct open file descriptions and coordinate through the kernel.
@@ -146,24 +150,46 @@ pub struct Scope {
     busy: AtomicU64,
 }
 
-/// Connection-local bookkeeping lock activity, including deferred settlement.
+/// `AccessCounters` counts this connection's bookkeeping lock activity.
+///
+/// The counters include deferred settlement and cover this connection only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccessCounters {
+    /// `attempts` counts the accesses that tried to take the bookkeeping locks.
     pub attempts: u64,
+    /// `acquired` counts the accesses that acquired the interprocess lock.
     pub acquired: u64,
+    /// `busy` counts the accesses that found the connection mutex or the
+    /// interprocess lock busy.
     pub busy: u64,
 }
 
-/// Connection diagnostics. Shared budget totals are available through `view`.
+/// `Diagnostics` describes one connection without taking the shared lock.
+///
+/// [`Scope::view`] reports the shared budget totals.
 #[derive(Clone, Debug)]
 pub struct Diagnostics {
+    /// `path` names the directory where the connection opened the scope.
     pub path: PathBuf,
+    /// `generation` identifies the retained authority.
     pub generation: Generation,
+    /// `config` holds the configuration that the authority enforces.
     pub config: Config,
+    /// `namespaces` holds the three identities that qualify the scope on this
+    /// platform.
+    ///
+    /// [`ScopeIdentity`](super::ScopeIdentity) names each component per
+    /// platform.
     pub namespaces: [[u8; 16]; 3],
+    /// `pending_settlements` counts the settlements and cancellations that wait
+    /// for the bookkeeping lock.
     pub pending_settlements: usize,
+    /// `bookkeeping_active` is `true` while a bookkeeping thread drains
+    /// deferred settlements.
     pub bookkeeping_active: bool,
+    /// `failed` is `true` after an uncertain failure fenced the connection.
     pub failed: bool,
+    /// `access` reports the connection's lock activity.
     pub access: AccessCounters,
 }
 
@@ -213,9 +239,11 @@ impl Scope {
         Ok(())
     }
 
-    /// Discover a scope on the platform's retained tmpfs rendezvous.
+    /// `discover` opens the private scope for the effective user and namespace
+    /// on the platform's retained tmpfs rendezvous.
     ///
-    /// Nothing is created in a home directory or on a network filesystem.
+    /// The backend creates nothing in a home directory or on a network
+    /// filesystem.
     pub fn discover(config: Config) -> Result<Arc<Self>, Error> {
         let context = Context::current()?;
         let mut name = format!("tree-fucker-{}", context.uid);
@@ -228,8 +256,11 @@ impl Scope {
         Self::open(Path::new(platform::RENDEZVOUS).join(name), config)
     }
 
-    /// Open an explicit private tmpfs scope, useful for isolated applications
-    /// and acceptance tests. All cooperating participants must use this scope.
+    /// `open` opens an explicit private scope at the absolute tmpfs path
+    /// `path`.
+    ///
+    /// Isolated applications and acceptance tests use it. All cooperating
+    /// participants must use the same path.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Arc<Self>, Error> {
         // Validate before creating retained storage.
         config.validate()?;
@@ -405,6 +436,12 @@ impl Scope {
         Ok(())
     }
 
+    /// `join` registers a new participant and returns its [`Client`].
+    ///
+    /// The participant holds an exclusive lifetime lock on a persistent owner
+    /// slot file. Joining first recovers the operations of owners that
+    /// exited, in bounded batches, and visits the whole participant table
+    /// before it reports participant capacity exhaustion.
     pub fn join(self: &Arc<Self>) -> Result<Client, Error> {
         // Visit the whole table before reporting exhaustion, committing each
         // bounded recovery batch and releasing the authority lock between them.
@@ -444,7 +481,9 @@ impl Scope {
         Err(Error::Authority(protocol::Error::ParticipantCapacity.into()))
     }
 
-    /// Separate shared accounting; do not sum this with process accounting.
+    /// `view` returns the shared accounting at the current authority time.
+    ///
+    /// The caller must not add this view to process accounting.
     pub fn view(&self) -> Result<View, Error> {
         self.transaction(|state, at| {
             state.advance(at)?;
@@ -452,7 +491,7 @@ impl Scope {
         })
     }
 
-    /// This only reads connection state; it does not acquire the shared lock.
+    /// `diagnostics` reads connection state without acquiring the shared lock.
     pub fn diagnostics(&self) -> Result<Diagnostics, Error> {
         self.context.check()?;
         let (pending_settlements, bookkeeping_active) = self.queue.status();

@@ -1,5 +1,5 @@
-//! Shared operation lifecycle and deferred completion ownership for native
-//! backends.
+//! This module implements the shared operation lifecycle and deferred
+//! completion ownership for native backends.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -17,7 +17,11 @@ struct Member {
     _owner: File,
 }
 
-/// Participant ownership is retained by all its outstanding operations.
+/// `Client` holds one participant's membership in a shared authority.
+///
+/// [`Scope::join`] returns it. Clones share the membership, and every
+/// outstanding operation retains it. The participant's lifetime evidence
+/// stays held until the last clone and operation drop.
 #[derive(Clone)]
 pub struct Client(Arc<Member>);
 
@@ -26,14 +30,23 @@ impl Client {
         Self(Arc::new(Member { scope, participant, _owner: owner }))
     }
 
+    /// `participant` returns the participant identity of this membership.
     pub fn participant(&self) -> Participant {
         self.0.participant
     }
 
+    /// `register_shared_domain` returns the shared domain account for `key`.
+    ///
+    /// The call commits one journal transaction and creates the account on
+    /// first use.
     pub fn register_shared_domain(&self, key: SharedDomainKey) -> Result<DomainId, Error> {
         self.0.scope.transaction(|state, _| state.register_shared_domain(key))
     }
 
+    /// `register_private_domain` returns this participant's private account
+    /// for the local domain number `local`.
+    ///
+    /// Private accounts draw on the same aggregate envelope as shared ones.
     pub fn register_private_domain(&self, local: u64) -> Result<DomainId, Error> {
         self.0.scope.transaction(|state, _| state.register_private_domain(self.0.participant, local))
     }
@@ -53,6 +66,11 @@ impl Client {
         })
     }
 
+    /// `prepare` holds shared budget for `request` and returns reversible
+    /// ownership.
+    ///
+    /// The call never blocks. A contended bookkeeping lock returns
+    /// [`Error::Busy`], and a budget denial returns [`Error::Authority`].
     pub fn prepare(&self, request: Request) -> Result<Prepared, Error> {
         let (id, admission) = self.0.scope.transaction(|state, at| {
             let id = state.ledger().next_operation(self.0.participant)?;
@@ -62,7 +80,10 @@ impl Client {
     }
 }
 
-/// Reversible budget ownership. Dropping this without running aborts the hold.
+/// `Prepared` owns a reversible shared budget hold.
+///
+/// Dropping it before a successful start aborts the hold. A busy abort moves
+/// to the connection's bounded bookkeeping queue.
 pub struct Prepared {
     member: Arc<Member>,
     id: OperationId,
@@ -70,18 +91,28 @@ pub struct Prepared {
     consumed: bool,
 }
 
-/// Actual completed work reported by a synchronous physical callback.
+/// `Completion` reports the work that a synchronous physical callback
+/// performed.
 pub struct Completion<T> {
+    /// `value` holds the result that [`Prepared::try_run`] returns to its
+    /// caller.
     pub value: T,
+    /// `operations` counts the filesystem operations the callback performed.
     pub operations: u32,
+    /// `failed` reports that the filesystem work failed.
     pub failed: bool,
 }
 
 impl Prepared {
+    /// `admission` returns the current lease of this preparation.
     pub fn admission(&self) -> Admission {
         self.admission
     }
 
+    /// `narrow` reduces the lease to `optional_operations` before start.
+    ///
+    /// The lease cannot grow. After a successful start, the call fails with an
+    /// invalid-transition error.
     pub fn narrow(&mut self, optional_operations: u32) -> Result<Admission, Error> {
         if self.consumed {
             return Err(Error::Authority(protocol::Error::InvalidTransition.into()));
@@ -90,9 +121,13 @@ impl Prepared {
         Ok(self.admission)
     }
 
-    /// Execute only after shared start permission commits. A denied start
-    /// retains this preparation for retry or drop. The callback must retain
-    /// physical ownership until its filesystem work actually returns.
+    /// `try_run` runs `work` after shared start permission commits.
+    ///
+    /// A denied start retains this preparation for retry or drop. The callback
+    /// must not return before its filesystem work actually returns. The
+    /// method settles the reported completion, and an unwinding callback
+    /// settles as failed. A busy settlement moves to the connection's bounded
+    /// bookkeeping queue.
     pub fn try_run<T>(&mut self, work: impl FnOnce(Admission) -> Completion<T>) -> Result<T, Error> {
         let physical = self.authorize()?;
         let result = work(self.admission);
@@ -113,8 +148,10 @@ impl Prepared {
     }
 }
 
-/// Internal completion ownership, retained by the governor's physical grant.
-/// Dropping it is only legal after physical execution has ended.
+/// `Physical` owns the completion of one physically authorized operation.
+///
+/// The governor's physical grant retains it. The owner may drop it only after
+/// physical execution has ended.
 pub(crate) struct Physical {
     pending: Option<Pending>,
     started: u64,

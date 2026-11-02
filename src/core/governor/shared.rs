@@ -1,3 +1,5 @@
+//! `shared` composes the process governor with a shared authority.
+
 use std::sync::TryLockError;
 
 use super::*;
@@ -412,8 +414,17 @@ impl Binding {
 }
 
 impl HostGovernor {
-    /// Compose process-local constraints with an explicitly selected native
-    /// scope.
+    /// `with_coordination` joins an explicit native scope and composes it with
+    /// local limits.
+    ///
+    /// Admission under the result must satisfy both the local limits and the
+    /// shared authority (`rfc/coordination.md`).
+    ///
+    /// # Errors
+    ///
+    /// `with_coordination` returns the native error when `config` fails
+    /// validation. It also returns the native error when inspecting or joining
+    /// the scope fails.
     pub fn with_coordination(config: &HostConfig, scope: Arc<Scope>) -> Result<Self, native::Error> {
         config.validate().map_err(|_| authority::Error::InvalidConfig)?;
         let diagnostics = scope.diagnostics()?;

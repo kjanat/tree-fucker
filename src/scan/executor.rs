@@ -1,3 +1,5 @@
+//! This module runs one-shot scan listing leases on a bounded worker pool.
+
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
@@ -6,10 +8,10 @@ use crate::{CancellationToken, Error, FsError, Result};
 type Job = Box<dyn FnOnce() + Send>;
 pub(super) const CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
-/// A reusable, bounded set of workers for one-shot listing leases.
+/// `ListingExecutor` runs one-shot listing leases on reusable, bounded workers.
 ///
-/// Clone this executor to share its worker bound across scans. Workers are
-/// created lazily and reused. A blocked call retains its worker; cancellation
+/// Clones share one worker bound across scans. The executor creates workers
+/// lazily and reuses them. A blocked call retains its worker. Cancellation
 /// never starts a replacement beyond the configured bound.
 #[derive(Clone)]
 pub struct ListingExecutor(Arc<Pool>);
@@ -32,6 +34,9 @@ pub(super) struct Worker {
 }
 
 impl ListingExecutor {
+    /// `new` creates a pool of at most `maximum_workers` threads.
+    ///
+    /// It returns [`Error::InvalidConfig`] when `maximum_workers` is zero.
     pub fn new(maximum_workers: usize) -> Result<Self> {
         if maximum_workers == 0 {
             return Err(Error::InvalidConfig("listing executor requires at least one worker".into()));
@@ -43,6 +48,7 @@ impl ListingExecutor {
         })))
     }
 
+    /// `capacity` returns the maximum number of worker threads.
     pub fn capacity(&self) -> usize {
         self.0.capacity
     }

@@ -14,10 +14,21 @@ use super::{
     WatcherScope,
 };
 
+/// `IllumosProbe` probes storage domains on illumos and Solaris with `fstatvfs`
+/// (RFC §14.3).
+///
+/// It keys a domain by the `f_fsid` of the mount and keys the identity
+/// space by the device number. A changed fsid between parent and child
+/// proves a crossing. The probe treats a directory as a domain root when
+/// its parent directory reports another fsid or cannot be read. A built-in
+/// table keyed by `f_basetype` supplies topology, transport, media, case
+/// and identity reliability. The probe declares timestamp granularity as
+/// Unknown. It opens each directory without following a symbolic link.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IllumosProbe;
 
 impl IllumosProbe {
+    /// `new` creates an illumos probe.
     pub fn new() -> IllumosProbe {
         IllumosProbe
     }

@@ -18,10 +18,23 @@ use super::{
 
 const MNT_REMOVABLE: u32 = 0x200;
 
+/// `MacOsProbe` probes storage domains on macOS with `fstatfs` and
+/// `getattrlist` (RFC §14.3).
+///
+/// It keys a domain by the `f_fsid` of the volume and keys the identity
+/// space by the device number. A changed volume or device between parent
+/// and child proves a crossing. The probe reads `MNT_LOCAL` for topology
+/// and `MNT_REMOVABLE` for media. It reads case sensitivity and persistent
+/// object ids from the volume capability bits, and it trusts a bit only
+/// when the matching valid bit is set. A built-in table per filesystem
+/// type supplies timestamp granularity. The same table supplies identity
+/// reliability when the capability bits are silent. The probe opens each
+/// directory without following a symbolic link.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MacOsProbe;
 
 impl MacOsProbe {
+    /// `new` creates a macOS probe.
     pub fn new() -> MacOsProbe {
         MacOsProbe
     }

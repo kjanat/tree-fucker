@@ -1,3 +1,9 @@
+//! `types` defines value types for the coordinator, scheduler and governor.
+//!
+//! [`MonotonicTime`], [`WorkOrigin`], [`Class`] and [`DegradedCause`] appear in
+//! the public API through [`crate::core`]. The other types hold coordinator
+//! state.
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Add;
 use std::time::Duration;
@@ -9,16 +15,31 @@ use crate::ids::*;
 use crate::path::RelativePath;
 use crate::policy::PolicyContext;
 
+/// `MonotonicTime` is a point on the monotonic clock.
+///
+/// It counts from the base instant of the governor.
+/// [`HostGovernor::base`](crate::HostGovernor::base) fixes that instant.
+/// Scheduling reads only this clock (RFC §12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct MonotonicTime(pub Duration);
+pub struct MonotonicTime(
+    /// The inner duration holds the time elapsed since the base instant.
+    pub Duration,
+);
 
 impl MonotonicTime {
+    /// `ZERO` is the base instant itself.
     pub const ZERO: MonotonicTime = MonotonicTime(Duration::ZERO);
 
+    /// `saturating_sub` returns the time from `other` to `self`.
+    ///
+    /// `saturating_sub` returns zero when `other` is later.
     pub fn saturating_sub(self, other: MonotonicTime) -> Duration {
         self.0.saturating_sub(other.0)
     }
 
+    /// `since` returns the time elapsed from `earlier` to `self`.
+    ///
+    /// `since` returns zero when `earlier` is later.
     pub fn since(self, earlier: MonotonicTime) -> Duration {
         self.0.saturating_sub(earlier.0)
     }
@@ -32,19 +53,40 @@ impl Add<Duration> for MonotonicTime {
     }
 }
 
+/// `WorkOrigin` selects the allowance of an operation.
+///
+/// The governor charges a grant to the buckets of its origin. Foreground and
+/// background allowances never lend capacity to each other (RFC §15.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WorkOrigin {
+    /// Reconciliation, watcher, retry, priority, policy and root-recovery work
+    /// draw on the background allowance.
     Background,
+    /// Reads for an accepted `refresh` or `load` and every one-shot scan
+    /// operation draw on the foreground allowance.
     Foreground,
 }
 
+/// `Class` decides the admission share of a job.
+///
+/// A job with several reasons takes the first matching class in declaration
+/// order (RFC §6). [`ClassWeights`](crate::ClassWeights) holds the class
+/// weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Class {
+    /// The job serves a reconciliation round obligation.
     Baseline,
+    /// The job serves initial scan, load, policy invalidation or root recovery.
+    ///
+    /// A retry of a required watch registration also uses this class.
     Control,
+    /// The job serves an explicit `refresh`.
     Refresh,
+    /// A watcher hint scheduled the job.
     Watcher,
+    /// The job retries a failed read.
     Retry,
+    /// The job lists a priority-set directory.
     Priority,
 }
 
@@ -419,13 +461,31 @@ impl RetryRecord {
     }
 }
 
+/// `DegradedCause` explains why the tree reports a path degraded.
+///
+/// [`Stats::degraded_path_causes`](crate::Stats::degraded_path_causes) and
+/// [`ReconciliationHealth`](crate::update::ReconciliationHealth) map each
+/// degraded path to its cause (RFC §13.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DegradedCause {
+    /// Consecutive transient failures reached the configured threshold.
+    ///
+    /// Rejected listings count as transient failures.
+    /// [`Config::transient_degrade_threshold`](crate::Config::transient_degrade_threshold)
+    /// sets the threshold.
     Transient,
+    /// The filesystem denied permission for the latest read (RFC §13.3).
     PermissionDenied,
+    /// The adapter reported the operation as unsupported.
     Unsupported,
+    /// A listing or commit reached a configured resource limit.
     ResourceLimited,
+    /// A required watch registration failed under
+    /// [`RequireWatcher`](crate::WatchRegistrationFailure::RequireWatcher).
     WatcherRegistration,
+    /// Metadata enrichment failed for the path.
+    ///
+    /// The tree reports the path as metadata-degraded.
     Enrichment,
 }
 

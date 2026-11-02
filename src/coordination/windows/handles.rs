@@ -1,4 +1,5 @@
-//! Windows file ownership and nonblocking bookkeeping primitives.
+//! This module provides Windows file ownership and nonblocking bookkeeping
+//! primitives.
 //!
 //! The enclosing authority must pin and validate the parent directory, storage,
 //! and security descriptor. These primitives never unlink or truncate a slot.
@@ -21,8 +22,9 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use super::security::Principal;
 
-/// Preserve the complete volume serial and 128-bit file identity. In
-/// particular, do not truncate a ReFS identity to the older 64-bit index.
+/// `Identity` preserves the complete volume serial and 128-bit file identity.
+///
+/// Code must never truncate a ReFS identity to the older 64-bit index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub volume: u64,
@@ -103,9 +105,11 @@ pub(crate) fn recover_at(
     }
 }
 
-/// A byte-range lock belongs to bookkeeping, never physical operation lifetime.
-/// The byte is beyond the anchor header so validation can still read the
-/// header.
+/// `Bookkeeping` holds a byte-range lock for bookkeeping exclusion.
+///
+/// Physical operation lifetime never depends on this lock. The locked byte
+/// lies beyond the anchor header, and validation can still read the header
+/// while another connection holds the lock.
 pub(crate) struct Bookkeeping<'a> {
     file: &'a File,
     held: bool,

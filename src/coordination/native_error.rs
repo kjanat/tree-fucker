@@ -2,17 +2,38 @@ use std::io;
 
 use super::{authority, journal};
 
-/// Failure never authorizes process-only fallback after joining.
+/// `Error` reports a failure of a native coordination connection.
+///
+/// A failure after joining never authorizes process-only fallback. An I/O,
+/// journal, replacement, or fencing failure during an access fences the
+/// connection, and later calls return [`Error::Failed`].
 #[derive(Debug)]
 pub enum Error {
+    /// Another thread or process holds the connection mutex or the bookkeeping
+    /// lock.
+    ///
+    /// The caller may retry later outside the filesystem worker.
     Busy,
+    /// An operating-system call on the scope's files failed.
     Io(io::Error),
+    /// The retained journal could not be read, recovered, or published.
     Journal(journal::Error),
+    /// The shared authority rejected the requested transition.
     Authority(authority::Error),
+    /// The scope location or one of its files fails the platform's storage,
+    /// ownership, or permission requirements.
     InvalidScope,
+    /// Someone removed or replaced the scope directory, anchor, state file, or
+    /// an owner file after the connection pinned it.
     Replaced,
+    /// The retained authority records a different configuration, generation,
+    /// or scope identity, or the caller's security context changed.
     Incompatible,
+    /// A child process called the API through a handle that it inherited
+    /// across `fork`.
     Forked,
+    /// An earlier uncertain storage failure fenced this connection, and the
+    /// connection refuses further work.
     Failed,
 }
 

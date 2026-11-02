@@ -1,4 +1,5 @@
-//! Retained Windows authority with exclusive file-handle operation ownership.
+//! This module provides the retained Windows authority, and exclusive file
+//! handles establish operation ownership.
 
 mod clock;
 mod handles;
@@ -42,7 +43,11 @@ struct Store {
     recovery_slot: u32,
 }
 
-/// One independently opened connection to retained per-user accounting.
+/// `Scope` is one independently opened connection to retained per-user
+/// accounting.
+///
+/// Clone the returned `Arc` within a process. The scope lives on verified
+/// local NTFS or ReFS storage under a protected owner-only DACL.
 pub struct Scope {
     path: PathBuf,
     parent: relative::Directory,
@@ -63,26 +68,56 @@ pub struct Scope {
     busy: AtomicU64,
 }
 
+/// `AccessCounters` counts this connection's bookkeeping lock activity.
+///
+/// The counters include deferred settlement and cover this connection only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccessCounters {
+    /// `attempts` counts the accesses that tried to take the bookkeeping locks.
     pub attempts: u64,
+    /// `acquired` counts the accesses that acquired the anchor's byte-range
+    /// lock.
     pub acquired: u64,
+    /// `busy` counts the accesses that found the connection mutex or the
+    /// byte-range lock busy.
     pub busy: u64,
 }
 
+/// `Diagnostics` describes one connection without taking the shared lock.
+///
+/// [`Scope::view`] reports the shared budget totals.
 #[derive(Clone, Debug)]
 pub struct Diagnostics {
+    /// `path` names the directory where the connection opened the scope.
     pub path: PathBuf,
+    /// `generation` identifies the retained authority.
     pub generation: Generation,
+    /// `config` holds the configuration that the authority enforces.
     pub config: Config,
+    /// `user` holds the effective user's SID.
     pub user: String,
+    /// `clock` encodes the boot-entry GUID, kernel boot sequence, and
+    /// performance-counter frequency of the current boot.
     pub clock: [u8; 32],
+    /// `clock_offset_ns` holds the signed offset that the connection adds to
+    /// the raw counter time to obtain authority time.
+    ///
+    /// The journal retains the offset, and a reboot rebases it at the last
+    /// committed authority time (coordination-platforms.md, "Windows").
     pub clock_offset_ns: i64,
+    /// `volume` holds the volume serial number of the scope directory.
     pub volume: u64,
+    /// `root` holds the 128-bit file ID of the scope directory.
     pub root: [u8; 16],
+    /// `pending_settlements` counts the settlements and cancellations that wait
+    /// for the bookkeeping lock.
     pub pending_settlements: usize,
+    /// `bookkeeping_active` is `true` while a bookkeeping thread drains
+    /// deferred settlements.
     pub bookkeeping_active: bool,
+    /// `failed` is `true` after an uncertain failure fenced the connection.
     pub failed: bool,
+    /// `access` reports the connection's lock activity.
     pub access: AccessCounters,
 }
 
@@ -119,8 +154,12 @@ impl Scope {
         Ok(())
     }
 
-    /// Resolve the effective user's OS-configured local application-data path.
-    /// Environment variables and logon/session IDs do not select an authority.
+    /// `discover` opens the scope in the effective user's local application
+    /// data folder.
+    ///
+    /// The shell's known-folder lookup with the effective token resolves the
+    /// folder. Environment variables and logon or session IDs never select an
+    /// authority.
     pub fn discover(config: Config) -> Result<Arc<Self>, Error> {
         config.validate()?;
         let principal = Principal::current()?;
@@ -128,7 +167,10 @@ impl Scope {
         Self::open_for(path, config, principal)
     }
 
-    /// Open a private retained scope on verified local NTFS or ReFS storage.
+    /// `open` opens a private retained scope at `path` on verified local NTFS
+    /// or ReFS storage.
+    ///
+    /// All cooperating participants must use the same path.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Arc<Self>, Error> {
         config.validate()?;
         let principal = Principal::current()?;
@@ -282,6 +324,12 @@ impl Scope {
         Ok(())
     }
 
+    /// `join` registers a new participant and returns its [`Client`].
+    ///
+    /// The participant holds an exclusive handle on a persistent owner slot
+    /// file. Joining first recovers the operations of owners whose handles
+    /// all closed, in bounded batches, and visits the whole participant table
+    /// before it reports participant capacity exhaustion.
     pub fn join(self: &Arc<Self>) -> Result<Client, Error> {
         // Fresh connections must reach every slot without extending a single
         // authority-lock hold beyond the bounded recovery batch.
@@ -332,6 +380,9 @@ impl Scope {
         Err(Error::Authority(protocol::Error::ParticipantCapacity.into()))
     }
 
+    /// `view` returns the shared accounting at the current authority time.
+    ///
+    /// The caller must not add this view to process accounting.
     pub fn view(&self) -> Result<View, Error> {
         self.transaction(|state, at| {
             state.advance(at)?;
@@ -339,6 +390,7 @@ impl Scope {
         })
     }
 
+    /// `diagnostics` reads connection state without acquiring the shared lock.
     pub fn diagnostics(&self) -> Result<Diagnostics, Error> {
         self.principal.check().map_err(|_| Error::Incompatible)?;
         let (pending_settlements, bookkeeping_active) = self.queue.status();

@@ -1,19 +1,32 @@
+//! This module defines the typed `u64` identifiers, generations and counters of
+//! a tree.
+//!
+//! Each type wraps one `u64`, orders by its value and advances with
+//! `next`. A job captures generations at dispatch, and its publication
+//! guards compare them with the current generations (RFC §11.4).
+//! [`IdMap`] and [`SharedIdMap`] key maps by these types and hash them
+//! with [`IdHashing`].
+
 use std::fmt;
 
 macro_rules! counter_type {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
         pub struct $name(u64);
 
         impl $name {
+            /// `new` wraps a raw value.
             pub const fn new(value: u64) -> Self {
                 $name(value)
             }
 
+            /// `get` returns the raw value.
             pub const fn get(self) -> u64 {
                 self.0
             }
 
+            /// `next` returns the value one greater than `self`.
             pub const fn next(self) -> Self {
                 $name(self.0 + 1)
             }
@@ -33,26 +46,153 @@ macro_rules! counter_type {
     };
 }
 
-counter_type!(EntryId);
-counter_type!(SnapshotVersion);
-counter_type!(Sequence);
-counter_type!(ReconciliationGeneration);
-counter_type!(LoadGeneration);
-counter_type!(EntryGeneration);
-counter_type!(PolicyRevision);
-counter_type!(PolicyFence);
-counter_type!(ContextGeneration);
-counter_type!(ChildStateGeneration);
-counter_type!(StateGeneration);
-counter_type!(ChangeEpoch);
-counter_type!(RootIncarnation);
-counter_type!(CommandId);
-counter_type!(JobId);
-counter_type!(WatchId);
-counter_type!(WatchRequestId);
-counter_type!(WatchReleaseId);
-counter_type!(TimerId);
+counter_type!(
+    /// `EntryId` identifies one entry for the lifetime of a tree instance.
+    ///
+    /// A tree never reuses an `EntryId` during its lifetime (RFC §7.1). A
+    /// rename keeps the id only when the storage domain supplies stable
+    /// identity. Consumers must also accept a rename as a removal plus an
+    /// addition.
+    EntryId
+);
+counter_type!(
+    /// `SnapshotVersion` orders published snapshots.
+    ///
+    /// Updates arrive in snapshot version order (RFC §7.4).
+    SnapshotVersion
+);
+counter_type!(
+    /// `Sequence` holds a value from the coordinator-wide monotonic sequence
+    /// (RFC §2).
+    ///
+    /// The coordinator takes each accepted command's causal barrier and each
+    /// admitted job's dispatch generation from this sequence. A read
+    /// satisfies barrier `B` only when its dispatch generation exceeds `B`
+    /// (RFC §9).
+    Sequence
+);
+counter_type!(
+    /// `ReconciliationGeneration` tags coverage for a reconciliation round (RFC
+    /// §11.4).
+    ///
+    /// The coordinator allocates a new value when a round begins. A
+    /// mismatch keeps a result from satisfying round, overflow or
+    /// watcher-restart coverage for a newer generation. The result can
+    /// still commit.
+    ReconciliationGeneration
+);
+counter_type!(
+    /// `LoadGeneration` versions the load state of a directory (RFC §11.4).
+    ///
+    /// It advances on every transition among Loading, Loaded, Unloaded and
+    /// Excluded. It guards directory jobs and keys round obligations
+    /// (RFC §2). A directory can get loaded many times in one life, and
+    /// the tree counts every one.
+    LoadGeneration
+);
+counter_type!(
+    /// `EntryGeneration` versions the path binding and kind of an entry (RFC
+    /// §11.4).
+    ///
+    /// It advances when the path-to-[`EntryId`] binding or the kind of the
+    /// entry changes. A directory rename advances it on every moved binding
+    /// (RFC §7.4). It guards every job for the entry.
+    EntryGeneration
+);
+counter_type!(
+    /// `PolicyRevision` versions the scan policy (RFC §8).
+    ///
+    /// It advances when the consumer invalidates policy.
+    PolicyRevision
+);
+counter_type!(
+    /// `PolicyFence` marks the revision fence of policy invalidation (RFC §8).
+    ///
+    /// The coordinator advances it on each accepted policy invalidation, and
+    /// jobs capture it at dispatch. A result from before the current fence
+    /// must not commit within the invalidated scope.
+    PolicyFence
+);
+counter_type!(
+    /// `ContextGeneration` versions the policy context of a directory (RFC §8,
+    /// §11.4).
+    ///
+    /// It advances when the policy context for the directory's children
+    /// changes.
+    ContextGeneration
+);
+counter_type!(
+    /// `ChildStateGeneration` holds the child-binding generation of a directory
+    /// (RFC §2, §11.4).
+    ///
+    /// It versions the mapping from immediate-child names to [`EntryId`]s.
+    /// It advances when the directory gains, loses, replaces or renames an
+    /// immediate child. A busy directory goes through a lot of them.
+    ChildStateGeneration
+);
+counter_type!(
+    /// `StateGeneration` holds the target-state generation of an entry (RFC §2,
+    /// §11.4).
+    ///
+    /// It versions the entry's publication domain. That domain covers the
+    /// binding and path, kind, configured metadata and load state of the
+    /// entry. It also covers the immediate children of the entry. A listing
+    /// of the entry reconciles those children.
+    StateGeneration
+);
+counter_type!(
+    /// `ChangeEpoch` versions a listing or metadata target (RFC §11.2).
+    ///
+    /// It advances for every accepted watcher hint and every explicit
+    /// invalidation. A job is stale when its captured epoch is older at
+    /// completion.
+    ChangeEpoch
+);
+counter_type!(
+    /// `RootIncarnation` holds the root-incarnation generation (RFC §2, §7.4).
+    ///
+    /// It advances each time the coordinator confirms that a missing root
+    /// has reappeared. The root can come back as often as it likes, and
+    /// every return gets its own number.
+    RootIncarnation
+);
+counter_type!(
+    /// `CommandId` identifies one consumer command to a tree.
+    CommandId
+);
+counter_type!(
+    /// `JobId` identifies one admitted filesystem job.
+    JobId
+);
+counter_type!(
+    /// `WatchId` identifies an active watch.
+    ///
+    /// [`crate::fs::FileSystem::watch`] returns it, and
+    /// [`crate::fs::FileSystem::unwatch`] takes it to remove the watch.
+    WatchId
+);
+counter_type!(
+    /// `WatchRequestId` identifies one pending watch registration request.
+    WatchRequestId
+);
+counter_type!(
+    /// `WatchReleaseId` identifies one pending watch removal.
+    ///
+    /// Every watch gets released in the end.
+    WatchReleaseId
+);
+counter_type!(
+    /// `TimerId` identifies one armed coordinator timer.
+    ///
+    /// The coordinator acts only on the most recently armed id and ignores
+    /// earlier ones.
+    TimerId
+);
 
+/// `IdHasher` hashes the identifier types of this module.
+///
+/// It mixes each word with one multiplication. Callers must hash only
+/// crate-allocated keys with it. Caller-chosen keys can force collisions.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IdHasher(u64);
 
@@ -80,6 +220,7 @@ impl std::hash::Hasher for IdHasher {
     }
 }
 
+/// `IdHashing` builds [`IdHasher`] instances for [`IdMap`] and [`SharedIdMap`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IdHashing;
 
@@ -91,5 +232,11 @@ impl std::hash::BuildHasher for IdHashing {
     }
 }
 
+/// `IdMap` is a mutable hash map that hashes identifier keys with
+/// [`IdHashing`].
 pub type IdMap<K, V> = std::collections::HashMap<K, V, IdHashing>;
+/// `SharedIdMap` is a persistent hash map that hashes identifier keys with
+/// [`IdHashing`].
+///
+/// Its clones share structure.
 pub type SharedIdMap<K, V> = imbl::GenericHashMap<K, V, IdHashing, imbl::shared_ptr::DefaultSharedPtr>;

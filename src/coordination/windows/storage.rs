@@ -1,4 +1,6 @@
-//! Validate retained storage through the opened object, not its pathname.
+//! This module validates retained storage through the opened object.
+//!
+//! The pathname alone never establishes storage validity.
 
 use std::fs::File;
 use std::io;
