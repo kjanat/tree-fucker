@@ -413,10 +413,25 @@ pub enum HintKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatcherEvent {
-    Hint { paths: Vec<RelativePath>, kind: HintKind },
+    Hint {
+        paths: Vec<RelativePath>,
+        kind: HintKind,
+    },
     Overflow,
-    Failed { message: String, path: Option<RelativePath> },
-    Dropped { count: u64 },
+    /// The backend requires recursive reconciliation below this path.
+    ///
+    /// The core conservatively invalidates coverage for every loaded directory.
+    /// A normal path hint refreshes only its target and is insufficient here.
+    Rescan {
+        path: RelativePath,
+    },
+    Failed {
+        message: String,
+        path: Option<RelativePath>,
+    },
+    Dropped {
+        count: u64,
+    },
 }
 
 pub trait WatcherSink: Send + Sync {
@@ -429,6 +444,14 @@ impl<F: Fn(WatcherEvent) + Send + Sync> WatcherSink for F {
     }
 }
 
+/// Filesystem operations and capability declarations supplied by an adapter.
+///
+/// Protocol clients implement this same contract: domain evidence belongs in
+/// [`ProbeResult`], and unavailable metadata remains `None`. Network calls are
+/// blocking work subject to the same admission, lease, and cancellation rules.
+/// Native access-control payloads remain adapter-owned;
+/// [`Metadata::permissions`] is not a portable ACL or an authorization
+/// decision.
 pub trait FileSystem: Send + Sync {
     fn capabilities(&self) -> FsCapabilities;
     fn canonicalize(&self, root: &Path) -> Result<PathBuf, FsError>;

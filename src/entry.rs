@@ -59,6 +59,8 @@ pub struct Metadata {
     pub modified: Option<SystemTime>,
     pub created: Option<SystemTime>,
     pub size: Option<u64>,
+    /// Adapter-supplied permission bits, not an ACL or effective access check.
+    /// Adapters without a meaningful bit representation return `None`.
     pub permissions: Option<u32>,
 }
 

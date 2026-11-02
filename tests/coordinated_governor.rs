@@ -618,3 +618,56 @@ fn terminal_coordination_failure_does_not_retain_the_tree_actor_for_undispatchab
         );
     }
 }
+
+#[test]
+fn prepared_admission_keeps_the_caller_ceiling_independent_of_the_local_hold() {
+    for ceiling in [None, Some(Duration::from_millis(50)), Some(Duration::from_millis(5))] {
+        let (root, original) = fixture();
+        let mut config = original.diagnostics().unwrap().config;
+        config.initial_estimate_ns = 20_000_000;
+        let scope = Scope::open(root.path().join("priced"), config).unwrap();
+        let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+        let reservation = Reservation { ceiling, ..request(&host) };
+        let id = reservation.id;
+        let prepared = host.try_prepare(reservation, NOW).unwrap();
+        assert_eq!(prepared.admitted().cost, Duration::from_millis(1));
+        let result = prepared.commit(NOW);
+        if ceiling == Some(Duration::from_millis(5)) {
+            assert_eq!(result, Err(ThrottleCause::CommandCeiling { required: Duration::from_millis(20) }));
+            assert_eq!(host.view(NOW).preparations, 0);
+            assert_eq!(scope.view().unwrap().prepared, 0);
+        } else {
+            assert_eq!(result.unwrap().cost, Duration::from_millis(1));
+            host.try_start(id, NOW).unwrap();
+            assert_eq!(host.view(NOW).charged, Duration::from_millis(1));
+            assert!(scope.view().unwrap().charged_ns >= 20_000_000);
+            host.release(id, NOW);
+        }
+    }
+}
+
+#[test]
+fn prepared_commit_caps_local_repricing_without_limiting_the_shared_price() {
+    let (root, original) = fixture();
+    let mut config = original.diagnostics().unwrap().config;
+    config.initial_estimate_ns = 20_000_000;
+    let scope = Scope::open(root.path().join("repriced"), config).unwrap();
+    let host = HostGovernor::with_coordination(&host_config(), scope.clone()).unwrap();
+    let reservation = Reservation { reads: 0, operations: 10, listing: true, ..request(&host) };
+    let id = reservation.id;
+    let prepared = host.try_prepare(reservation, NOW).unwrap();
+    assert_eq!(prepared.admitted().cost, Duration::from_millis(10));
+    let training = request(&host);
+    let training_id = training.id;
+    host.try_admit(training, NOW).unwrap();
+    host.try_start(training_id, NOW).unwrap();
+    let later = NOW + Duration::from_millis(2);
+    host.release(training_id, later);
+    assert_eq!(host.estimate_of(None), Duration::from_millis(2));
+    let admitted = prepared.commit(later).unwrap();
+    assert_eq!(admitted.operations, 5);
+    assert_eq!(admitted.cost, Duration::from_millis(10));
+    host.try_start(id, later).unwrap();
+    assert!(scope.view().unwrap().charged_ns >= 120_000_000);
+    host.release(id, later);
+}

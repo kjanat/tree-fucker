@@ -352,6 +352,13 @@ Abstract
    and similar values are metadata. They MAY be stored, diffed, and
    published.
 
+   The portable metadata model includes optional permission bits, not ACL
+   payloads or effective-access decisions. Adapters MUST return unavailable
+   when a permission-bit representation is not meaningful. Native ACLs,
+   principals, inheritance rules, and authorization checks remain owned by
+   the adapter or application; they MUST NOT be flattened into a claim of
+   portable access rights. The core does not fetch ACLs during enumeration.
+
    Metadata MUST NOT be treated as proof of directory contents.
    In particular, equality of modification times MUST NOT suppress a
    required directory listing.
@@ -1449,6 +1456,16 @@ Abstract
    benchmarks and SHOULD reuse metadata the listing already obtains.
    Platform guidance appears in Section 14.3.
 
+   Protocol-native clients implement the same FileSystem interface as
+   operating-system adapters. DeclaredProbe supplies established domain
+   identity and capabilities; it does not discover protocol semantics.
+   A protocol adapter MUST account for every physical request, respect
+   listing leases and result ceilings, and report incomplete enumeration
+   as failure. Unknown metadata remains unavailable. Notification loss
+   uses the recovery contract in Section 11.6. Protocol transports,
+   credentials, ACL payloads, and connection pools remain adapter-owned;
+   the core does not select or bundle a protocol client.
+
 10.4.  Watcher Capabilities
 
    Watcher capabilities are declared per storage domain and answer:
@@ -1846,6 +1863,22 @@ Abstract
    work MAY commit when publication-valid but cannot discharge the newer
    requirement. Repeated overflow notifications coalesce into the newest
    required generation.
+
+   A backend with a subtree rescan requirement emits Rescan with the
+   root-relative affected path. This is distinct from an ordinary path
+   hint: refreshing that directory alone cannot repair missed descendants.
+   The core conservatively applies the same whole-tree coverage barrier
+   as Overflow, including when the reported path is absent or unloaded.
+   Only loaded directories require reconciliation; the event does not
+   force excluded or unloaded subtrees to load. This avoids unbounded
+   per-path recovery state and shares the existing baseline scheduler.
+
+   Dropped hints increment the dropped-hint counter and set reconciliation
+   coverage_pending until newer accepted listings repair coverage. Event
+   loss alone MUST NOT mark a functioning watcher backend as failed or
+   restart its registrations. Watcher degradation denotes registration or
+   backend failure; reconciliation degradation denotes failed reads or a
+   degraded completed round. Pending coverage is reported independently.
 
    Implementations MAY accelerate this work by assigning greater baseline
    weight, but MUST preserve configured admission and concurrency bounds.

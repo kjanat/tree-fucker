@@ -616,9 +616,22 @@ impl Authority {
             let record = self.ledger.record(account.id).expect("live account");
             let Some(started) = record.authorized_at else { continue };
             let occupancy = now - started;
+            let reserved = record.reservation.estimated_ns;
             self.charge(slot, occupancy.saturating_sub(account.charged_ns));
             if !account.stuck && occupancy >= self.config.stuck_after_ns {
-                self.accounts[slot].as_mut().expect("account").stuck = true;
+                let account = self.accounts[slot].as_mut().expect("account");
+                account.stuck = true;
+                // Quarantine defers all global overshoot, including occupancy
+                // charged before this access discovered the stuck operation.
+                account.withheld_ns = account.charged_ns.saturating_sub(reserved);
+                let bucket = match account.request.origin {
+                    Origin::Background => &mut self.background,
+                    Origin::Foreground => &mut self.foreground,
+                };
+                bucket.level = (bucket.level + i128::from(account.withheld_ns)).min(i128::from(bucket.config.burst_ns));
+                if bucket.level == i128::from(bucket.config.burst_ns) {
+                    bucket.remainder = 0;
+                }
                 self.failure(slot);
             }
         }

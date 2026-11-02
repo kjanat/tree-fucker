@@ -86,6 +86,8 @@ pub struct ReconciliationHealth {
     pub degraded_paths: BTreeSet<RelativePath>,
     pub degraded_path_causes: BTreeMap<RelativePath, crate::core::DegradedCause>,
     pub metadata_degraded_paths: BTreeSet<RelativePath>,
+    /// Event loss or a rescan request still needs newer accepted listings.
+    /// This does not by itself mean that the watcher backend has failed.
     pub coverage_pending: bool,
 }
 

@@ -129,6 +129,7 @@ impl Binding {
         host: &HostGovernor,
         reservation: Reservation,
         work: Work,
+        local_ceiling: Option<Duration>,
         now: MonotonicTime,
     ) -> Result<Admitted, ThrottleCause> {
         let mut state = self.lock()?;
@@ -139,7 +140,13 @@ impl Binding {
             return Err(cause);
         }
         let id = reservation.id;
-        let local = guard(&host.inner).try_prepare(reservation.clone(), now)?;
+        let mut local_reservation = reservation.clone();
+        if let Some(ceiling) = local_ceiling {
+            // The local hold caps only local repricing. The shared authority
+            // must see the caller's allowance, not our cost estimate.
+            local_reservation.ceiling = Some(reservation.ceiling.unwrap_or(Duration::MAX).min(ceiling));
+        }
+        let local = guard(&host.inner).try_prepare(local_reservation, now)?;
         // Local budget stays provisional throughout the native transaction.
         // No local governor mutex is held while acquiring the shared lock.
         let result = (|| {

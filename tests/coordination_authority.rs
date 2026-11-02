@@ -134,12 +134,12 @@ fn stuck_work_keeps_occupancy_and_defers_only_its_global_debt() {
     let stuck = prepare(&mut authority, participant, request(Some(a)), 0);
     authority.authorize(stuck, 0).unwrap();
     authority.advance(20).unwrap();
-    assert_eq!(authority.view().foreground_level_ns, 80);
+    assert_eq!(authority.view().foreground_level_ns, 90);
     assert_eq!(authority.view().surcharged_ns, 7);
     assert!(authority.cancel(stuck, 40).unwrap());
     assert_eq!(authority.view().physical, 1);
-    assert_eq!(authority.view().foreground_level_ns, 80);
-    assert_eq!(authority.view().withheld_ns, 20);
+    assert_eq!(authority.view().foreground_level_ns, 90);
+    assert_eq!(authority.view().withheld_ns, 30);
     let next = authority.ledger().next_operation(participant).unwrap();
     assert_eq!(authority.prepare(next, request(Some(a)), 40), Err(Error::Quarantined));
     let healthy = prepare(&mut authority, participant, request(Some(b)), 40);
@@ -332,7 +332,7 @@ fn snapshot_round_trip_retains_preparations_occupancy_debt_and_incarnations() {
     let mut recovered = Authority::decode(&bytes).unwrap();
     assert_eq!(recovered, authority);
     assert_eq!(recovered.view().physical, 1);
-    assert_eq!(recovered.view().withheld_ns, 100);
+    assert_eq!(recovered.view().withheld_ns, 1290);
     assert_eq!(recovered.encode().unwrap(), bytes);
     recovered.cancel(prepared, 1300).unwrap();
     recovered.reclaim_after_owner_exit(running, 1400).unwrap();
@@ -418,4 +418,73 @@ fn caller_ceiling_uses_the_capacity_capped_minimum_and_exempts_cleanup() {
     let cleanup = Request { work: Work::WatchRelease, ceiling_ns: 0, ..request };
     assert!(authority.prepare(id, cleanup, 0).is_ok());
     assert!(authority.authorize(id, 0).is_ok());
+}
+
+#[test]
+fn overdue_shared_work_keeps_healthy_domains_admissible_until_settlement() {
+    for origin in [Origin::Background, Origin::Foreground] {
+        for reclaim in [false, true] {
+            let mut authority = authority();
+            let a = domain(&mut authority, 1);
+            let b = domain(&mut authority, 2);
+            let participant = authority.join(VERSION).unwrap();
+            let stuck = prepare(&mut authority, participant, Request { origin, ..request(Some(a)) }, 0);
+            authority.authorize(stuck, 0).unwrap();
+            authority.advance(30_000).unwrap();
+            assert_eq!(authority.view().withheld_ns, 29_990);
+            assert_eq!(authority.view().charged_ns, 30_000);
+            assert_eq!(authority.view().physical, 1);
+            let healthy = prepare(&mut authority, participant, Request { origin, ..request(Some(b)) }, 30_000);
+            authority.authorize(healthy, 30_000).unwrap();
+            authority.settle(healthy, completed(0), 30_000).unwrap();
+            authority.advance(30_000).unwrap();
+            assert_eq!(authority.view().withheld_ns, 29_990);
+            authority = Authority::decode(&authority.encode().unwrap()).unwrap();
+            if reclaim {
+                authority.reclaim_after_owner_exit(stuck, 30_000).unwrap();
+                authority.reclaim_after_owner_exit(stuck, 30_000).unwrap();
+            } else {
+                authority.settle(stuck, completed(30_000), 30_000).unwrap();
+                authority.settle(stuck, completed(30_000), 30_000).unwrap();
+            }
+            let view = authority.view();
+            assert_eq!(view.withheld_ns, 0);
+            assert_eq!(view.physical, 0);
+            assert_eq!(view.charged_ns, 30_010);
+            assert_eq!(view.surcharged_ns, 7);
+            let level = match origin {
+                Origin::Background => view.background_level_ns,
+                Origin::Foreground => view.foreground_level_ns,
+            };
+            assert_eq!(level, -29_910);
+            let next = authority.ledger().next_operation(participant).unwrap();
+            assert_eq!(authority.prepare(next, Request { origin, ..request(Some(b)) }, 30_000), Err(Error::Budget));
+        }
+    }
+}
+
+#[test]
+fn deferring_stuck_debt_after_refill_never_exceeds_the_global_burst() {
+    for origin in [Origin::Background, Origin::Foreground] {
+        let budget = Budget { refill_ns_per_second: 1_000_000_001, burst_ns: 100 };
+        let cfg = Config { background: budget, foreground: budget, ..config() };
+        let mut authority = Authority::new(Generation([1; 16]), cfg, 0).unwrap();
+        let participant = authority.join(VERSION).unwrap();
+        let stuck = prepare(&mut authority, participant, Request { origin, ..request(None) }, 0);
+        authority.authorize(stuck, 0).unwrap();
+        authority.advance(990).unwrap();
+        authority.advance(1000).unwrap();
+        let view = authority.view();
+        assert_eq!(view.background_level_ns, 100);
+        assert_eq!(view.foreground_level_ns, 100);
+        assert_eq!(view.withheld_ns, 990);
+        assert_eq!(Authority::decode(&authority.encode().unwrap()).unwrap(), authority);
+        authority.settle(stuck, completed(1000), 1000).unwrap();
+        let view = authority.view();
+        let level = match origin {
+            Origin::Background => view.background_level_ns,
+            Origin::Foreground => view.foreground_level_ns,
+        };
+        assert_eq!(level, -890);
+    }
 }

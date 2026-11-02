@@ -13,9 +13,9 @@ impl Coordinator {
                     self.on_hint(path, kind);
                 }
             }
-            WatcherEvent::Overflow => self.coverage_invalidate(),
+            WatcherEvent::Overflow | WatcherEvent::Rescan { .. } => self.coverage_invalidate(),
             WatcherEvent::Dropped { count } => {
-                self.dropped_hints += count;
+                self.dropped_hints = self.dropped_hints.saturating_add(count);
                 self.coverage_invalidate();
             }
             WatcherEvent::Failed { message, path } => self.on_watcher_failed(message, path),
@@ -72,7 +72,7 @@ impl Coordinator {
         };
         let watcher_pending = self.pending.values().filter(|p| p.reasons.watcher).count();
         if watcher_pending >= self.config.watcher_path_limit {
-            self.dropped_hints += 1;
+            self.dropped_hints = self.dropped_hints.saturating_add(1);
             self.coverage_invalidate();
             return;
         }

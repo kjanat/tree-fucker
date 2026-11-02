@@ -162,6 +162,18 @@ pub struct Reservation {
     pub listing: bool,
 }
 
+impl Reservation {
+    fn work(&self) -> crate::coordination::protocol::Work {
+        match self.id {
+            GrantId::Bootstrap(_) => crate::coordination::protocol::Work::Bootstrap,
+            GrantId::WatchRegistration(..) => crate::coordination::protocol::Work::WatchRegistration,
+            GrantId::WatchRelease(..) => crate::coordination::protocol::Work::WatchRelease,
+            _ if self.listing => crate::coordination::protocol::Work::Listing,
+            _ => crate::coordination::protocol::Work::Enrichment,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
     pub cost: Duration,
@@ -215,13 +227,14 @@ impl PreparedAdmission {
         let mut governor = guard(&self.governor.inner);
         let mut prepared = governor.prepared.remove(&self.id).expect("preparation owns its reservation");
         self.armed = false;
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+        if let Some(shared) = &self.governor.shared {
+            drop(governor);
+            let work = prepared.reservation.work();
+            return shared.admit(&self.governor, prepared.reservation, work, Some(prepared.admitted.cost), now);
+        }
         prepared.reservation.ceiling =
             Some(prepared.reservation.ceiling.unwrap_or(Duration::MAX).min(prepared.admitted.cost));
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
-        if self.governor.shared.is_some() {
-            drop(governor);
-            return self.governor.try_admit(prepared.reservation, now);
-        }
         governor.try_admit(prepared.reservation, now)
     }
 }
@@ -1933,13 +1946,7 @@ impl HostGovernor {
     }
 
     pub fn try_admit(&self, reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
-        let work = match reservation.id {
-            GrantId::Bootstrap(_) => crate::coordination::protocol::Work::Bootstrap,
-            GrantId::WatchRegistration(..) => crate::coordination::protocol::Work::WatchRegistration,
-            GrantId::WatchRelease(..) => crate::coordination::protocol::Work::WatchRelease,
-            _ if reservation.listing => crate::coordination::protocol::Work::Listing,
-            _ => crate::coordination::protocol::Work::Enrichment,
-        };
+        let work = reservation.work();
         self.try_admit_work(reservation, work, now)
     }
 
@@ -1951,7 +1958,7 @@ impl HostGovernor {
     ) -> Result<Admitted, ThrottleCause> {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
         if let Some(shared) = &self.shared {
-            return shared.admit(self, reservation, _work, now);
+            return shared.admit(self, reservation, _work, None, now);
         }
         guard(&self.inner).try_admit(reservation, now)
     }
