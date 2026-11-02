@@ -34,6 +34,8 @@ Unix connections pin the rendezvous objects and each live owner description. Win
 
 [Coordination acceptance run 41372711016](https://github.com/kjanat/tree-fucker/actions/runs/41372711016) tested commit `6b996590e37f05c472ba37db6373e298ef772e18`. Its five `aggregate-resources-*` artifacts contain all 60 combinations of six scenarios (`tiny`, `disjoint`, `contention`, `churn`, `slow`, `idle`), two modes, and five native platforms. Every report has samples containing its required complete cohort, and every recorded peak equals the maximum of its samples. Tiny runs require two processes; the remaining scenarios require five.
 
+The resource jobs in [run 41386719491](https://github.com/kjanat/tree-fucker/actions/runs/41386719491), on `024dfad8116bbfc0f4bb93231cd63ae9dfecb19a`, passed on all five runners after replacing the fixed startup hold with collector acknowledgement. All sixty downloaded reports contain complete cohorts and correctly computed peaks. Every churn report acknowledges four distinct ready cohorts; every other report acknowledges one. The ten idle workloads again report zero operations, rows and bookkeeping attempts/acquisitions/contention. This verifies the resource jobs; it is not a claim about the separate Windows session guest or physical sleep job.
+
 The idle measurements below are peaks for the complete five-process cohort, including its controller. Private memory is the sum of unique resident bytes (USS). Handle counts mean file descriptors on Unix and kernel handles on Windows. Virtual-address reservations are reported separately in the artifacts and must not be interpreted as resident memory.
 
 | Runner           | Process-only private bytes | Shared private bytes | Process-only handles | Shared handles |

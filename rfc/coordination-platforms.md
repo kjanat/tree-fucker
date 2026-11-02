@@ -4,14 +4,14 @@ The ownership protocol, authority, and snapshot journal are shared across platfo
 
 ## Current implementation and activation
 
-| Target  | Current shared backend                                            | Current mode selection                             | Native activation gate                                                                      |
-| ------- | ----------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Linux   | Private tmpfs journal, pinned sibling anchor, `flock` owner slots | Opt-in shared coordination                         | Linux subprocess, namespace, recovery, and performance acceptance                           |
-| Windows | Private NTFS/ReFS journal, pinned anchor, exclusive owner handles | Opt-in implementation; native acceptance pending   | Native process/session/crash acceptance and retained accounting across reboot               |
-| macOS   | Root-qualified tmpfs journal and pinned anchor                    | Opt-in implementation; native acceptance pending   | Native tmpfs, sandbox, root transition, inherited ownership, sleep/wake, and resource tests |
-| FreeBSD | Root-qualified tmpfs journal and pinned anchor                    | Opt-in for compatible roots; capability rejection  | Retained tmpfs discovery, jail/capability identity, inherited owner locks                   |
-| illumos | Zone-qualified tmpfs journal and pinned anchor                    | Opt-in shared coordination                         | Native zone transitions, privilege restrictions, and resource acceptance                    |
-| Solaris | Unavailable                                                       | Required errors; Auto reports unsupported fallback | Verified lifetime primitive and zone-local scope on the exact supported release             |
+| Target  | Current shared backend                                            | Current mode selection                             | Native activation gate                                                                                               |
+| ------- | ----------------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Linux   | Private tmpfs journal, pinned sibling anchor, `flock` owner slots | Opt-in shared coordination                         | Linux subprocess, namespace, recovery, and performance acceptance                                                    |
+| Windows | Private NTFS/ReFS journal, pinned anchor, exclusive owner handles | Opt-in implementation; native acceptance pending   | Native process/session/crash acceptance and retained accounting across reboot                                        |
+| macOS   | Root-qualified tmpfs journal and pinned anchor                    | Opt-in; physical sleep/wake remains unverified     | Native tmpfs, sandbox, root transition, inherited ownership and resource tests pass; physical transition remains #20 |
+| FreeBSD | Root-qualified tmpfs journal and pinned anchor                    | Opt-in for compatible roots; capability rejection  | Retained tmpfs discovery, jail/capability identity, inherited owner locks                                            |
+| illumos | Zone-qualified tmpfs journal and pinned anchor                    | Opt-in shared coordination                         | Native zone transitions, privilege restrictions, and resource acceptance                                             |
+| Solaris | Unavailable                                                       | Required errors; Auto reports unsupported fallback | Verified lifetime primitive and zone-local scope on the exact supported release                                      |
 
 ProcessOnly remains the default everywhere. `tests/coordination_policy.rs` exercises mode selection, including explicit unsupported-platform outcomes. The existing CI matrix runs the portable tests on native Windows and macOS runners and FreeBSD/OmniOS VMs. Those jobs run each implemented adapter's process histories as part of its native release acceptance. Solaris cross-compilation checks API availability; native Solaris execution is a separate gate.
 
