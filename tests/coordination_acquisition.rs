@@ -116,6 +116,7 @@ fn drained(scope: &Scope) -> View {
 
 #[derive(Clone, Copy, Debug)]
 enum Boundary {
+    LocalPreparationDenied,
     LocalPreparation,
     PublicCommitDenied,
     SharedPreparation,
@@ -126,29 +127,179 @@ enum Boundary {
     ReportedCompletion,
 }
 
-#[test]
-fn abort_and_completion_at_each_composed_boundary_do_not_wait_or_lose_accounting() {
-    for origin in [WorkOrigin::Background, WorkOrigin::Foreground] {
-        for operations in [0, 4] {
-            for known_domain in [false, true] {
-                for boundary in [
-                    Boundary::LocalPreparation,
-                    Boundary::PublicCommitDenied,
-                    Boundary::SharedPreparation,
-                    Boundary::LocalStartDenied,
-                    Boundary::SharedStartDenied,
-                    Boundary::SharedCapacityDenied,
-                    Boundary::PhysicalCompletion,
-                    Boundary::ReportedCompletion,
-                ] {
-                    history(boundary, origin, operations, known_domain);
-                }
+const BOUNDARIES: [Boundary; 9] = [
+    Boundary::LocalPreparationDenied,
+    Boundary::LocalPreparation,
+    Boundary::PublicCommitDenied,
+    Boundary::SharedPreparation,
+    Boundary::LocalStartDenied,
+    Boundary::SharedStartDenied,
+    Boundary::SharedCapacityDenied,
+    Boundary::PhysicalCompletion,
+    Boundary::ReportedCompletion,
+];
+
+/// Which ownership the history holds when the controller takes bookkeeping
+/// exclusion. Every expected accounting fact below derives from this table.
+#[derive(Clone, Copy)]
+struct Held {
+    local_preparation: bool,
+    shared_preparation: bool,
+    physical: bool,
+}
+
+impl Boundary {
+    fn held(self) -> Held {
+        let (local_preparation, shared_preparation, physical) = match self {
+            Self::LocalPreparationDenied => (false, false, false),
+            Self::LocalPreparation | Self::PublicCommitDenied => (true, false, false),
+            Self::SharedPreparation | Self::LocalStartDenied | Self::SharedStartDenied | Self::SharedCapacityDenied => {
+                (true, true, false)
             }
+            Self::PhysicalCompletion | Self::ReportedCompletion => (false, false, true),
+        };
+        Held { local_preparation, shared_preparation, physical }
+    }
+}
+
+/// Shared facts that native elapsed time cannot change.
+#[derive(Debug, PartialEq, Eq)]
+struct Shared {
+    participants: usize,
+    domains: usize,
+    prepared: usize,
+    physical: u32,
+    surcharged_ns: u128,
+    withheld_ns: u128,
+    bootstrap_reserved_ns: u128,
+}
+
+impl Shared {
+    fn of(view: &View) -> Self {
+        Self {
+            participants: view.participants,
+            domains: view.domains,
+            prepared: view.prepared,
+            physical: view.physical,
+            surcharged_ns: view.surcharged_ns,
+            withheld_ns: view.withheld_ns,
+            bootstrap_reserved_ns: view.bootstrap_reserved_ns,
         }
     }
 }
 
+/// Local holds and charges summed over every governor in one history.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Local {
+    preparations: usize,
+    prepared: Duration,
+    in_flight: usize,
+    charged: Duration,
+    surcharged: Duration,
+}
+
+fn local_holds(governors: &[&HostGovernor]) -> Local {
+    governors.iter().map(|governor| governor.view(NOW)).fold(Local::default(), |sum, view| Local {
+        preparations: sum.preparations + view.preparations,
+        prepared: sum.prepared + view.prepared,
+        in_flight: sum.in_flight + view.in_flight,
+        charged: sum.charged + view.charged,
+        surcharged: sum.surcharged + view.surcharged,
+    })
+}
+
+/// The clock the Unix backends timestamp authority transitions with
+/// (`now` in `src/coordination/unix.rs`). Rust's `Instant` differs on Darwin.
+#[cfg(unix)]
+struct NativeClock;
+
+#[cfg(unix)]
+impl NativeClock {
+    fn new() -> Self {
+        Self
+    }
+
+    fn now_ns(&self) -> u128 {
+        let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        u128::try_from(time.tv_sec).unwrap() * 1_000_000_000 + u128::try_from(time.tv_nsec).unwrap()
+    }
+
+    /// POSIX CLOCK_MONOTONIC never runs backwards across threads.
+    fn cross_thread_slack_ns(&self) -> u128 {
+        0
+    }
+}
+
+/// The performance counter scaled by the same floored integer division as
+/// `Epoch::nanos` in `src/coordination/windows/clock.rs`. A connection's
+/// binding offset is constant, so it cancels in every occupancy interval.
+#[cfg(windows)]
+struct NativeClock {
+    frequency: u128,
+}
+
+#[cfg(windows)]
+impl NativeClock {
+    fn new() -> Self {
+        let mut frequency = 0;
+        // SAFETY: live, correctly sized output.
+        assert_ne!(unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency) }, 0);
+        Self { frequency: u128::try_from(frequency).unwrap() }
+    }
+
+    fn now_ns(&self) -> u128 {
+        let mut ticks = 0;
+        // SAFETY: live, correctly sized output.
+        assert_ne!(unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut ticks) }, 0);
+        u128::try_from(ticks).unwrap() * 1_000_000_000 / self.frequency
+    }
+
+    /// The backend clamps readings because QPC on different threads can
+    /// differ by one tick (`now_at` in `src/coordination/windows/mod.rs`).
+    /// Allow one tick at each end of the window.
+    fn cross_thread_slack_ns(&self) -> u128 {
+        2 * 1_000_000_000_u128.div_ceil(self.frequency)
+    }
+}
+
+/// The native authority charges each authorized operation the larger of its
+/// reservation and its measured occupancy. With one physical permit those
+/// occupancies are disjoint and lie inside the native-clock window that
+/// starts at `opened`. Work that was never authorized accrues nothing.
+fn assert_charged(view: &View, reserved: Duration, clock: &NativeClock, opened: u128, context: &str) {
+    let charged = view.charged_ns;
+    let reserved = reserved.as_nanos();
+    if reserved == 0 {
+        assert_eq!(charged, 0, "{context}: no operation was authorized");
+        return;
+    }
+    let window = clock.now_ns() - opened + clock.cross_thread_slack_ns();
+    assert!(
+        (reserved..=reserved + window).contains(&charged),
+        "{context}: charged {charged}, reserved {reserved}, native window {window}"
+    );
+}
+
+#[test]
+fn abort_and_completion_at_each_composed_boundary_do_not_wait_or_lose_accounting() {
+    let mut histories = 0;
+    for origin in [WorkOrigin::Background, WorkOrigin::Foreground] {
+        for operations in [0, 4] {
+            for known_domain in [false, true] {
+                for boundary in BOUNDARIES {
+                    history(boundary, origin, operations, known_domain);
+                    histories += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(histories, 72);
+}
+
 fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain: bool) {
+    let context = format!("{boundary:?} {origin:?} operations={operations} known_domain={known_domain}");
+    let clock = NativeClock::new();
+    let opened = clock.now_ns();
     let (root, scope, host, peer) = fixture();
     let mut reservation = request(&host, origin, operations);
     if known_domain {
@@ -157,7 +308,34 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
         reservation.domain = Some(domain);
     }
     let id = reservation.id;
+    let held = boundary.held();
+    // Both authorities start from a 1 ms estimate with second-long buckets, so
+    // every requested optional operation is permitted at that unit price.
+    let cost = Duration::from_millis(u64::from(1 + operations));
+    let peer_cost =
+        if matches!(boundary, Boundary::SharedCapacityDenied) { Duration::from_millis(1) } else { Duration::ZERO };
+    let host_charge = if held.physical { cost } else { Duration::ZERO };
+    let shared_owner = held.shared_preparation || held.physical;
+    let expected_shared = |prepared: usize, host_live: bool| Shared {
+        participants: 2,
+        domains: usize::from(known_domain && shared_owner),
+        prepared,
+        physical: u32::from(host_live && held.physical) + u32::from(!peer_cost.is_zero()),
+        surcharged_ns: 0,
+        withheld_ns: 0,
+        bootstrap_reserved_ns: peer_cost.as_nanos()
+            + if host_live && shared_owner && !known_domain { cost.as_nanos() } else { 0 },
+    };
+    let released_local =
+        Local { in_flight: usize::from(!peer_cost.is_zero()), charged: host_charge + peer_cost, ..Local::default() };
+    let held_local = Local {
+        preparations: usize::from(held.local_preparation),
+        prepared: if held.local_preparation { cost } else { Duration::ZERO },
+        in_flight: usize::from(held.physical) + released_local.in_flight,
+        ..released_local
+    };
     let mut local = None;
+    let mut denied = None;
     let peer_id = if matches!(boundary, Boundary::SharedCapacityDenied) {
         let busy = request(&peer, origin, 0);
         let peer_id = busy.id;
@@ -168,6 +346,10 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
         None
     };
     match boundary {
+        Boundary::LocalPreparationDenied => {
+            host.report_memory(host.next_tree(), host.memory_ceiling() + 1, 0);
+            denied = Some(reservation);
+        }
         Boundary::LocalPreparation | Boundary::PublicCommitDenied => {
             local = Some(host.try_prepare(reservation, NOW).unwrap());
         }
@@ -197,6 +379,27 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
     let before = lock.authority(root.path());
     let observer = scope.clone();
     assert!(matches!(nonblocking(move || observer.view()), Err(Error::Busy)));
+    assert_eq!(Shared::of(&before.view()), expected_shared(usize::from(held.shared_preparation), true), "{context}");
+    assert_charged(&before.view(), host_charge + peer_cost, &clock, opened, &context);
+    assert_eq!(local_holds(&[&host, &peer]), held_local, "{context}");
+    assert_eq!(scope.diagnostics().unwrap().pending_settlements, 0, "{context}");
+    if let Some(reservation) = denied {
+        let access = scope.diagnostics().unwrap().access;
+        let owner = host.clone();
+        assert_eq!(nonblocking(move || owner.try_admit(reservation, NOW)), Err(ThrottleCause::Memory));
+        assert_eq!(scope.diagnostics().unwrap().access, access, "local denial must not attempt shared preparation");
+        assert_eq!(local_holds(&[&host, &peer]), held_local, "{context}: local denial must hold nothing");
+        assert_eq!(scope.diagnostics().unwrap().pending_settlements, 0, "{context}");
+    }
+    if held.physical {
+        // Replaying start for running work must reuse the committed shared
+        // permission without a native attempt or a second local charge.
+        let access = scope.diagnostics().unwrap().access;
+        let owner = host.clone();
+        assert_eq!(nonblocking(move || owner.try_start(id, NOW)), Ok(()));
+        assert_eq!(scope.diagnostics().unwrap().access, access, "{context}: replayed start reached the authority");
+        assert_eq!(local_holds(&[&host, &peer]), held_local, "{context}: replayed start changed local accounting");
+    }
     if matches!(boundary, Boundary::SharedStartDenied) {
         let access = scope.diagnostics().unwrap().access;
         let owner = host.clone();
@@ -207,6 +410,7 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
             (access.attempts + 1, access.busy + 1, access.acquired)
         );
         assert_eq!(host.view(NOW).in_flight, 0, "shared denial must roll back the local physical hold");
+        assert_eq!(local_holds(&[&host, &peer]), held_local, "{context}: shared denial changed local accounting");
     }
     match boundary {
         Boundary::LocalPreparation => {
@@ -220,17 +424,19 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
             nonblocking(move || owner.release(id, NOW));
         }
     }
-    let queued = !matches!(boundary, Boundary::LocalPreparation | Boundary::PublicCommitDenied);
+    let queued = shared_owner;
     let diagnostics = scope.diagnostics().unwrap();
     assert_eq!(diagnostics.pending_settlements, usize::from(queued), "boundary={boundary:?}");
     assert!(!diagnostics.failed);
     assert_eq!(lock.authority(root.path()), before, "no shared state can change while exclusion is held");
+    assert_eq!(local_holds(&[&host, &peer]), released_local, "{context}: release must return every local hold");
     // A duplicate release must neither enqueue a second update nor release a
     // different participant's ownership.
     let owner = host.clone();
     nonblocking(move || owner.release(id, NOW));
     assert_eq!(scope.diagnostics().unwrap().pending_settlements, usize::from(queued));
     assert_eq!(lock.authority(root.path()), before);
+    assert_eq!(local_holds(&[&host, &peer]), released_local, "{context}: duplicate release changed local accounting");
     let view = host.view(NOW);
     assert_eq!((view.preparations, view.in_flight), (0, 0));
     assert_eq!(view.surcharged, Duration::ZERO);
@@ -249,6 +455,8 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
     if !completed && peer_id.is_none() {
         assert_eq!(settled.charged_ns, 0);
     }
+    assert_eq!(Shared::of(&settled), expected_shared(0, false), "{context}: settlement");
+    assert_charged(&settled, host_charge + peer_cost, &clock, opened, &context);
     if let Some(peer_id) = peer_id {
         peer.release(peer_id, NOW);
     } else {
@@ -258,6 +466,12 @@ fn history(boundary: Boundary, origin: WorkOrigin, operations: u32, known_domain
     drop((host, peer));
     let retired = drained(&scope);
     assert_eq!((retired.participants, retired.prepared, retired.physical), (0, 0, 0));
+    assert_eq!(
+        (retired.surcharged_ns, retired.withheld_ns, retired.bootstrap_reserved_ns),
+        (0, 0, 0),
+        "{context}: retirement"
+    );
+    assert_charged(&retired, host_charge + peer_cost, &clock, opened, &context);
 }
 
 #[test]

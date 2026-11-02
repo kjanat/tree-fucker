@@ -20,6 +20,12 @@ mod tree_denials;
 #[path = "coordinated_governor/leases.rs"]
 mod leases;
 
+#[path = "coordinated_governor/histories.rs"]
+mod histories;
+
+#[path = "coordinated_governor/lifecycle.rs"]
+mod lifecycle;
+
 #[test]
 fn tree_failure_outcomes_reach_shared_settlement_once() {
     use tree_fucker::core::{JobResult, Work};
@@ -54,6 +60,7 @@ fn tree_failure_outcomes_reach_shared_settlement_once() {
             ));
         }
         assert_eq!(scope.view().unwrap().surcharged_ns, 1_000, "lost={lost}");
+        assert_eq!(harness.governor().surcharged, host_config().failure_surcharge, "lost={lost}");
     }
 }
 
