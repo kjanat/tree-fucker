@@ -1,6 +1,78 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:recommended"
-  ]
+	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"extends": [
+		"config:recommended"
+	],
+	"timezone": "Europe/Amsterdam",
+	"schedule": ["* 0-6 * * 1"],
+	"prConcurrentLimit": 4,
+	"automerge": false,
+	"automergeType": "pr",
+	"platformAutomerge": false,
+	"ignoreTests": false,
+	"rebaseWhen": "conflicted",
+	"lockFileMaintenance": {
+		"enabled": true,
+		"schedule": ["* 0-6 1-7 * 1"]
+	},
+	"packageRules": [
+		{
+			"description": "Keep crate minimums current and respect Cargo's seven-day publish-age policy.",
+			"matchManagers": ["cargo"],
+			"rangeStrategy": "bump",
+			"minimumReleaseAge": "7 days"
+		},
+		{
+			"description": "Batch Rust patches; review minor and major upgrades separately.",
+			"matchManagers": ["cargo"],
+			"matchUpdateTypes": ["patch"],
+			"groupName": "Rust patch dependencies",
+			"groupSlug": "rust-patches"
+		},
+		{
+			"description": "Update the futures crates together across runtime and test dependencies.",
+			"matchManagers": ["cargo"],
+			"matchPackageNames": ["futures", "futures-*"],
+			"groupName": "futures crates",
+			"groupSlug": "futures"
+		},
+		{
+			"description": "Batch compatible workflow updates while keeping action majors separate.",
+			"matchManagers": ["github-actions"],
+			"matchUpdateTypes": ["minor", "patch"],
+			"groupName": "GitHub Actions",
+			"groupSlug": "github-actions"
+		},
+		{
+			"description": "Automerge only action patches after a release delay and successful CI on the current base.",
+			"matchManagers": ["github-actions"],
+			"matchUpdateTypes": ["patch"],
+			"minimumReleaseAge": "3 days",
+			"groupName": "GitHub Actions patches",
+			"groupSlug": "github-actions-patches",
+			"automerge": true,
+			"rebaseWhen": "behind-base-branch"
+		},
+		{
+			"description": "Give RFC-site packages time to settle before updating the Bun workspace.",
+			"matchManagers": ["bun", "npm"],
+			"minimumReleaseAge": "3 days"
+		},
+		{
+			"description": "Keep routine RFC-site updates separate from the Rust library and CI tools.",
+			"matchManagers": ["bun", "npm"],
+			"matchUpdateTypes": ["minor", "patch"],
+			"groupName": "RFC site dependencies",
+			"groupSlug": "rfc-site"
+		},
+		{
+			"description": "Automerge site patches separately so a minor update cannot inherit that permission.",
+			"matchManagers": ["bun", "npm"],
+			"matchUpdateTypes": ["patch"],
+			"groupName": "RFC site patches",
+			"groupSlug": "rfc-site-patches",
+			"automerge": true,
+			"rebaseWhen": "behind-base-branch"
+		}
+	]
 }
