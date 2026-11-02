@@ -3,6 +3,8 @@
 
 #[path = "coordination_windows/context.rs"]
 mod context;
+#[path = "coordination_windows/crashes.rs"]
+mod crashes;
 
 #[path = "../src/coordination/clock_binding.rs"]
 mod clock_binding;
@@ -499,6 +501,8 @@ fn windows_fixture() {
             })
             .unwrap();
         panic!("writer did not stop at the requested publication boundary");
+    } else if mode.starts_with("registration-") || mode.starts_with("recovery-") {
+        crashes::fixture(&root, &mode);
     } else {
         panic!("unknown Windows fixture");
     }

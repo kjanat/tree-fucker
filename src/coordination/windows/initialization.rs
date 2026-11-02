@@ -10,6 +10,9 @@ const MAGIC: &[u8; 8] = b"TFWIN001";
 const PREPARING: u8 = 0x5a;
 const READY: u8 = 0xa5;
 
+#[cfg(test)]
+mod crashes;
+
 fn encode_id(bytes: &mut [u8], id: Identity) {
     bytes[..8].copy_from_slice(&id.volume.to_le_bytes());
     bytes[8..24].copy_from_slice(&id.file);
@@ -28,12 +31,23 @@ fn hash(bytes: &[u8; HEADER]) -> u64 {
 pub(super) fn open(
     parent: &relative::Directory,
     name: &OsStr,
-    mut anchor: &File,
+    anchor: &File,
     principal: &Principal,
     clock: &mut Clock,
     config: Config,
 ) -> Result<(File, Journal<File>), Error> {
-    let length = anchor.metadata()?.len();
+    initialize_storage(parent, name, anchor, anchor.metadata()?.len(), principal, clock, config)
+}
+
+fn initialize_storage(
+    parent: &relative::Directory,
+    name: &OsStr,
+    mut anchor: impl Read + Write + Seek,
+    length: u64,
+    principal: &Principal,
+    clock: &mut Clock,
+    config: Config,
+) -> Result<(File, Journal<File>), Error> {
     if length != 0 && length != HEADER as u64 {
         return Err(Error::Replaced);
     }
@@ -171,7 +185,7 @@ mod tests {
         Journal::open(OpenOptions::new().read(true).write(true).open(path.join(STATE)).unwrap()).unwrap()
     }
 
-    fn mark_preparing(directory: &Path) {
+    pub(super) fn mark_preparing(directory: &Path) {
         let mut anchor = OpenOptions::new().write(true).open(directory.join("coordination.authority.lock")).unwrap();
         anchor.seek(SeekFrom::Start(12)).unwrap();
         anchor.write_all(&[PREPARING]).unwrap();
