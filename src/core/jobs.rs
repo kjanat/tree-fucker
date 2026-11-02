@@ -308,6 +308,16 @@ impl Coordinator {
         }
         if job.phase.started().is_none() {
             let now = self.now;
+            // Only the current unstarted preparation is reversible. Earlier
+            // completed leases and their overshoot remain command charges.
+            let refund = self.governor.prepared_cost_of(self.job_grant(id));
+            for barrier in &job.barriers {
+                if let Some(command) = self.commands.get_mut(barrier)
+                    && command.draws_on_foreground()
+                {
+                    command.admitted -= refund;
+                }
+            }
             self.governor.release(self.job_grant(id), now);
         }
         match job.entry() {

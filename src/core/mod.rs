@@ -1469,8 +1469,21 @@ impl Coordinator {
         let exhausted: Vec<(CommandId, Duration)> = self
             .commands
             .values()
-            .filter(|command| command.draws_on_foreground() && command.admitted >= ceiling)
-            .map(|command| (command.id, command.admitted))
+            .filter_map(|command| {
+                if !command.draws_on_foreground() || command.admitted < ceiling {
+                    return None;
+                }
+                // Preparations reduce the available ceiling for other work,
+                // but only committed charges can exhaust the command.
+                let prepared: Duration = self
+                    .jobs
+                    .values()
+                    .filter(|job| job.phase == JobPhase::Queued && job.barriers.contains(&command.id))
+                    .map(|job| self.governor.prepared_cost_of(self.job_grant(job.id)))
+                    .sum();
+                let admitted = command.admitted.saturating_sub(prepared);
+                (admitted >= ceiling).then_some((command.id, admitted))
+            })
             .collect();
         for (id, admitted) in exhausted {
             let limited = ResourceLimited {

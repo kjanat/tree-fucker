@@ -2651,6 +2651,12 @@ Abstract
    reached, the command fails with ResourceLimited under Section 13.1;
    this is a terminal outcome, not throttling with a resume time.
 
+   A reversible shared preparation holds part of the command's ceiling
+   without exhausting it. Cancelling that preparation returns only the
+   unstarted lease's hold. Earlier physical leases and their overshoot
+   remain charged; retrying cancelled work MUST NOT charge the abandoned
+   preparation again.
+
    Priority directories, policy invalidation, and root recovery are
    background work. They change which directory is read next. They do
    not draw on the foreground allowance.

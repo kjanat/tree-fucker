@@ -146,6 +146,8 @@ Auto fallback is restricted to an unsupported native platform or an unavailable 
 
 Tree result classification precedes shared settlement, including validation failures, worker loss, and partial enrichment failures. A queued cancellation aborts both preparations without an admission charge or failure surcharge. A running cancellation retains the physical grant through its completion message. A confirming metadata read after `NotDirectory` receives its own bounded lease and start permission.
 
+Command ceilings include queued preparations as reversible holds when pricing other work. A hold alone cannot exhaust a command. Cancelling an unstarted shared lease refunds that lease's command hold, preserving charges and overshoot from earlier physical leases, including when a suspended session had acquired its next preparation.
+
 After joining, coordinator failure stops new shared work. It does not discard liabilities or quietly enable independent admission. A full, malformed, or incompatible ledger does not authorize a replacement. Recovery state, effective scope, limits, participants, physical occupancy, debt, and wait causes are observable (§16).
 
 ## Acceptance histories

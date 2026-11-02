@@ -1985,6 +1985,10 @@ impl HostGovernor {
         guard(&self.inner).overshoot_of(id)
     }
 
+    pub(super) fn prepared_cost_of(&self, id: GrantId) -> Duration {
+        guard(&self.inner).prepared.get(&id).map(|held| held.admitted.cost).unwrap_or_default()
+    }
+
     pub fn charge_surcharge(&self, domain: Option<StorageDomainId>, origin: WorkOrigin, now: MonotonicTime) {
         guard(&self.inner).charge_surcharge(domain, origin, now)
     }
