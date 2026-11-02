@@ -9,7 +9,6 @@ permissions: { contents: read, pages: write, id-token: write }
 defaults: { run: { working-directory: rfc } }
 env:
   CARGO_TERM_COLOR: always
-  CARGO_UNSTABLE_HINT_MSRV: "false"
   RUSTDOCFLAGS: -D warnings
   SITE_REQUIRE_API: "1"
 

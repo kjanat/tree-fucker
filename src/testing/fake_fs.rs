@@ -118,6 +118,7 @@ struct Inner {
     directory_cases: HashMap<RelativePath, CaseSensitivity>,
     unknown_identities: BTreeSet<DomainId>,
     weak_identities: HashMap<DomainId, WeakDomainKey>,
+    known_identities: HashMap<DomainId, DomainKey>,
     non_domain_roots: BTreeSet<DomainId>,
     inline_domains: bool,
     unknown_kinds: BTreeSet<RelativePath>,
@@ -192,6 +193,7 @@ impl FakeFileSystem {
                 directory_cases: HashMap::new(),
                 unknown_identities: BTreeSet::new(),
                 weak_identities: HashMap::new(),
+                known_identities: HashMap::new(),
                 non_domain_roots: BTreeSet::new(),
                 inline_domains: true,
                 unknown_kinds: BTreeSet::new(),
@@ -554,6 +556,10 @@ impl FakeFileSystem {
         lock(&self.inner).weak_identities.insert(domain, key);
     }
 
+    pub fn report_domain_key(&self, domain: DomainId, key: DomainKey) {
+        lock(&self.inner).known_identities.insert(domain, key);
+    }
+
     pub fn report_not_domain_root(&self, domain: DomainId) {
         lock(&self.inner).non_domain_roots.insert(domain);
     }
@@ -610,7 +616,9 @@ impl FakeFileSystem {
         let identity = match inner.weak_identities.get(&domain) {
             Some(weak) => DomainIdentity::Weak(weak.clone()),
             None if inner.unknown_identities.contains(&domain) => DomainIdentity::Unknown,
-            None => DomainIdentity::Known(Self::domain_key(domain)),
+            None => DomainIdentity::Known(
+                inner.known_identities.get(&domain).cloned().unwrap_or_else(|| Self::domain_key(domain)),
+            ),
         };
         let probe = DeclaredProbe::new(
             identity,

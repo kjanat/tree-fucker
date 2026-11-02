@@ -704,3 +704,47 @@ fn a_whole_watcher_failure_charges_every_release_to_its_owning_domain_not_the_bo
         "the failure released no watch, so the charging path was never exercised"
     );
 }
+
+#[test]
+fn subtree_rescan_repairs_descendants_and_preserves_watcher_health() {
+    let fs = two_domains();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).unwrap();
+    h.run_until_idle();
+    h.run_round();
+    let watches = fs.watch_count();
+    fs.add_silently("local/inner/new", tree_fucker::EntryKind::File);
+    fs.add_silently("mnt/inner/new", tree_fucker::EntryKind::File);
+    h.inject_watcher_event(tree_fucker::WatcherEvent::Rescan { path: path("local") });
+    assert!(h.health().reconciliation.coverage_pending);
+    assert!(matches!(h.health().watcher, WatcherHealth::Healthy { .. }));
+    assert!(!h.health().reconciliation.is_degraded());
+    h.run_until_idle();
+    assert!(h.health().reconciliation.coverage_pending);
+    h.run_round();
+    assert!(h.entry("local/inner/new").is_some());
+    assert!(h.entry("mnt/inner/new").is_some());
+    assert!(!h.health().reconciliation.coverage_pending);
+    assert_eq!(fs.watch_count(), watches);
+}
+
+#[test]
+fn dropped_hints_report_recovery_without_restarting_a_healthy_watcher() {
+    let fs = two_domains();
+    let mut h = Harness::open(fs.clone(), Arc::new(LoadAll), follow()).unwrap();
+    h.run_until_idle();
+    h.run_round();
+    let watches = fs.watch_count();
+    fs.add_silently("local/inner/missed", tree_fucker::EntryKind::File);
+    h.inject_watcher_event(tree_fucker::WatcherEvent::Dropped { count: 3 });
+    assert_eq!(h.stats().dropped_hints, 3);
+    assert!(h.health().reconciliation.coverage_pending);
+    assert!(matches!(h.health().watcher, WatcherHealth::Healthy { .. }));
+    assert!(h.health().watcher_domains.values().all(|health| matches!(health, WatcherHealth::Healthy { .. })));
+    h.run_round();
+    assert!(h.entry("local/inner/missed").is_some());
+    assert!(!h.health().reconciliation.coverage_pending);
+    assert_eq!(fs.watch_count(), watches);
+    assert!(matches!(h.health().watcher, WatcherHealth::Healthy { .. }));
+    h.inject_watcher_event(tree_fucker::WatcherEvent::Dropped { count: u64::MAX });
+    assert_eq!(h.stats().dropped_hints, u64::MAX);
+}

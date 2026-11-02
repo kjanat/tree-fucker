@@ -19,6 +19,105 @@ fn path(p: &str) -> RelativePath {
     RelativePath::parse(p).expect("valid path")
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "illumos", target_os = "macos", windows))]
+#[test]
+fn cancelled_shared_preparations_refund_only_the_unstarted_command_lease() {
+    use super::{GrantId, JobPhase, JobResult, Reservation, WorkOrigin};
+    use crate::coordination::{authority, native::Scope};
+    use crate::{DomainCapabilities, HostConfig, HostGovernor, SessionCost, SessionStep};
+
+    for resumed in [false, true] {
+        for load in [false, true] {
+            #[cfg(target_os = "linux")]
+            let root = tempfile::tempdir_in("/dev/shm").unwrap();
+            #[cfg(any(target_os = "freebsd", target_os = "illumos", target_os = "macos"))]
+            let root = tempfile::tempdir_in("/var/run/tree-fucker").unwrap();
+            #[cfg(windows)]
+            let root = tempfile::tempdir().unwrap();
+            let config = HostConfig { maximum_in_flight: 2, per_domain_concurrency: 2, ..Default::default() };
+            let scope =
+                Scope::open(root.path().join("commands"), authority::Config::from_host(&config, 8, 16, 16).unwrap())
+                    .unwrap();
+            let host = HostGovernor::with_coordination(&config, scope.clone()).unwrap();
+            let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+            fs.set_default_capabilities(DomainCapabilities::inline());
+            fs.mkdir("child");
+            let mut h = Harness::open_under(fs, Arc::new(LoadAll), Config::default(), host.clone()).unwrap();
+            h.run_until_idle();
+            if load {
+                h.command(Command::Unload(path("child")));
+            }
+            // Keep the Tree's dispatch ceiling at one while another holder
+            // uses the shared host. This lets a resumed lease queue as well.
+            h.coordinator.maximum_in_flight = 1;
+            let held = GrantId::Bootstrap(host.next_bootstrap());
+            let hold = |now| {
+                host.try_admit(
+                    Reservation {
+                        id: held,
+                        path: RelativePath::root(),
+                        reads: 1,
+                        registrations: 0,
+                        operations: 0,
+                        ceiling: None,
+                        lease: 0,
+                        domain: None,
+                        origin: WorkOrigin::Background,
+                        listing: false,
+                    },
+                    now,
+                )
+                .unwrap();
+                host.try_start(held, now).unwrap();
+            };
+            if !resumed {
+                hold(h.now());
+            }
+            let command = if load { Command::Load(path("child")) } else { Command::Refresh(vec![path("child")]) };
+            let ticket = h.command(command);
+            let spent = if resumed {
+                let spent = h.coordinator.commands.get(&ticket.0).unwrap().admitted;
+                let job = h.pending_job_for("child").unwrap();
+                hold(h.now());
+                assert!(h.complete_job_with(
+                    job.id,
+                    JobResult::Listing(SessionStep::suspended(SessionCost {
+                        listing_operations: 1,
+                        ..Default::default()
+                    }))
+                ));
+                spent
+            } else {
+                Duration::ZERO
+            };
+            let queued = h.coordinator.jobs.values().find(|job| job.path == path("child")).unwrap();
+            assert_eq!(queued.phase, JobPhase::Queued);
+            let id = queued.id;
+            assert!(h.coordinator.commands.get(&ticket.0).unwrap().admitted > spent);
+            let ceiling = h.coordinator.config.foreground_ceiling_per_command;
+            h.coordinator.config.foreground_ceiling_per_command =
+                h.coordinator.commands.get(&ticket.0).unwrap().admitted;
+            h.coordinator.enforce_command_ceilings();
+            assert!(h.coordinator.commands.contains_key(&ticket.0), "a reversible hold cannot exhaust the command");
+            h.coordinator.config.foreground_ceiling_per_command = ceiling;
+            h.coordinator.cancel_job(id);
+            assert_eq!(
+                h.coordinator.commands.get(&ticket.0).unwrap().admitted,
+                spent,
+                "resumed={resumed}, load={load}"
+            );
+            assert_eq!(host.view(h.now()).preparations, 0);
+            assert_eq!(h.result(ticket), None);
+            host.release(held, h.now());
+            h.advance(Duration::ZERO);
+            h.run_until_idle();
+            assert_eq!(h.result(ticket), Some(Ok(())));
+            h.command(Command::Shutdown);
+            assert_eq!((scope.view().unwrap().prepared, scope.view().unwrap().physical), (0, 0));
+        }
+    }
+}
+
 fn scanned_coverage_pending(coordinator: &Coordinator) -> bool {
     coordinator.min_recon > ReconciliationGeneration::new(0)
         && coordinator.snapshot.loaded_directories().any(|dir| {

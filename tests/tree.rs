@@ -723,6 +723,63 @@ fn an_open_under_an_exhausted_bootstrap_allowance_waits_rather_than_bypassing() 
 }
 
 #[test]
+fn a_tree_queued_behind_host_capacity_wakes_when_another_holder_releases_it() {
+    let runtime = Arc::new(DeterministicRuntime::new());
+    let fs = Arc::new(FakeFileSystem::new(WatcherKind::None));
+    fs.mkdir("a");
+    let host = HostConfig { maximum_in_flight: 1, per_domain_concurrency: 1, ..Default::default() };
+    let governor = tree_fucker::HostGovernor::independent(&host);
+    let rt: Arc<dyn tree_fucker::runtime::Runtime> = runtime.clone();
+    let (handle, _stream) = runtime
+        .block_on(Tree::open_outside_host_governor(
+            fs.clone(),
+            fs.root().to_path_buf(),
+            Arc::new(LoadAll),
+            Config::default(),
+            rt,
+            governor.clone(),
+        ))
+        .expect("open");
+    runtime.block_on(handle.initial_scan_complete()).expect("scan");
+    let at = tree_fucker::core::MonotonicTime::ZERO;
+    let held = tree_fucker::core::GrantId::Bootstrap(governor.next_bootstrap());
+    governor
+        .try_admit(
+            tree_fucker::core::Reservation {
+                id: held,
+                path: path("."),
+                reads: 1,
+                registrations: 0,
+                operations: 0,
+                ceiling: None,
+                lease: 0,
+                domain: None,
+                origin: tree_fucker::core::WorkOrigin::Background,
+                listing: false,
+            },
+            at,
+        )
+        .expect("another holder is admitted");
+    governor.try_start(held, at).expect("another holder occupies the only physical slot");
+
+    let mut refresh = std::pin::pin!(handle.refresh(vec![path("a")]));
+    assert!(poll_once(refresh.as_mut()).is_pending());
+    runtime.run_until_stalled();
+    assert!(poll_once(refresh.as_mut()).is_pending(), "the refresh waits for the held slot");
+    let elapsed = runtime.elapsed();
+
+    governor.release(held, at);
+    runtime.run_until_stalled();
+    assert_eq!(runtime.elapsed(), elapsed);
+    assert_eq!(
+        poll_once(refresh.as_mut()),
+        std::task::Poll::Ready(Ok(())),
+        "RFC 6 and 12: a tree wakes on the governor change that frees capacity and starts its queued work before \
+         its own timer"
+    );
+}
+
+#[test]
 fn shutdown_keeps_reporting_a_stuck_worker_and_releases_its_slot_only_when_it_returns() {
     let inner = Arc::new(DeterministicRuntime::new());
     inner.set_blocking_mode(BlockingMode::Uninterruptible);

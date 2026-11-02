@@ -106,6 +106,8 @@ enum SessionSlot {
 pub struct Harness {
     pub fs: Arc<FakeFileSystem>,
     pub coordinator: Coordinator,
+    host: HostGovernor,
+    governor_seen: u64,
     now: MonotonicTime,
     injected: Duration,
     opened_at: std::time::Instant,
@@ -163,11 +165,15 @@ impl Harness {
         config.validate().map_err(Error::InvalidConfig)?;
         let root_info = fs.metadata(fs.root(), &RelativePath::root())?;
         let now = MonotonicTime::ZERO;
+        let host = governor.clone();
+        let governor_seen = host.changes();
         let mut coordinator = Coordinator::new(config, policy, fs.capabilities(), root_info, now, governor)?;
         let outputs = coordinator.take_outputs();
         let mut harness = Harness {
             fs,
             coordinator,
+            host,
+            governor_seen,
             now,
             injected: Duration::ZERO,
             opened_at: std::time::Instant::now(),
@@ -278,17 +284,27 @@ impl Harness {
     }
 
     fn feed(&mut self, input: Input) {
+        self.follow_governor();
         let now = self.now;
         let outputs = self.coordinator.handle(input, now);
         self.record_grants();
         self.process(outputs);
+        self.follow_governor();
     }
 
-    fn observe(&mut self) {
-        let now = self.now;
-        let outputs = self.coordinator.observe(now);
-        self.record_grants();
-        self.process(outputs);
+    fn follow_governor(&mut self) {
+        for _ in 0..MAXIMUM_STEPS {
+            let generation = self.host.changes();
+            if generation == self.governor_seen {
+                return;
+            }
+            self.governor_seen = generation;
+            let now = self.now;
+            let outputs = self.coordinator.observe(now);
+            self.record_grants();
+            self.process(outputs);
+        }
+        panic!("the governor changed {MAXIMUM_STEPS} times without settling");
     }
 
     fn record_grants(&mut self) {
@@ -760,7 +776,7 @@ impl Harness {
             before_step(self);
             if !self.step(target, &mut fired) {
                 self.advance_injected(target);
-                self.observe();
+                self.follow_governor();
                 if self.auto_register {
                     self.complete_registrations();
                 }
@@ -849,7 +865,7 @@ impl Harness {
             }
         }
         self.advance_injected(target);
-        self.observe();
+        self.follow_governor();
         self.settle(target);
     }
 

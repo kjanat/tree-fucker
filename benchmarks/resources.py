@@ -46,13 +46,11 @@ def main() -> None:
                     private = sum(
                         int(line.split()[1])
                         for line in smaps.splitlines()
-                        if line.startswith(
-                            (
-                                "Private_Clean:",
-                                "Private_Dirty:",
-                                "Private_Hugetlb:",
-                            )
-                        )
+                        if line.startswith((
+                            "Private_Clean:",
+                            "Private_Dirty:",
+                            "Private_Hugetlb:",
+                        ))
                     )
                     descriptors = redacted(
                         "\n".join(os.listdir(f"/proc/{process.pid}/fd"))

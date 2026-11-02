@@ -352,6 +352,13 @@ Abstract
    and similar values are metadata. They MAY be stored, diffed, and
    published.
 
+   The portable metadata model includes optional permission bits, not ACL
+   payloads or effective-access decisions. Adapters MUST return unavailable
+   when a permission-bit representation is not meaningful. Native ACLs,
+   principals, inheritance rules, and authorization checks remain owned by
+   the adapter or application; they MUST NOT be flattened into a claim of
+   portable access rights. The core does not fetch ACLs during enumeration.
+
    Metadata MUST NOT be treated as proof of directory contents.
    In particular, equality of modification times MUST NOT suppress a
    required directory listing.
@@ -374,8 +381,9 @@ Abstract
 
    Coordinator
       Owns mutable synchronization state. It receives commands, watcher
-      hints, timer notifications, and completed filesystem jobs. It is
-      the only component allowed to publish a new snapshot.
+      hints, timer notifications, and completed filesystem jobs. A tree
+      wakes when its process governor changes. It is the only component
+      allowed to publish a new snapshot.
 
    Snapshot store
       Holds the current immutable snapshot and its monotonically
@@ -1448,6 +1456,16 @@ Abstract
    benchmarks and SHOULD reuse metadata the listing already obtains.
    Platform guidance appears in Section 14.3.
 
+   Protocol-native clients implement the same FileSystem interface as
+   operating-system adapters. DeclaredProbe supplies established domain
+   identity and capabilities; it does not discover protocol semantics.
+   A protocol adapter MUST account for every physical request, respect
+   listing leases and result ceilings, and report incomplete enumeration
+   as failure. Unknown metadata remains unavailable. Notification loss
+   uses the recovery contract in Section 11.6. Protocol transports,
+   credentials, ACL payloads, and connection pools remain adapter-owned;
+   the core does not select or bundle a protocol client.
+
 10.4.  Watcher Capabilities
 
    Watcher capabilities are declared per storage domain and answer:
@@ -1846,6 +1864,22 @@ Abstract
    requirement. Repeated overflow notifications coalesce into the newest
    required generation.
 
+   A backend with a subtree rescan requirement emits Rescan with the
+   root-relative affected path. This is distinct from an ordinary path
+   hint: refreshing that directory alone cannot repair missed descendants.
+   The core conservatively applies the same whole-tree coverage barrier
+   as Overflow, including when the reported path is absent or unloaded.
+   Only loaded directories require reconciliation; the event does not
+   force excluded or unloaded subtrees to load. This avoids unbounded
+   per-path recovery state and shares the existing baseline scheduler.
+
+   Dropped hints increment the dropped-hint counter and set reconciliation
+   coverage_pending until newer accepted listings repair coverage. Event
+   loss alone MUST NOT mark a functioning watcher backend as failed or
+   restart its registrations. Watcher degradation denotes registration or
+   backend failure; reconciliation degradation denotes failed reads or a
+   degraded completed round. Pending coverage is reported independently.
+
    Implementations MAY accelerate this work by assigning greater baseline
    weight, but MUST preserve configured admission and concurrency bounds.
 
@@ -2214,12 +2248,16 @@ Abstract
    quarantined domain is resolved Unsatisfied when the cursor reaches
    it, so the round can end and healthy domains keep receiving baseline
    coverage. Jobs already admitted on the quarantined domain that have
-   not started are cancelled so the closed batch can complete. The
-   round result for a quarantined obligation is Degraded; the quarantine
-   adds no path to the degraded set, and the domain's resource state
-   names StuckWorker as the cause. A dead mount therefore costs exactly
-   the workers that were already inside it when it died, never more, and
-   degrades one domain instead of exhausting the host's blocking pool.
+   not started are cancelled so the closed batch can complete, and so
+   is a suspended listing session whose next lease the quarantine
+   denies. Cancellation leaves attached commands open. Each cancelled
+   read is requested again and is admitted once the quarantine lifts.
+   The round result for a quarantined obligation is Degraded; the
+   quarantine adds no path to the degraded set, and the domain's
+   resource state names StuckWorker as the cause. A dead mount therefore
+   costs exactly the workers that were already inside it when it died,
+   never more, and degrades one domain instead of exhausting the host's
+   blocking pool.
 
 13.6.  Capacity Exhaustion
 
@@ -2595,7 +2633,12 @@ Abstract
    window and in the global in-flight limit and still counts against the
    memory ceiling. Exhausting the foreground allowance queues the
    command's reads; it neither fails the command nor borrows from the
-   background buckets. Section 9 places no wall-clock bound on command
+   background buckets. A dispatch cycle that finds one allowance
+   exhausted still admits, in that cycle, the work the other allowance
+   affords. This applies to global and per-domain allowances, including
+   shared-authority denials. A denial in one domain and origin MUST NOT
+   suppress another origin's admission on that domain or another domain's
+   available capacity. Section 9 places no wall-clock bound on command
    completion.
 
    Each command additionally has a ceiling on the worker time its reads
@@ -2607,6 +2650,12 @@ Abstract
    overshoot it. When a required read remains after the ceiling is
    reached, the command fails with ResourceLimited under Section 13.1;
    this is a terminal outcome, not throttling with a resume time.
+
+   A reversible shared preparation holds part of the command's ceiling
+   without exhausting it. Cancelling that preparation returns only the
+   unstarted lease's hold. Earlier physical leases and their overshoot
+   remain charged; retrying cancelled work MUST NOT charge the abandoned
+   preparation again.
 
    Priority directories, policy invalidation, and root recovery are
    background work. They change which directory is read next. They do
@@ -2751,6 +2800,16 @@ Abstract
    that runs several processes using this library relies on operating
    system mechanisms to bound their aggregate; the library reports its
    own accounting so that such mechanisms can be configured.
+
+15.9.1.  Opt-In Coordination Extension
+
+   The cross-process extension is specified in coordination.md beside
+   this RFC. It defines a separate shared admission authority while
+   preserving the process-only default and the ownership rules in
+   Sections 10, 13.5, and 15.1 through 15.4. Its acceptance evidence
+   extends the observability and test requirements in Sections 16 and
+   17.5. The extension is under implementation; this reference does not
+   claim that a shared backend or platform support has shipped.
 
 
 16.  Observability

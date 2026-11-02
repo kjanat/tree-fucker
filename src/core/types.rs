@@ -364,8 +364,9 @@ pub struct ActiveJob {
     pub cancel: crate::fs::CancellationToken,
     pub leases: u32,
     pub permitted: u32,
-    pub starved: bool,
+    pub needs_operations: bool,
     pub session_open: bool,
+    pub confirming: bool,
     pub registration: Option<super::WatchScope>,
     pub enrichment: Option<EnrichmentProgress>,
 }

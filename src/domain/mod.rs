@@ -67,6 +67,15 @@ impl StorageDomainId {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn unique_mount(self) -> Option<u64> {
+        let interned = INTERNED_DOMAINS.lock().unwrap_or_else(|error| error.into_inner());
+        interned.iter().find_map(|(key, id)| match (id == &self, &key.0) {
+            (true, Key::LinuxUniqueMount(mount)) => Some(*mount),
+            _ => None,
+        })
+    }
 }
 
 impl fmt::Display for StorageDomainId {

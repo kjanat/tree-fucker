@@ -13,9 +13,9 @@ impl Coordinator {
                     self.on_hint(path, kind);
                 }
             }
-            WatcherEvent::Overflow => self.coverage_invalidate(),
+            WatcherEvent::Overflow | WatcherEvent::Rescan { .. } => self.coverage_invalidate(),
             WatcherEvent::Dropped { count } => {
-                self.dropped_hints += count;
+                self.dropped_hints = self.dropped_hints.saturating_add(count);
                 self.coverage_invalidate();
             }
             WatcherEvent::Failed { message, path } => self.on_watcher_failed(message, path),
@@ -72,7 +72,7 @@ impl Coordinator {
         };
         let watcher_pending = self.pending.values().filter(|p| p.reasons.watcher).count();
         if watcher_pending >= self.config.watcher_path_limit {
-            self.dropped_hints += 1;
+            self.dropped_hints = self.dropped_hints.saturating_add(1);
             self.coverage_invalidate();
             return;
         }
@@ -169,7 +169,10 @@ impl Coordinator {
                     if self.governor.try_admit(reservation, now).is_err() {
                         return true;
                     }
-                    self.governor.start(self.registration_grant(request), now);
+                    if self.governor.try_start(self.registration_grant(request), now).is_err() {
+                        self.governor.release(self.registration_grant(request), now);
+                        return true;
+                    }
                     self.hold_watch_path(id);
                     self.blocking_slots.insert(
                         super::SlotOwner::WatchRegistration(request),

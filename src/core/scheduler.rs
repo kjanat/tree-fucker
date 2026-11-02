@@ -10,7 +10,21 @@ use crate::domain::StorageDomainId;
 use crate::entry::{LoadState, Shape};
 use crate::fs::{CancellationToken, Lease};
 use crate::ids::*;
-use crate::update::{RoundResult, ShutdownState};
+use crate::update::{RoundResult, ShutdownState, ThrottleCause};
+
+fn governed_work(need: ReadNeed) -> crate::coordination::protocol::Work {
+    use crate::coordination::protocol::Work;
+    match need {
+        ReadNeed::Domain => Work::DomainDiscovery,
+        ReadNeed::Listing => Work::Listing,
+        ReadNeed::Metadata | ReadNeed::Enrichment(_) => Work::Enrichment,
+    }
+}
+
+fn exhaust(exhausted: &mut BTreeSet<WorkOrigin>, origin: WorkOrigin) -> bool {
+    exhausted.insert(origin);
+    [WorkOrigin::Background, WorkOrigin::Foreground].iter().all(|origin| exhausted.contains(origin))
+}
 
 impl Coordinator {
     pub(super) fn maybe_dispatch(&mut self) {
@@ -43,15 +57,16 @@ impl Coordinator {
         if contended {
             self.dispatch_rotation = self.dispatch_rotation.wrapping_add(1);
         }
+        let mut exhausted: BTreeSet<WorkOrigin> = BTreeSet::new();
         let mut granting = true;
         if baseline_first && baseline_slots > 0 {
-            granting = self.admit_baseline(baseline_slots, &mut members);
+            granting = self.admit_baseline(baseline_slots, &mut members, &mut exhausted);
         }
         if granting && expedited_slots > 0 {
-            granting = self.admit_expedited(expedited_slots, expedited, &mut members);
+            granting = self.admit_expedited(expedited_slots, expedited, &mut members, &mut exhausted);
         }
         if granting && !baseline_first && baseline_slots > 0 {
-            self.admit_baseline(baseline_slots, &mut members);
+            self.admit_baseline(baseline_slots, &mut members, &mut exhausted);
         }
         if periodic {
             self.baseline_due = false;
@@ -101,7 +116,6 @@ impl Coordinator {
             ReadNeed::Metadata | ReadNeed::Listing | ReadNeed::Enrichment(_) => entry.and_then(|e| self.domain_of(e)),
         };
         let origin = self.origin_of(entry, barriers);
-        let now = self.now;
         let reservation = Reservation {
             id: self.job_grant(id),
             path: path.clone(),
@@ -114,14 +128,14 @@ impl Coordinator {
             origin,
             listing: need == ReadNeed::Listing,
         };
-        match self.governor.try_admit(reservation, now) {
+        match self.admit_with_command_ceiling(reservation, governed_work(need), barriers) {
             Ok(admitted) => {
                 self.next_job_id = id.next();
                 Ok(JobGrant { id, registration, domain, origin, cost: admitted.cost, operations: admitted.operations })
             }
             Err(_) => match self.governor.global_exhausted(domain, origin) {
-                true => Err(Denied::Globally),
-                false => Err(Denied::OnDomain(domain)),
+                true => Err(Denied::Globally(origin)),
+                false => Err(Denied::OnDomain(domain, origin)),
             },
         }
     }
@@ -150,11 +164,11 @@ impl Coordinator {
         need: ReadNeed,
         scope: &EnrichmentScope,
         cursor: usize,
-        starved: bool,
+        needs_operations: bool,
     ) -> u32 {
         let maximum = u32::try_from(self.config.operations_per_lease).unwrap_or(u32::MAX).max(1);
         match need {
-            ReadNeed::Listing => match starved || self.observation_costs_per_child(entry) {
+            ReadNeed::Listing => match needs_operations || self.observation_costs_per_child(entry) {
                 true => maximum,
                 false => 0,
             },
@@ -164,6 +178,27 @@ impl Coordinator {
                 maximum.min(remaining.max(1))
             }
             ReadNeed::Metadata | ReadNeed::Domain => 0,
+        }
+    }
+
+    fn admit_with_command_ceiling(
+        &mut self,
+        mut reservation: Reservation,
+        work: crate::coordination::protocol::Work,
+        barriers: &[CommandId],
+    ) -> Result<super::governor::Admitted, ThrottleCause> {
+        loop {
+            let result = self.governor.try_admit_work(reservation.clone(), work, self.now);
+            let Err(ThrottleCause::CommandCeiling { required }) = result else { return result };
+            self.finish_commands_below_cost(barriers, required, reservation.domain);
+            let Some(remaining) = self.command_ceiling(barriers) else { return result };
+            // A coalesced command with more budget can still fund this work.
+            // Retry only after removing a stricter command actually raised
+            // the ceiling, so an unchanged denial cannot spin.
+            if Some(remaining) <= reservation.ceiling {
+                return result;
+            }
+            reservation.ceiling = Some(remaining);
         }
     }
 
@@ -193,7 +228,6 @@ impl Coordinator {
                 self.finish_job(id, JobOutcome::Stale);
                 continue;
             }
-            let now = self.now;
             let lease = job.leases;
             let domain = job.domain;
             let cursor = job.enrichment.as_ref().map(|progress| progress.cursor).unwrap_or(0);
@@ -203,15 +237,24 @@ impl Coordinator {
                 path: job.path.clone(),
                 reads: 1,
                 registrations: 0,
-                operations: self.requested_operations(job.entry(), job.need, &scope, cursor, job.starved),
+                operations: if job.confirming {
+                    0
+                } else {
+                    self.requested_operations(job.entry(), job.need, &scope, cursor, job.needs_operations)
+                },
                 ceiling: self.command_ceiling(&job.barriers),
                 lease,
                 domain,
                 origin: job.origin,
-                listing: job.need == ReadNeed::Listing,
+                listing: job.need == ReadNeed::Listing && !job.confirming,
             };
-            let admitted = match self.governor.try_admit(reservation, now) {
+            let work = if job.confirming { governed_work(ReadNeed::Metadata) } else { governed_work(job.need) };
+            let admitted = match self.admit_with_command_ceiling(reservation, work, &job.barriers) {
                 Ok(admitted) => admitted,
+                Err(ThrottleCause::StuckWorker) => {
+                    self.cancel_job(id);
+                    continue;
+                }
                 Err(_) => continue,
             };
             let barriers = job.barriers.clone();
@@ -232,6 +275,9 @@ impl Coordinator {
     }
 
     fn work_for(&self, job: &ActiveJob) -> Work {
+        if job.confirming {
+            return Work::Metadata;
+        }
         match job.need {
             ReadNeed::Listing => Work::Listing(ListingWork {
                 lease: Lease {
@@ -422,9 +468,14 @@ impl Coordinator {
         self.round = Some(Round { generation, barrier, obligations, index, cursor: 0, started: self.now });
     }
 
-    fn admit_baseline(&mut self, slots: usize, members: &mut HashSet<JobId>) -> bool {
+    fn admit_baseline(
+        &mut self,
+        slots: usize,
+        members: &mut HashSet<JobId>,
+        exhausted: &mut BTreeSet<WorkOrigin>,
+    ) -> bool {
         let mut remaining = slots;
-        let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
+        let mut denied: BTreeSet<(Option<StorageDomainId>, WorkOrigin)> = BTreeSet::new();
         let mut quarantined: std::collections::HashMap<Option<StorageDomainId>, bool> =
             std::collections::HashMap::new();
         let mut index = match self.round.as_ref() {
@@ -515,17 +566,21 @@ impl Coordinator {
                 }
                 continue;
             }
-            if denied.contains(&domain) {
-                continue;
-            }
             let barriers =
                 self.pending.get(&obligation.entry).map(|request| request.barriers.clone()).unwrap_or_default();
+            let origin = self.origin_of(Some(obligation.entry), &barriers);
+            if denied.contains(&(domain, origin)) || exhausted.contains(&origin) {
+                continue;
+            }
             let grant = match self.try_grant_on(Some(obligation.entry), ReadNeed::Listing, &obligation.path, &barriers)
             {
                 Ok(grant) => grant,
-                Err(Denied::Globally) => return false,
-                Err(Denied::OnDomain(domain)) => {
-                    denied.insert(domain);
+                Err(Denied::Globally(origin)) => match exhaust(exhausted, origin) {
+                    true => return false,
+                    false => continue,
+                },
+                Err(Denied::OnDomain(domain, origin)) => {
+                    denied.insert((domain, origin));
                     continue;
                 }
             };
@@ -564,7 +619,13 @@ impl Coordinator {
         }
     }
 
-    fn admit_expedited(&mut self, slots: usize, ready: Vec<Ready>, members: &mut HashSet<JobId>) -> bool {
+    fn admit_expedited(
+        &mut self,
+        slots: usize,
+        ready: Vec<Ready>,
+        members: &mut HashSet<JobId>,
+        exhausted: &mut BTreeSet<WorkOrigin>,
+    ) -> bool {
         let mut by_class: [Vec<Ready>; 5] = Default::default();
         for candidate in ready {
             let id = candidate.entry();
@@ -628,7 +689,7 @@ impl Coordinator {
             }
         }
         self.class_rotation = (rotation + 1) % 5;
-        let mut denied: BTreeSet<Option<StorageDomainId>> = BTreeSet::new();
+        let mut denied: BTreeSet<(Option<StorageDomainId>, WorkOrigin)> = BTreeSet::new();
         for step in 0..5 {
             let i = (rotation + step) % 5;
             let mut take = quota[i];
@@ -672,14 +733,22 @@ impl Coordinator {
                     continue;
                 };
                 let id = candidate.entry();
-                if denied.contains(&self.domain_of(id)) {
+                let domain = match request.need {
+                    ReadNeed::Domain => None,
+                    _ => self.domain_of(id),
+                };
+                let origin = self.origin_of(Some(id), &request.barriers);
+                if denied.contains(&(domain, origin)) || exhausted.contains(&origin) {
                     continue;
                 }
                 let grant = match self.try_grant_on(Some(id), request.need, &request.path, &request.barriers) {
                     Ok(grant) => grant,
-                    Err(Denied::Globally) => return false,
-                    Err(Denied::OnDomain(domain)) => {
-                        denied.insert(domain);
+                    Err(Denied::Globally(origin)) => match exhaust(exhausted, origin) {
+                        true => return false,
+                        false => continue,
+                    },
+                    Err(Denied::OnDomain(domain, origin)) => {
+                        denied.insert((domain, origin));
                         continue;
                     }
                 };
@@ -767,8 +836,9 @@ impl Coordinator {
             cancel: CancellationToken::new(),
             leases: 1,
             permitted: grant.operations,
-            starved: false,
+            needs_operations: false,
             session_open: false,
+            confirming: false,
             registration,
             enrichment: match request.need {
                 ReadNeed::Enrichment(_) => Some(EnrichmentProgress::default()),
@@ -883,7 +953,17 @@ impl Coordinator {
                 continue;
             }
             let now = self.now;
-            self.governor.start(self.job_grant(id), now);
+            match self.governor.try_start(self.job_grant(id), now) {
+                Ok(()) => {}
+                Err(ThrottleCause::StuckWorker) => {
+                    self.cancel_job(id);
+                    continue;
+                }
+                Err(_) => {
+                    deferred.push(id);
+                    continue;
+                }
+            }
             let registration = self.jobs.get_mut(&id).and_then(|job| job.registration.take());
             match registration {
                 Some(scope) => self.register_before_listing(id, scope, now),
@@ -893,7 +973,7 @@ impl Coordinator {
                     };
                     let work = self.work_for(job);
                     if let Some(job) = self.jobs.get_mut(&id) {
-                        job.phase = JobPhase::Running(now);
+                        job.phase = if job.confirming { JobPhase::Confirming(now) } else { JobPhase::Running(now) };
                     }
                     self.dispatch_job(id, work);
                 }
@@ -1021,8 +1101,8 @@ type RelativePathOwned = crate::path::RelativePath;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Denied {
-    Globally,
-    OnDomain(Option<StorageDomainId>),
+    Globally(WorkOrigin),
+    OnDomain(Option<StorageDomainId>, WorkOrigin),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
