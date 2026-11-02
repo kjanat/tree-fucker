@@ -9,14 +9,17 @@ try {
 	if ($phase -ne 'windows_after_reboot' -or !(Test-Path "$env:TF_POWER_ROOT\verified")) { throw 'Missing post-reboot verification' }
 	$sessions = & C:\OEM\sessions.ps1
 	if ($sessions.status -ne 'passed') { throw 'Missing real-session verification' }
-	$result = @{ status = 'passed'; phase = $phase; log = (Get-Content $log -Raw); sessions = $sessions }
+	# Windows PowerShell 5.1 serializes provider metadata attached by
+	# Get-Content. Read plain strings so reports contain only fixture output.
+	$result = @{ status = 'passed'; phase = $phase; log = [System.IO.File]::ReadAllText($log); sessions = $sessions }
 }
 catch {
-	$result = @{ status = 'failed'; phase = $phase; error = $_.ToString(); log = (Get-Content $log -Raw -ErrorAction SilentlyContinue) }
+	$result = @{ status = 'failed'; phase = $phase; error = $_.ToString(); stack = $_.ScriptStackTrace }
+	if (Test-Path $log) { $result.log = [System.IO.File]::ReadAllText($log) }
 	if (Test-Path 'C:\coordination-sessions') {
 		$result.sessionLogs = @{}
 		foreach ($sessionLog in Get-ChildItem 'C:\coordination-sessions\*.log') {
-			$result.sessionLogs[$sessionLog.Name] = Get-Content $sessionLog.FullName -Raw
+			$result.sessionLogs[$sessionLog.Name] = [System.IO.File]::ReadAllText($sessionLog.FullName)
 		}
 	}
 }

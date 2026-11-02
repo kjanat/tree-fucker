@@ -232,9 +232,10 @@ def main() -> None:
                         raise RuntimeError(
                             f"Guest exited {process.returncode} without a readable result"
                         )
-                    outcome.update(
-                        json.loads(redacted(recovered.stdout.decode("utf-8-sig")))
-                    )
+                    recovered_text = redacted(recovered.stdout.decode("utf-8-sig"))
+                    # Keep diagnostics even when the guest's report is malformed.
+                    (root / "recovered-result.log").write_text(recovered_text)
+                    outcome.update(json.loads(recovered_text))
                     (root / "result.json").write_text(
                         json.dumps(outcome, indent=2) + "\n"
                     )
