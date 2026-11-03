@@ -184,8 +184,6 @@ The implementation and tests are intended to follow the RFC rather than leave im
 
 See [CONTRIBUTING.md](https://github.com/kjanat/tree-fucker/blob/master/CONTRIBUTING.md) for development setup, checks, package verification, and benchmarks.
 
-The [release process](https://github.com/kjanat/tree-fucker/blob/master/RELEASING.md) uses Beepboop to prepare a version PR, approve an exact commit, and dispatch verified crates.io and GitHub publication.
-
 ## Name
 
 Yes, the crate is called `tree-fucker`.

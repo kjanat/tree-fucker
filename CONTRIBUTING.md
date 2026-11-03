@@ -2,6 +2,8 @@
 
 The normative contract is [`rfc/tree-fucker.txt`](rfc/tree-fucker.txt). Changes to observable behavior should keep the implementation, regression tests, and RFC consistent. The [README](README.md) describes the consumer API and compatibility policy.
 
+The [release process](RELEASING.md) uses Beepboop to prepare a version PR, approve an exact commit, and dispatch verified crates.io and GitHub publication. Its credential setup and retry behavior are documented separately from development checks.
+
 ## Development setup
 
 The repository selects rolling Rust nightly through `rust-toolchain.toml` and includes `rustfmt`, Clippy, and `rust-analyzer`. The library itself supports the stable compiler stated in `Cargo.toml`; nightly is for repository development.
