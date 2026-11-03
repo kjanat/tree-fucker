@@ -95,6 +95,31 @@ jobs:
           sudo "${test_executable}" privileged_ --ignored --nocapture
       - run: cargo doc --no-deps --all-features
 
+  package:
+    name: packaged consumers (Rust 1.99.1 and stable)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: "${{ github.event_name != 'pull_request' }}" }
+      - name: Package, dry-run publication, and exercise stable consumers
+        run: python3 tests/package/verify.py --toolchain stable
+      - name: Exercise release-baseline consumers
+        shell: bash
+        run: python3 tests/package/verify.py --toolchain 1.99.1 --archive target/package/tree-fucker-*.crate
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crate-candidate
+          path: |
+            target/package/*.crate
+            target/package/files.txt
+          if-no-files-found: error
+
   freebsd:
     name: freebsd-15
     if: github.event.repository.visibility == 'public'
