@@ -37,6 +37,12 @@ jobs:
         run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --no-fail-fast
+      - name: Repeat the parallel macOS suite
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          for iteration in {1..2}; do
+            cargo test --all-features --no-fail-fast
+          done
       - name: Repeat native interrupted initialization
         if: startsWith(matrix.os, 'macos-')
         run: |

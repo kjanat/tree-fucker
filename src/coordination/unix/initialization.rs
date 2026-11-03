@@ -4,6 +4,7 @@
 #[path = "../../../tests/coordination_support/fifo.rs"]
 mod native_fifo;
 
+use std::assert_matches;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -129,6 +130,59 @@ fn killed_initial_journal_writers_recover_the_pinned_generation() {
     crash_initialization(true);
 }
 
+#[test]
+fn duplicated_bookkeeping_description_does_not_retain_initialization_exclusion() {
+    for partial in [false, true] {
+        let fixture = tempfile::tempdir_in(platform::RENDEZVOUS).unwrap();
+        let path = fixture.path().join("scope");
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let root = File::open(&path).unwrap();
+        let parent = File::open(fixture.path()).unwrap();
+        let context = Context::current().unwrap();
+        let anchor = open_file(&parent, OsStr::new("scope.authority.lock"), true, context.uid).unwrap();
+        let state = open_file(&root, OsStr::new(STATE), true, context.uid).unwrap();
+        let state_identity = identity(&state.metadata().unwrap());
+        if partial {
+            anchor.set_len((HEADER_SIZE - 1) as u64).unwrap();
+        }
+        // A dup retains the same flock reference as a descriptor inherited by
+        // a concurrently spawned process, without depending on spawn timing.
+        let duplicate = anchor.try_clone().unwrap();
+        let result = bookkeeping(&anchor, || {
+            let mut journal = initialize(&root, &anchor, context, config())?;
+            Ok(journal.load()?.ledger().generation())
+        });
+        drop(anchor);
+        let reopened = Scope::open(&path, config());
+        if partial {
+            assert_matches!(result, Err(Error::Replaced));
+            assert_matches!(reopened.err(), Some(Error::Replaced));
+            assert_eq!(fs::read(fixture.path().join("scope.authority.lock")).unwrap(), vec![0; HEADER_SIZE - 1]);
+            assert_eq!(state.metadata().unwrap().len(), 0);
+        } else {
+            assert_eq!(reopened.unwrap().generation, result.unwrap());
+        }
+        assert_eq!(identity(&fs::metadata(path.join(STATE)).unwrap()), state_identity);
+        drop(duplicate);
+    }
+}
+
+#[test]
+fn duplicated_bookkeeping_description_does_not_retain_exclusion_after_unwind() {
+    let independent = tempfile::NamedTempFile::new_in(platform::RENDEZVOUS).unwrap();
+    // Use two independently opened descriptions of the same inode.
+    let anchor = independent.reopen().unwrap();
+    let duplicate_anchor = anchor.try_clone().unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let _ = bookkeeping(&anchor, || -> Result<(), Error> { panic!("interrupted initialization") });
+    });
+    assert!(result.is_err());
+    drop(anchor);
+    exclusive(independent.as_file()).unwrap();
+    flock(independent.as_file(), FlockOperation::Unlock).unwrap();
+    drop(duplicate_anchor);
+}
+
 fn kill_writer(root: &Path, index: usize, journal: bool) {
     let mut writer = Writer(
         Command::new(std::env::current_exe().unwrap())
@@ -164,6 +218,7 @@ fn kill_writer(root: &Path, index: usize, journal: bool) {
             Err(error) => panic!("cut {index}, journal {journal}: writer exclusion did not release: {error:?}"),
         }
     }
+    flock(&anchor, FlockOperation::Unlock).unwrap();
     drop(anchor);
     fs::remove_file(root.join("paused")).unwrap();
 }
