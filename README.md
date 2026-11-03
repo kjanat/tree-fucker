@@ -29,7 +29,7 @@ The normative behaviour is specified in [`rfc/tree-fucker.txt`](rfc/tree-fucker.
 
 ## Quick start
 
-Consumers require Rust 1.99.1 or newer. Nightly is used for repository development tooling, not by the library. With Tokio integration:
+Consumers require Rust 1.99.1 or newer. With Tokio integration:
 
 ```toml
 [dependencies]
@@ -180,33 +180,14 @@ The RFC is the contract:
 
 The implementation and tests are intended to follow the RFC rather than leave important consistency or resource-safety behaviour implicit in code.
 
-## Development
+## Contributing
 
-The repository selects rolling Rust nightly for development and includes `rustfmt`, Clippy, and `rust-analyzer` components.
-
-Typical checks:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features
-cargo test --all-features
-cargo doc --no-deps --all-features
-```
-
-The RFC site tooling uses Bun.
-
-```sh
-bun install
-```
-
-See the workflows in [`.github/workflows`](.github/workflows) for the platform matrix and site build used by CI.
+See [CONTRIBUTING.md](https://github.com/kjanat/tree-fucker/blob/master/CONTRIBUTING.md) for development setup, checks, package verification, and benchmarks.
 
 ## Name
 
 Yes, the crate is called `tree-fucker`.
 
-## Performance probes
-
-The [benchmark guide](https://github.com/kjanat/tree-fucker/blob/master/benchmarks/README.md) documents `cargo bench:layers` and `cargo bench:alloc` for raw Scan, anchor budgets, path materialization, allocation counts and profiling. Both probes run correctness smoke checks in CI.
+## Performance
 
 Shared coordination trades extra CPU, allocation, and filesystem transactions for cross-process resource safety. It is not an automatic traversal speedup. Historical Linux measurements show the largest relative overhead for cheap cached reads, much smaller relative overhead for slow filesystem calls, and zero authority access while idle. See the [recorded baseline and optimizations](https://github.com/kjanat/tree-fucker/blob/master/benchmarks/coordination-baseline.md); these are historical results, not measurements of every release. Process-only governance remains the default.
