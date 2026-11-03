@@ -107,6 +107,8 @@ jobs:
         run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
       - name: Package, dry-run publication, and exercise stable consumers
         run: python3 tests/package/verify.py --toolchain stable
+      - name: Check release publication gates
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Exercise release-baseline consumers
         shell: bash
         run: python3 tests/package/verify.py --toolchain 1.99.1 --archive target/package/tree-fucker-*.crate

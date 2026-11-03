@@ -2,22 +2,37 @@
 	"$schema": "https://beepboop.kjanat.dev/schema/v1.json",
 	"managers": [
 		"cargo",
-		"npm",
+		"github-release",
 		"workflow"
 	],
 	"streams": {
 		"main": {
 			"versioning": "workspace",
+			"packages": ["cargo:tree-fucker"],
 			"prepare": {
-				"version": "manual"
+				"version": "manual",
+				"strategy": "managed",
+				"workflow": {
+					"file": "release-prepare.yml",
+					"ref": "master",
+					"mode": "dispatch"
+				}
 			},
 			"promote": {
-				"approval": "required"
+				"approval": "required",
+				"workflow": {
+					"file": "release.yml",
+					"ref": "master",
+					"mode": "dispatch",
+					"publications": ["cargo:tree-fucker", "github-release:kjanat/tree-fucker"],
+					"refs": { "phase": "version", "prefix": "v" }
+				}
 			},
 			"workflows": {},
+			"credentials": ["crates-io"],
 			"required": [
 				"cargo:tree-fucker",
-				"npm:rfc"
+				"github-release:kjanat/tree-fucker"
 			]
 		}
 	}
