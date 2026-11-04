@@ -15,10 +15,12 @@ env:
 concurrency: { group: release-publish, cancel-in-progress: false }
 
 jobs:
-  publish:
+  authorize:
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    permissions: { contents: write, actions: read, id-token: write }
+    timeout-minutes: 5
+    permissions: { contents: read, actions: read, id-token: write }
+    outputs:
+      context: ${{ steps.release.outputs.context }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -29,23 +31,33 @@ jobs:
           operation: promote
       - uses: actions/checkout@v7
         with:
-          ref: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Fetch the approved source commit
+        env:
+          SOURCE_SHA: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
+        run: git fetch --no-tags --depth=1 origin "${SOURCE_SHA}"
       - name: Require the approved version, signed commit, and successful CI
         env:
           RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
-        run: python3 scripts/release.py check
+        run: python3 -I scripts/release.py check
+
+  package:
+    needs: authorize
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
+          persist-credentials: false
       - name: Install Rust toolchains
         run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
       - name: Verify the release archive and stable consumers
         run: python3 tests/package/verify.py --toolchain stable
       - name: Verify release-baseline consumers
         run: python3 tests/package/verify.py --toolchain 1.99.1 --archive target/package/tree-fucker-*.crate
-      - name: Check publication identity and retry state
-        id: candidate
-        env:
-          RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
-        run: python3 scripts/release.py candidate
       - uses: actions/upload-artifact@v7
         with:
           name: release-crate
@@ -53,6 +65,34 @@ jobs:
             target/package/*.crate
             target/package/files.txt
           if-no-files-found: error
+
+  publish:
+    needs: [authorize, package]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions: { contents: write, actions: read, id-token: write }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_CONTEXT: ${{ needs.authorize.outputs.context }}
+      BEEPBOOP_EXECUTION_ID: ${{ inputs.beepboop_execution_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Fetch the approved source commit
+        env:
+          SOURCE_SHA: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
+        run: git fetch --no-tags --depth=1 origin "${SOURCE_SHA}"
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-crate
+          path: target/package
+      - name: Recheck the approved commit and CI
+        run: python3 -I scripts/release.py check
+      - name: Check publication identity and retry state
+        id: candidate
+        run: python3 -I scripts/release.py candidate
       - uses: kjanat/beepboop/actions/credentials@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
         if: steps.candidate.outputs.publish == 'true'
         id: credentials
@@ -62,12 +102,10 @@ jobs:
         if: steps.candidate.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ fromJSON(steps.credentials.outputs.values)['crates-io'] }}
-        run: cargo +nightly publish --locked
+        run: python3 -I scripts/release.py publish
       - name: Verify the registry checksum
         id: crate
-        env:
-          RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
-        run: python3 scripts/release.py crate-report
+        run: python3 -I scripts/release.py crate-report
       - uses: kjanat/beepboop/actions/report@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
         with:
           publications: ${{ steps.crate.outputs.publications }}
@@ -82,15 +120,13 @@ jobs:
         if: steps.candidate.outputs.github-release == 'false'
         env:
           TAG: ${{ steps.candidate.outputs.tag }}
-          SOURCE_SHA: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
+          SOURCE_SHA: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
           PRERELEASE: "${{ case(steps.candidate.outputs.prerelease == 'true', '--prerelease', '') }}"
         run: gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag
           --target "${SOURCE_SHA}" --title "${TAG}" --generate-notes ${{ env.PRERELEASE }}
       - name: Verify the published release and tag
         id: github
-        env:
-          RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
-        run: python3 scripts/release.py github-report
+        run: python3 -I scripts/release.py github-report
       - uses: kjanat/beepboop/actions/report@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
         with:
           publications: ${{ steps.github.outputs.publications }}

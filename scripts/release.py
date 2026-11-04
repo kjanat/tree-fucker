@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import subprocess
 import tarfile
 import urllib.error
@@ -52,14 +53,16 @@ def validate_context(context, package, head, repository, repository_id):
 
 def context_from_checkout():
     context = json.loads(os.environ["RELEASE_CONTEXT"])
-    package = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=30
-    ).strip()
+    sha = context["sourceSha"]
+    require(re.fullmatch(r"[a-f0-9]{40}", sha), "Invalid source commit")
+    manifest = subprocess.check_output(
+        ["git", "show", f"{sha}:Cargo.toml"], cwd=ROOT, text=True, timeout=30
+    )
+    package = tomllib.loads(manifest)["package"]
     validate_context(
         context,
         package,
-        head,
+        sha,
         os.environ["GITHUB_REPOSITORY"],
         os.environ["GITHUB_REPOSITORY_ID"],
     )
@@ -113,6 +116,109 @@ def archive_digest(archive, context):
     )
     with archive.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def publication_metadata(archive, context):
+    prefix = f"{CRATE}-{context['version']}"
+    with tarfile.open(archive) as source:
+
+        def read(name):
+            member = source.getmember(f"{prefix}/{name}")
+            require(member.isfile(), "Package metadata must be a regular file")
+            with source.extractfile(member) as file:
+                return file.read().decode()
+
+        manifest = tomllib.loads(read("Cargo.toml"))
+        package = manifest["package"]
+        readme = package.get("readme")
+        metadata = {
+            "name": package["name"],
+            "vers": package["version"],
+            "deps": [],
+            "features": manifest.get("features", {}),
+            "authors": package.get("authors", []),
+            "keywords": package.get("keywords", []),
+            "categories": package.get("categories", []),
+            "readme": read(readme) if readme else None,
+            "readme_file": readme or None,
+        }
+        for key in [
+            "description",
+            "documentation",
+            "homepage",
+            "license",
+            "license-file",
+            "repository",
+            "links",
+            "rust-version",
+        ]:
+            metadata[key.replace("-", "_")] = package.get(key)
+    tables = [(None, manifest), *manifest.get("target", {}).items()]
+    for target, table in tables:
+        for section, kind in [
+            ("dependencies", "normal"),
+            ("dev-dependencies", "dev"),
+            ("build-dependencies", "build"),
+        ]:
+            for name, dependency in table.get(section, {}).items():
+                require(
+                    isinstance(dependency, dict) and "version" in dependency,
+                    "Expected Cargo's normalized dependency metadata",
+                )
+                require(
+                    not any(key in dependency for key in ["path", "git", "registry"]),
+                    "Published dependencies must use registry versions",
+                )
+                metadata["deps"].append({
+                    "name": dependency.get("package", name),
+                    "version_req": dependency["version"],
+                    "features": dependency.get("features", []),
+                    "optional": dependency.get("optional", False),
+                    "default_features": dependency.get("default-features", True),
+                    "target": target,
+                    "kind": kind,
+                    "registry": dependency.get("registry-index"),
+                    "explicit_name_in_toml": name if "package" in dependency else None,
+                })
+    return metadata
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "Redirect refused", headers, fp
+        )
+
+
+def publish_archive(archive, context, token):
+    require(token, "Crates.io token is missing")
+    archive_digest(archive, context)
+    metadata = json.dumps(publication_metadata(archive, context)).encode()
+    crate = archive.read_bytes()
+    # Cargo's registry protocol sends length-prefixed metadata and archive bytes.
+    body = struct.pack("<I", len(metadata)) + metadata
+    body += struct.pack("<I", len(crate)) + crate
+    request = urllib.request.Request(
+        "https://crates.io/api/v1/crates/new",
+        data=body,
+        method="PUT",
+        headers={
+            "Authorization": token,
+            "Content-Type": "application/octet-stream",
+            "Accept": "application/json",
+            "User-Agent": f"{CRATE}-release (https://github.com/{REPOSITORY})",
+        },
+    )
+    opener = urllib.request.build_opener(NoRedirect())
+    try:
+        with opener.open(request, timeout=60) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise RuntimeError(f"Crates.io upload failed (HTTP {error.code})") from None
+    require(not result.get("errors"), "Crates.io rejected the archive")
+    for category, warnings in result.get("warnings", {}).items():
+        require(not warnings, f"Crates.io reported {category}; inspect the publication")
 
 
 def registry_version(version):
@@ -192,15 +298,20 @@ def report(manager, name, version, digest=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=["check", "candidate", "crate-report", "github-report"]
+        "command",
+        choices=["check", "candidate", "publish", "crate-report", "github-report"],
     )
     command = parser.parse_args().command
+    # Keep the publishing credential out of all child-process environments.
+    token = os.environ.pop("CARGO_REGISTRY_TOKEN", None)
     context = context_from_checkout()
     version = context["version"]
+    archive = ROOT / f"target/package/{CRATE}-{version}.crate"
     if command == "check":
         check(context)
+    elif command == "publish":
+        publish_archive(archive, context, token)
     elif command in ["candidate", "crate-report"]:
-        archive = ROOT / f"target/package/{CRATE}-{version}.crate"
         digest = archive_digest(archive, context)
         entry = registry_version(version)
         if entry is not None or command == "crate-report":
