@@ -129,8 +129,13 @@ jobs:
       - name: Attach the crate to the draft release
         env:
           GH_TOKEN: ${{ steps.beepboop.outputs.token }}
-          TAG: ${{ fromJSON(needs.authorize.outputs.context).draftRelease.tag }}
-        run: gh release upload "${TAG}" target/package/*.crate --clobber --repo "${GITHUB_REPOSITORY}"
+          RELEASE_ID: ${{ fromJSON(needs.authorize.outputs.context).draftRelease.id }}
+          ASSET: tree-fucker-${{ fromJSON(needs.authorize.outputs.context).version }}.crate
+        run: |
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" --jq ".[] | select(.name == \"${ASSET}\") | .id")
+          if [ -n "${existing}" ]; then gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${existing}"; fi
+          gh api --method POST --header "Content-Type: application/octet-stream" --input "target/package/${ASSET}" \
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET}"
       - uses: kjanat/beepboop/actions/publish-refs@v1
         env:
           GIT_COMMITTER_NAME: ${{ steps.beepboop.outputs.bot-login }}

@@ -8,28 +8,29 @@
 	"streams": {
 		"main": {
 			"versioning": "workspace",
-			"packages": ["cargo:tree-fucker"],
-			"prepare": {
-				"version": "manual",
-				"strategy": "managed",
-				"workflow": {
-					"file": "release-prepare.yml",
-					"ref": "master",
-					"mode": "dispatch"
-				}
-			},
+			"packages": [
+				"cargo:tree-fucker"
+			],
 			"promote": {
-				"approval": "required",
+				"approval": "push",
 				"workflow": {
 					"file": "release.yml",
 					"ref": "master",
 					"mode": "dispatch",
-					"publications": ["cargo:tree-fucker", "github-release:kjanat/tree-fucker"],
-					"refs": { "phase": "version", "prefix": "v" }
+					"publications": [
+						"cargo:tree-fucker",
+						"github-release:kjanat/tree-fucker"
+					],
+					"refs": {
+						"phase": "version",
+						"prefix": "v"
+					}
 				}
 			},
 			"workflows": {},
-			"credentials": ["crates-io"],
+			"credentials": [
+				"crates-io"
+			],
 			"required": [
 				"cargo:tree-fucker",
 				"github-release:kjanat/tree-fucker"

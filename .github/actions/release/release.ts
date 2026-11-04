@@ -25,7 +25,7 @@ const ReleaseContext = Schema.Struct({
 	stream: Schema.Literal('main'),
 	sourceSha: Sha,
 	version: Version,
-	draftRelease: Schema.Struct({ tag: Schema.String }),
+	draftRelease: Schema.Struct({ id: Schema.Int, tag: Schema.String }),
 });
 type ReleaseContext = typeof ReleaseContext.Type;
 
