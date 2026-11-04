@@ -15,6 +15,7 @@ on:
 permissions: { contents: read }
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUSTDOCFLAGS: -D warnings
 
 jobs:
@@ -31,8 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install --no-self-update
       - uses: kjanat/envctl@v0.7.2
       - uses: actions/setup-dotnet@v6
         if: startsWith(matrix.os, 'windows-')
@@ -96,8 +98,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install --no-self-update
       - uses: astral-sh/setup-uv@v10.3.3
       - uses: kjanat/envctl@v0.7.2
       - name: Prepare macOS coordination storage
@@ -183,18 +186,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install --no-self-update
       - name: Build standalone fixture
         shell: pwsh
         env: { RUSTFLAGS: "-C target-feature=+crt-static" }
         run: |
           cargo test --release --test coordination_power --no-run --message-format=json > build.jsonl
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $artifact = Get-Content build.jsonl | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'coordination_power' -and $_.executable }
-          if (@($artifact).Count -ne 1) { throw 'Expected exactly one power fixture' }
+          if (${LASTEXITCODE} -ne 0) { exit ${LASTEXITCODE} }
+          ${artifact} = Get-Content build.jsonl | ConvertFrom-Json | Where-Object { ${_}.reason -eq 'compiler-artifact' -and ${_}.target.name -eq 'coordination_power' -and ${_}.executable }
+          if (@(${artifact}).Count -ne 1) { throw 'Expected exactly one power fixture' }
           New-Item -ItemType Directory -Path target/power -Force | Out-Null
-          Copy-Item $artifact.executable target/power/coordination_power.exe
+          Copy-Item ${artifact}.executable target/power/coordination_power.exe
       - uses: actions/upload-artifact@v7
         with:
           name: windows-reboot-fixture
@@ -243,8 +247,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install --no-self-update
       - name: Prepare retained coordination storage
         run: |
           sudo mkdir -p /var/run/tree-fucker

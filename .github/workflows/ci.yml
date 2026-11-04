@@ -11,6 +11,7 @@ permissions: { contents: read }
 concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: "${{ github.event_name == 'pull_request' }}" }
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUSTDOCFLAGS: -D warnings
 
 jobs:
@@ -23,10 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-        with: { components: "rustfmt, clippy, rust-src, rust-analyzer" }
-      - uses: Swatinem/rust-cache@v2
-        with: { save-if: "${{ github.event_name != 'pull_request' }}" }
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install --no-self-update
       - name: Prepare macOS coordination storage
         if: startsWith(matrix.os, 'macos-')
         run: |
@@ -34,17 +34,24 @@ jobs:
           sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
           sudo chmod 1777 /var/run/tree-fucker
       - if: matrix.os == 'ubuntu-26.04'
-        run: cargo fmt --check
+        uses: kjanat/dprint-check@v3
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --no-fail-fast
+      - name: Repeat the parallel macOS suite
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          for iteration in {1..2};
+          do  cargo test --all-features --no-fail-fast;
+          done
       - name: Repeat native interrupted initialization
         if: startsWith(matrix.os, 'macos-')
         run: |
-          for iteration in {1..20}; do
-            cargo test --lib coordination::unix::initialization::killed_initializers_recover_pinned_authority_or_reject_partial_anchor -- --exact
+          for iteration in {1..20};
+          do  cargo test --lib coordination::unix::initialization::killed_initializers_recover_pinned_authority_or_reject_partial_anchor -- --exact
           done
       - name: Layer probe correctness
-        run: cargo bench:layers --test;
+        run: |
+          cargo bench:layers --test
           cargo bench:alloc --test
       - name: Coordination protocol benchmark smoke test
         run: cargo bench --bench coordination -- --test
@@ -59,16 +66,14 @@ jobs:
           sudo install -m 755 "${test_executable}" "${namespace_dir}/coordination_namespaces"
           sudo "${namespace_dir}/coordination_namespaces" namespace_histories --ignored --nocapture
       - name: Coordination process benchmark smoke tests
-        shell: bash
+        shell: bash -euo pipefail {0}
         run: |
-          set -euo pipefail
           cargo bench --bench coordination_processes -- --test
           cargo bench --bench coordination_processes_alloc -- --test
       - name: Native coordination measurements
         if: startsWith(matrix.os, 'windows-') || startsWith(matrix.os, 'macos-')
-        shell: bash
+        shell: bash -euo pipefail {0}
         run: |
-          set -euo pipefail
           mkdir -p target/benchmarks
           cargo bench --bench coordination_processes -- \
             --workers 4 --iterations 100 --files 64 --runs 3 --warmups 1 \
@@ -89,6 +94,23 @@ jobs:
           test_executable=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_macos") | .executable // empty' target/macos-coordination-build.jsonl)
           sudo "${test_executable}" privileged_ --ignored --nocapture
       - run: cargo doc --no-deps --all-features
+
+  package:
+    name: package
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - run: rustup toolchain install --no-self-update
+      - run: cargo package --locked
+      - run: cargo publish --dry-run --locked
+      - run: cargo publish --dry-run --locked --features tokio
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crate-candidate
+          path: target/package/*.crate
+          if-no-files-found: error
 
   freebsd:
     name: freebsd-15
@@ -161,8 +183,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-        with: { components: clippy, targets: "${{ matrix.target }}" }
-      - uses: Swatinem/rust-cache@v2
-        with: { key: "${{ matrix.target }}", save-if: "${{ github.event_name != 'pull_request' }}" }
+      - name: Install Rust target
+        run: rustup toolchain install --no-self-update --target "${TARGET}"
       - run: cargo clippy --target "${TARGET}" --all-targets --all-features -- -D warnings

@@ -96,12 +96,33 @@ fn exclusive(file: &File) -> Result<(), Error> {
     }
 }
 
-struct Unlock<'a>(&'a File);
+struct Unlock<'a>(Option<&'a File>);
+
+impl Unlock<'_> {
+    fn release(mut self) -> Result<(), Error> {
+        flock(self.0.expect("held bookkeeping lock"), FlockOperation::Unlock)?;
+        self.0 = None;
+        Ok(())
+    }
+}
 
 impl Drop for Unlock<'_> {
     fn drop(&mut self) {
-        let _ = flock(self.0, FlockOperation::Unlock);
+        if let Some(file) = self.0 {
+            let _ = flock(file, FlockOperation::Unlock);
+        }
     }
+}
+
+fn bookkeeping<T>(anchor: &File, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    exclusive(anchor)?;
+    // A concurrent fork can retain this open description after we close it.
+    // Bookkeeping exclusion ends here even when initialization fails or
+    // unwinds.
+    let unlock = Unlock(Some(anchor));
+    let result = operation();
+    unlock.release()?;
+    result
 }
 
 fn open_file(root: &File, name: &OsStr, create: bool, uid: u32) -> Result<File, Error> {
@@ -299,12 +320,12 @@ impl Scope {
         }
         let mut anchor_name = path.file_name().ok_or(Error::InvalidScope)?.to_os_string();
         anchor_name.push(".authority.lock");
-        let mut anchor = open_file(&anchor_root, &anchor_name, true, context.uid)?;
-        exclusive(&anchor)?;
-        let mut journal = initialize(&root, &mut anchor, context, config)?;
-        let generation = journal.load()?.ledger().generation();
-        // Scope::open owns a unique description; on failure close releases it.
-        flock(&anchor, FlockOperation::Unlock)?;
+        let anchor = open_file(&anchor_root, &anchor_name, true, context.uid)?;
+        let (journal, generation) = bookkeeping(&anchor, || {
+            let mut journal = initialize(&root, &anchor, context, config)?;
+            let generation = journal.load()?.ledger().generation();
+            Ok((journal, generation))
+        })?;
         let scope = Arc::new(Self {
             path,
             root,
@@ -358,7 +379,7 @@ impl Scope {
             return Err(error);
         }
         self.acquired.fetch_add(1, Ordering::Relaxed);
-        let _unlock = Unlock(&self.anchor);
+        let _unlock = Unlock(Some(&self.anchor));
         let result = (|| {
             self.check_files()?;
             matches_file(&self.root, OsStr::new(STATE), store.journal.storage(), self.context.uid)?;
@@ -519,9 +540,9 @@ impl Scope {
     }
 }
 
-fn initialize(root: &File, anchor: &mut File, context: Context, config: Config) -> Result<Journal<File>, Error> {
+fn initialize(root: &File, mut anchor: &File, context: Context, config: Config) -> Result<Journal<File>, Error> {
     let length = anchor.metadata()?.len();
-    initialize_storage(root, anchor, length, context, config)
+    initialize_storage(root, &mut anchor, length, context, config)
 }
 
 fn initialize_storage(

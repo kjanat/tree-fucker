@@ -1,0 +1,131 @@
+---
+name: Publish release
+run-name: Release operation ${{ inputs.beepboop_execution_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      beepboop_execution_id:
+        description: Promotion execution approved in Beepboop
+        required: true
+        type: string
+permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+concurrency: { group: release-publish, cancel-in-progress: false }
+
+jobs:
+  authorize:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: { contents: read, actions: read, id-token: write }
+    outputs:
+      context: ${{ steps.release.outputs.context }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: kjanat/beepboop/actions/begin@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        id: release
+        with:
+          execution-id: ${{ inputs.beepboop_execution_id }}
+          operation: promote
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Fetch the approved source commit
+        env:
+          SOURCE_SHA: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
+        run: git fetch --no-tags --depth=1 origin "${SOURCE_SHA}"
+      - name: Require the approved version, signed commit, and successful CI
+        env:
+          RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
+        run: python3 -I .github/actions/release/release.py check
+
+  package:
+    needs: authorize
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - run: cargo package --locked
+      - run: cargo publish --dry-run --locked
+      - run: cargo publish --dry-run --locked --features tokio
+
+  publish:
+    needs: [authorize, package]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions: { contents: read, actions: read, id-token: write, attestations: write }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_CONTEXT: ${{ needs.authorize.outputs.context }}
+      BEEPBOOP_EXECUTION_ID: ${{ inputs.beepboop_execution_id }}
+      RELEASE_TOOL: ${{ github.workspace }}/.github/actions/release/release.py
+    defaults:
+      run: { working-directory: source }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Fetch the approved source commit for the version tag
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_SHA: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
+        run: git fetch --no-tags --depth=1 origin "${SOURCE_SHA}"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
+          path: source
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - name: Package the approved commit without building it
+        run: cargo package --no-verify --locked
+      - name: Recheck the approved commit and CI
+        run: python3 -I "${RELEASE_TOOL}" check
+      - name: Check publication identity and retry state
+        id: candidate
+        run: python3 -I "${RELEASE_TOOL}" candidate
+      - uses: kjanat/beepboop/actions/credentials@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        if: steps.candidate.outputs.publish == 'true'
+        id: credentials
+        with:
+          aliases: '["crates-io"]'
+      - name: Publish the crate
+        if: steps.candidate.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ fromJSON(steps.credentials.outputs.values)['crates-io'] }}
+        run: cargo publish --no-verify --locked
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: source/target/package/*.crate
+      - name: Verify the registry checksum
+        id: crate
+        run: python3 -I "${RELEASE_TOOL}" crate-report
+      - uses: kjanat/beepboop/actions/report@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        with:
+          publications: ${{ steps.crate.outputs.publications }}
+      - name: Obtain the Beepboop App identity and repository token
+        uses: kjanat/beepboop/actions/token@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        id: beepboop
+        with:
+          execution-id: ${{ inputs.beepboop_execution_id }}
+          permissions: '{"contents":"write"}'
+      - name: Attach the crate to the draft release
+        env:
+          GH_TOKEN: ${{ steps.beepboop.outputs.token }}
+          TAG: ${{ fromJSON(needs.authorize.outputs.context).draftRelease.tag }}
+        run: gh release upload "${TAG}" target/package/*.crate --clobber --repo "${GITHUB_REPOSITORY}"
+      - uses: kjanat/beepboop/actions/publish-refs@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        env:
+          GIT_COMMITTER_NAME: ${{ steps.beepboop.outputs.bot-login }}
+          GIT_COMMITTER_EMAIL: ${{ steps.beepboop.outputs.bot-email }}
+        with:
+          token: ${{ steps.beepboop.outputs.token }}
+      - uses: kjanat/beepboop/actions/publish-release@fb304b08fd2b622f70cac70a4ed428da143d10f2

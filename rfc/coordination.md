@@ -16,6 +16,14 @@ The cooperating scope is explicitly identified by its security, namespace, clock
 
 A protocol version is independent of the crate version. A stable rendezvous must reject incompatible versions instead of creating parallel version-named budgets.
 
+### Release compatibility
+
+The `0.1.x` crate series uses rendezvous protocol version 1 and journal format 1. It reads and writes authority snapshot format 2 without a clock binding and format 3 with a clock binding. Unix authorities use format 2; Windows authorities use format 3 to bind retained accounting to their clock history. Native anchor formats and namespace identities must also match; the Unix anchor format is 1. These numbers describe storage compatibility, separately from Rust API SemVer.
+
+Participants may join and recover an authority only when its protocol, storage formats, exact configuration, generation, and native identity checks succeed. An unknown version returns an incompatibility error before admission. Malformed or replaced storage fails closed. The caller must report the error and use a compatible implementation or an explicit administrative migration; deleting the authority to get a fresh budget is not a recovery strategy. A Cargo upgrade never creates a version-named rendezvous or clears retained liabilities. `Auto` does not fall back for incompatible versions, and no mode falls back after joining.
+
+Compatible public APIs and supported platforms are preserved within `0.1.x`. Breaking those promises requires a minor-version bump and release notes. Any future coordination-format transition needs its own documented migration and mixed-version acceptance independently of that bump.
+
 An authority has a nonzero generation. Each participant has a slot and a monotonically allocated incarnation within that generation. Each operation has a participant identity and a monotonically allocated sequence. Counters must fail on exhaustion, never wrap. Restart, slot reuse, and delayed messages cannot acquire the identity of earlier work.
 
 Operation records are bounded independently of participant records. Completed operation records can be reclaimed because each participant retains its issued-sequence watermark. A missing, previously issued operation is terminal and cannot be created again. Slots cannot be reused while they own nonterminal operations.
