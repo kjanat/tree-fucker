@@ -1,5 +1,7 @@
 # tree-fucker
 
+[![Crates.io](https://img.shields.io/crates/v/tree-fucker?logo=rust&labelColor=B7410E&color=black)][crates]
+
 `tree-fucker` is a Rust library for maintaining an immutable, versioned, diffable view of a filesystem tree without trusting filesystem watchers for correctness.
 
 It combines direct directory reconciliation, optional watcher hints, explicit storage-domain semantics, and a process-wide resource governor behind one interface. The goal is simple: keep converging on reality without accidentally turning a slow, remote, gigantic, or broken filesystem into a six-hour RAM-and-I/O bonfire.
@@ -189,3 +191,5 @@ Yes, the crate is called `tree-fucker`.
 ## Performance
 
 Shared coordination trades extra CPU, allocation, and filesystem transactions for cross-process resource safety. It is not an automatic traversal speedup. Historical Linux measurements show the largest relative overhead for cheap cached reads, much smaller relative overhead for slow filesystem calls, and zero authority access while idle. See the [recorded baseline and optimizations](https://github.com/kjanat/tree-fucker/blob/master/benchmarks/coordination-baseline.md); these are historical results, not measurements of every release. Process-only governance remains the default.
+
+[crates]: https://crates.io/crates/tree-fucker
