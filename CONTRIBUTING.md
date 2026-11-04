@@ -2,7 +2,7 @@
 
 The normative contract is [`rfc/tree-fucker.txt`](rfc/tree-fucker.txt). Changes to observable behavior should keep the implementation, regression tests, and RFC consistent. The [README](README.md) describes the consumer API and compatibility policy.
 
-The [release process](RELEASING.md) uses Beepboop to prepare a version PR, approve an exact commit, and dispatch verified crates.io and GitHub publication. Its credential setup and retry behavior are documented separately from development checks.
+The [release process](RELEASING.md) publishes each signed `master` push that carries a new crate version to crates.io and GitHub through Beepboop. Its credential setup and retry behavior are documented separately from development checks.
 
 ## Development setup
 
