@@ -24,7 +24,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: kjanat/beepboop/actions/begin@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
+      - uses: kjanat/beepboop/actions/begin@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
         id: release
         with:
           execution-id: ${{ inputs.beepboop_execution_id }}
@@ -70,7 +70,7 @@ jobs:
     needs: [authorize, package]
     runs-on: ubuntu-26.04
     timeout-minutes: 10
-    permissions: { contents: write, actions: read, id-token: write }
+    permissions: { contents: read, actions: read, id-token: write }
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_CONTEXT: ${{ needs.authorize.outputs.context }}
@@ -93,7 +93,7 @@ jobs:
       - name: Check publication identity and retry state
         id: candidate
         run: python3 -I scripts/release.py candidate
-      - uses: kjanat/beepboop/actions/credentials@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
+      - uses: kjanat/beepboop/actions/credentials@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
         if: steps.candidate.outputs.publish == 'true'
         id: credentials
         with:
@@ -106,19 +106,25 @@ jobs:
       - name: Verify the registry checksum
         id: crate
         run: python3 -I scripts/release.py crate-report
-      - uses: kjanat/beepboop/actions/report@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
+      - uses: kjanat/beepboop/actions/report@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
         with:
           publications: ${{ steps.crate.outputs.publications }}
-      - name: Set annotated-tag identity
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-      - uses: kjanat/beepboop/actions/publish-refs@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
+      - name: Obtain the Beepboop App identity and repository token
+        uses: kjanat/beepboop/actions/token@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
+        id: beepboop
         with:
-          token: ${{ github.token }}
+          execution-id: ${{ inputs.beepboop_execution_id }}
+          permissions: '{"contents":"write"}'
+      - uses: kjanat/beepboop/actions/publish-refs@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
+        env:
+          GIT_COMMITTER_NAME: ${{ steps.beepboop.outputs.bot-login }}
+          GIT_COMMITTER_EMAIL: ${{ steps.beepboop.outputs.bot-email }}
+        with:
+          token: ${{ steps.beepboop.outputs.token }}
       - name: Create the GitHub release
         if: steps.candidate.outputs.github-release == 'false'
         env:
+          GH_TOKEN: ${{ steps.beepboop.outputs.token }}
           TAG: ${{ steps.candidate.outputs.tag }}
           SOURCE_SHA: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
           PRERELEASE: "${{ case(steps.candidate.outputs.prerelease == 'true', '--prerelease', '') }}"
@@ -127,6 +133,6 @@ jobs:
       - name: Verify the published release and tag
         id: github
         run: python3 -I scripts/release.py github-report
-      - uses: kjanat/beepboop/actions/report@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
+      - uses: kjanat/beepboop/actions/report@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
         with:
           publications: ${{ steps.github.outputs.publications }}

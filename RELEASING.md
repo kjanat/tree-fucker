@@ -4,11 +4,11 @@
 
 ## Setup
 
-Merge the release workflows and configuration into `master`, then let the Beepboop repository webhook refresh its inventory. The workflows use the reviewed Beepboop helpers at `dcfd2f7ff3525ec54582b32c737b44a5cc47147b` and authenticate each execution with GitHub OIDC. A manual GitHub dispatch without a valid, approved Beepboop execution cannot publish.
+Merge the release workflows and configuration into `master`, then let the Beepboop repository webhook refresh its inventory. The workflows use the reviewed Beepboop helpers at `46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce` and authenticate each execution with GitHub OIDC. A manual GitHub dispatch without a valid, approved Beepboop execution cannot publish.
 
 Store a crates.io publishing token in Beepboop under the `crates-io` credential alias. Grant runtime access only to this repository's `main` stream, `promote` operation, `release.yml` workflow, and `master` workflow ref. The token needs permission to publish `tree-fucker`; it is requested only after release checks pass. Credential creation and grants are administrator actions in Beepboop, separate from merging this configuration.
 
-The workflow's GitHub token creates the version tag and GitHub release. The repository must allow its existing release policy to accept that token. No workflow changes repository protections or publishes through a bypass path.
+The publication job obtains a repository-scoped Beepboop App installation token with `contents: write`, bound to the dispatched execution ID. The token creates the version tag and GitHub release. Annotated tags use the App's bot login and email returned by `actions/token`; the workflow's built-in GitHub token has read-only access. The repository's release policy must permit the Beepboop App to publish these refs.
 
 ## Prepare and publish
 
