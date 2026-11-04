@@ -156,6 +156,14 @@ class PublishTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rejected"):
             release.publish_archive(self.archive, CONTEXT, "fixture-token", COMMITTED)
 
+    @patch("release.urllib.request.build_opener")
+    def test_registry_warnings_are_failures(self, opener):
+        opener.return_value.open.return_value = io.BytesIO(
+            b'{"warnings":{"invalid_categories":[],"other":["unexpected"]}}'
+        )
+        with self.assertRaisesRegex(RuntimeError, "reported other"):
+            release.publish_archive(self.archive, CONTEXT, "fixture-token", COMMITTED)
+
     def test_redirect_cannot_forward_credentials(self):
         request = release.urllib.request.Request(
             "https://crates.io/api/v1/crates/new",
