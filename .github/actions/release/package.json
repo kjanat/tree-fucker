@@ -1,0 +1,27 @@
+{
+	"name": "release",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@effect/platform-bun": "4.1.2",
+		"effect": "4.1.2"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:site",
+		"typescript": "catalog:site"
+	},
+	"devEngines": {
+		"packageManager": {
+			"name": "bun",
+			"version": ">=1.4"
+		},
+		"runtime": {
+			"name": "bun",
+			"version": ">=1.4"
+		}
+	}
+}

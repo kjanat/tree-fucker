@@ -41,10 +41,12 @@ jobs:
         env:
           SOURCE_SHA: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
         run: git fetch --no-tags --depth=1 origin "${SOURCE_SHA}"
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile --production --filter release
       - name: Require the approved version, signed commit, and successful CI
         env:
           RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
-        run: python3 -I .github/actions/release/release.py check
+        run: bun .github/actions/release/release.ts check
 
   package:
     needs: authorize
@@ -70,7 +72,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_CONTEXT: ${{ needs.authorize.outputs.context }}
       BEEPBOOP_EXECUTION_ID: ${{ inputs.beepboop_execution_id }}
-      RELEASE_TOOL: ${{ github.workspace }}/.github/actions/release/release.py
+      RELEASE_TOOL: ${{ github.workspace }}/.github/actions/release/release.ts
     defaults:
       run: { working-directory: source }
     steps:
@@ -83,6 +85,9 @@ jobs:
         env:
           SOURCE_SHA: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
         run: git fetch --no-tags --depth=1 origin "${SOURCE_SHA}"
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile --production --filter release
+        working-directory: ${{ github.workspace }}
       - uses: actions/checkout@v7
         with:
           ref: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
@@ -92,10 +97,10 @@ jobs:
       - name: Package the approved commit without building it
         run: cargo package --no-verify --locked
       - name: Recheck the approved commit and CI
-        run: python3 -I "${RELEASE_TOOL}" check
+        run: bun "${RELEASE_TOOL}" check
       - name: Check publication identity and retry state
         id: candidate
-        run: python3 -I "${RELEASE_TOOL}" candidate
+        run: bun "${RELEASE_TOOL}" candidate
       - uses: kjanat/beepboop/actions/credentials@v1
         if: steps.candidate.outputs.publish == 'true'
         id: credentials
@@ -111,7 +116,7 @@ jobs:
           subject-path: source/target/package/*.crate
       - name: Verify the registry checksum
         id: crate
-        run: python3 -I "${RELEASE_TOOL}" crate-report
+        run: bun "${RELEASE_TOOL}" crate-report
       - uses: kjanat/beepboop/actions/report@v1
         with:
           publications: ${{ steps.crate.outputs.publications }}
