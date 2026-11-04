@@ -34,7 +34,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Install Rust
         shell: bash
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+        run: rustup toolchain install --no-self-update
       - uses: kjanat/envctl@v0.7.2
       - uses: actions/setup-dotnet@v6
         if: startsWith(matrix.os, 'windows-')
@@ -100,7 +100,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Install Rust
         shell: bash
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+        run: rustup toolchain install --no-self-update
       - uses: astral-sh/setup-uv@v10.3.3
       - uses: kjanat/envctl@v0.7.2
       - name: Prepare macOS coordination storage
@@ -188,7 +188,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Install Rust
         shell: bash
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+        run: rustup toolchain install --no-self-update
       - name: Build standalone fixture
         shell: pwsh
         env: { RUSTFLAGS: "-C target-feature=+crt-static" }
@@ -249,7 +249,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Install Rust
         shell: bash
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+        run: rustup toolchain install --no-self-update
       - name: Prepare retained coordination storage
         run: |
           sudo mkdir -p /var/run/tree-fucker

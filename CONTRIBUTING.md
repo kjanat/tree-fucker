@@ -2,9 +2,11 @@
 
 The normative contract is [`rfc/tree-fucker.txt`](rfc/tree-fucker.txt). Changes to observable behavior should keep the implementation, regression tests, and RFC consistent. The [README](README.md) describes the consumer API and compatibility policy.
 
+The [release process](RELEASING.md) uses Beepboop to prepare a version PR, approve an exact commit, and dispatch verified crates.io and GitHub publication. Its credential setup and retry behavior are documented separately from development checks.
+
 ## Development setup
 
-The repository selects rolling Rust nightly through `rust-toolchain.toml` and includes `rustfmt`, Clippy, and `rust-analyzer`. The library itself supports the stable compiler stated in `Cargo.toml`; nightly is for repository development.
+`rust-toolchain.toml` pins a dated Rust nightly with `rustfmt`, Clippy, and `rust-analyzer`. CI and releases install that toolchain.
 
 The RFC site tooling uses Bun. Install its dependencies from the repository root:
 
@@ -27,14 +29,15 @@ Use `dprint check` for the repository's other formatted files. The workflows in 
 
 ## Package verification
 
-Run these checks from a committed checkout:
+Run the package job's commands from a committed checkout:
 
 ```sh
-python3 tests/package/verify.py --toolchain stable
-python3 tests/package/verify.py --toolchain 1.99.1 --archive target/package/tree-fucker-*.crate
+cargo package --locked
+cargo publish --dry-run --locked
+cargo publish --dry-run --locked --features tokio
 ```
 
-The verifier packages the crate, performs publication dry runs with default features and Tokio, and builds and runs two independent consumers from the archive outside repository Cargo configuration. It also checks that the README examples match their compiled targets in [`examples`](examples). Nothing is published. For local iteration with uncommitted changes, pass `--allow-dirty`; CI verifies committed source.
+Nothing is published. For local iteration with uncommitted changes, add `--allow-dirty`; CI verifies committed source.
 
 ## Benchmarks
 

@@ -1,0 +1,43 @@
+---
+name: Prepare release
+run-name: Release operation ${{ inputs.beepboop_execution_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      beepboop_execution_id:
+        description: Execution created by Beepboop
+        required: true
+        type: string
+permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+concurrency: { group: release-prepare, cancel-in-progress: false }
+
+jobs:
+  prepare:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: kjanat/beepboop/actions/begin@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        id: release
+        with:
+          execution-id: ${{ inputs.beepboop_execution_id }}
+          operation: prepare
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+      - uses: kjanat/beepboop/actions/prepare@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        with:
+          context: ${{ steps.release.outputs.context }}
+          mode: apply
+      - name: Refresh the package lockfile and check all targets
+        run: cargo check --all-targets --all-features
+      - uses: kjanat/beepboop/actions/prepare@fb304b08fd2b622f70cac70a4ed428da143d10f2
+        with:
+          context: ${{ steps.release.outputs.context }}
+          mode: submit

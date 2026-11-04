@@ -22,7 +22,7 @@ The `0.1.x` crate series uses rendezvous protocol version 1 and journal format 1
 
 Participants may join and recover an authority only when its protocol, storage formats, exact configuration, generation, and native identity checks succeed. An unknown version returns an incompatibility error before admission. Malformed or replaced storage fails closed. The caller must report the error and use a compatible implementation or an explicit administrative migration; deleting the authority to get a fresh budget is not a recovery strategy. A Cargo upgrade never creates a version-named rendezvous or clears retained liabilities. `Auto` does not fall back for incompatible versions, and no mode falls back after joining.
 
-Compatible public APIs, the Rust 1.99.1 compiler floor, and supported platforms are preserved within `0.1.x`. Breaking those promises requires a minor-version bump and release notes. Any future coordination-format transition needs its own documented migration and mixed-version acceptance independently of that bump.
+Compatible public APIs and supported platforms are preserved within `0.1.x`. Breaking those promises requires a minor-version bump and release notes. Any future coordination-format transition needs its own documented migration and mixed-version acceptance independently of that bump.
 
 An authority has a nonzero generation. Each participant has a slot and a monotonically allocated incarnation within that generation. Each operation has a participant identity and a monotonically allocated sequence. Counters must fail on exhaustion, never wrap. Restart, slot reuse, and delayed messages cannot acquire the identity of earlier work.
 
