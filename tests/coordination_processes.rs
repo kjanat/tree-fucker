@@ -451,8 +451,21 @@ fn fresh_connections_retain_bounded_recovery_from_failed_joins() {
         Err(Error::Authority(authority::Error::Protocol(protocol::Error::ParticipantCapacity)))
     ));
     drop(fresh);
-    let fresh = Scope::open(root.path().join("scope"), config()).unwrap();
-    let client = retry(|| fresh.join());
+    // A concurrent fork can retain a recovery probe's lifetime lock until exec.
+    // Keep reopening on capacity denial so every attempt must use the recovery
+    // progress committed by earlier connections, not their local scan cursor.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (fresh, client) = loop {
+        let fresh = retry(|| Scope::open(root.path().join("scope"), config()));
+        match fresh.join() {
+            Ok(client) => break (fresh, client),
+            Err(Error::Busy | Error::Authority(authority::Error::Protocol(protocol::Error::ParticipantCapacity))) => {
+                assert!(Instant::now() < deadline, "fresh joins did not finish recovering the abandoned preparations");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("fresh join failed: {error}"),
+        }
+    };
     assert_eq!(client.participant().slot, 31);
     let view = retry(|| fresh.view());
     assert_eq!(view.prepared, 0);
