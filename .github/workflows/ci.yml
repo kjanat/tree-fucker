@@ -34,23 +34,24 @@ jobs:
           sudo /sbin/mount_tmpfs -e -s 128m /var/run/tree-fucker
           sudo chmod 1777 /var/run/tree-fucker
       - if: matrix.os == 'ubuntu-26.04'
-        run: cargo fmt --check
+        uses: kjanat/dprint-check@v3
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --no-fail-fast
       - name: Repeat the parallel macOS suite
         if: startsWith(matrix.os, 'macos-')
         run: |
-          for iteration in {1..2}; do
-            cargo test --all-features --no-fail-fast
+          for iteration in {1..2};
+          do  cargo test --all-features --no-fail-fast;
           done
       - name: Repeat native interrupted initialization
         if: startsWith(matrix.os, 'macos-')
         run: |
-          for iteration in {1..20}; do
-            cargo test --lib coordination::unix::initialization::killed_initializers_recover_pinned_authority_or_reject_partial_anchor -- --exact
+          for iteration in {1..20};
+          do  cargo test --lib coordination::unix::initialization::killed_initializers_recover_pinned_authority_or_reject_partial_anchor -- --exact
           done
       - name: Layer probe correctness
-        run: cargo bench:layers --test;
+        run: |
+          cargo bench:layers --test
           cargo bench:alloc --test
       - name: Coordination protocol benchmark smoke test
         run: cargo bench --bench coordination -- --test
@@ -65,16 +66,14 @@ jobs:
           sudo install -m 755 "${test_executable}" "${namespace_dir}/coordination_namespaces"
           sudo "${namespace_dir}/coordination_namespaces" namespace_histories --ignored --nocapture
       - name: Coordination process benchmark smoke tests
-        shell: bash
+        shell: bash -euo pipefail {0}
         run: |
-          set -euo pipefail
           cargo bench --bench coordination_processes -- --test
           cargo bench --bench coordination_processes_alloc -- --test
       - name: Native coordination measurements
         if: startsWith(matrix.os, 'windows-') || startsWith(matrix.os, 'macos-')
-        shell: bash
+        shell: bash -euo pipefail {0}
         run: |
-          set -euo pipefail
           mkdir -p target/benchmarks
           cargo bench --bench coordination_processes -- \
             --workers 4 --iterations 100 --files 64 --runs 3 --warmups 1 \
