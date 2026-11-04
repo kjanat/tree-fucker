@@ -4,7 +4,6 @@ import io
 import json
 import os
 import struct
-import tarfile
 import tempfile
 import unittest
 import urllib.error
@@ -14,34 +13,13 @@ from threading import Thread
 from unittest.mock import patch
 
 import release
-from test_release import CONTEXT, SHA
-
-MANIFEST = """
-[package]
-name = "tree-fucker"
-version = "0.1.0"
-description = "A test crate"
-license = "MIT OR Apache-2.0"
-readme = "README.md"
-rust-version = "1.99.1"
-authors = ["Fixture author"]
-keywords = ["filesystem"]
-categories = ["filesystem"]
-[dependencies.alias]
-package = "original"
-version = "1.2.3"
-optional = true
-default-features = false
-features = ["std"]
-[dev-dependencies.test-helper]
-version = "2.0"
-[build-dependencies.builder]
-version = "3.0"
-[target.'cfg(windows)'.dependencies.windows-sys]
-version = "0.61.2"
-[features]
-extra = ["dep:alias"]
-"""
+from test_release import (
+    COMMITTED,
+    CONTEXT,
+    archive_members,
+    replace_member,
+    write_archive,
+)
 
 
 class PublishTests(unittest.TestCase):
@@ -49,21 +27,7 @@ class PublishTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.archive = Path(temporary.name) / "candidate.crate"
-        self.write_archive()
-
-    def write_archive(self, manifest=MANIFEST):
-        with tarfile.open(self.archive, "w:gz") as target:
-            files = {
-                ".cargo_vcs_info.json": json.dumps({"git": {"sha1": SHA}}),
-                "Cargo.toml": manifest,
-                "README.md": "# Packaged readme\n",
-                "build.rs": 'fn main() { panic!("must not execute during upload"); }',
-            }
-            for name, content in files.items():
-                data = content.encode()
-                member = tarfile.TarInfo(f"tree-fucker-0.1.0/{name}")
-                member.size = len(data)
-                target.addfile(member, io.BytesIO(data))
+        write_archive(self.archive, archive_members())
 
     def test_metadata_preserves_dependencies_and_package_details(self):
         metadata = release.publication_metadata(self.archive, CONTEXT)
@@ -126,7 +90,9 @@ class PublishTests(unittest.TestCase):
         before = self.archive.read_bytes()
         try:
             with patch("release.urllib.request.Request", side_effect=local_request):
-                release.publish_archive(self.archive, CONTEXT, "fixture-token")
+                release.publish_archive(
+                    self.archive, CONTEXT, "fixture-token", COMMITTED
+                )
         finally:
             server.shutdown()
             thread.join()
@@ -149,13 +115,26 @@ class PublishTests(unittest.TestCase):
     def test_wrong_archive_is_rejected_before_upload(self, opener):
         with self.assertRaisesRegex(RuntimeError, "commit mismatch"):
             release.publish_archive(
-                self.archive, {**CONTEXT, "sourceSha": "b" * 40}, "fixture-token"
+                self.archive,
+                {**CONTEXT, "sourceSha": "b" * 40},
+                "fixture-token",
+                COMMITTED,
             )
+        opener.assert_not_called()
+
+    @patch("release.urllib.request.build_opener")
+    def test_altered_archive_member_is_rejected_before_upload(self, opener):
+        write_archive(
+            self.archive,
+            replace_member(archive_members(), "src/lib.rs", b"pub fn injected() {}\n"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "src/lib.rs differs"):
+            release.publish_archive(self.archive, CONTEXT, "fixture-token", COMMITTED)
         opener.assert_not_called()
 
     def test_missing_credentials_fail_before_upload(self):
         with self.assertRaisesRegex(RuntimeError, "token is missing"):
-            release.publish_archive(self.archive, CONTEXT, None)
+            release.publish_archive(self.archive, CONTEXT, None, COMMITTED)
 
     @patch("release.urllib.request.build_opener")
     def test_http_errors_and_registry_errors_are_failures(self, opener):
@@ -167,13 +146,15 @@ class PublishTests(unittest.TestCase):
                 self.subTest(code=code),
                 self.assertRaisesRegex(RuntimeError, str(code)),
             ):
-                release.publish_archive(self.archive, CONTEXT, "fixture-token")
+                release.publish_archive(
+                    self.archive, CONTEXT, "fixture-token", COMMITTED
+                )
         opener.return_value.open.side_effect = None
         opener.return_value.open.return_value = io.BytesIO(
             b'{"errors":[{"detail":"bad"}]}'
         )
         with self.assertRaisesRegex(RuntimeError, "rejected"):
-            release.publish_archive(self.archive, CONTEXT, "fixture-token")
+            release.publish_archive(self.archive, CONTEXT, "fixture-token", COMMITTED)
 
     def test_redirect_cannot_forward_credentials(self):
         request = release.urllib.request.Request(
@@ -186,9 +167,12 @@ class PublishTests(unittest.TestCase):
             )
         caught.exception.close()
 
+    @patch("release.committed_files", return_value=COMMITTED)
     @patch("release.publish_archive")
     @patch("release.context_from_checkout")
-    def test_cli_removes_token_before_running_checkout_checks(self, context, publish):
+    def test_cli_removes_token_before_running_checkout_checks(
+        self, context, publish, committed
+    ):
         def inspect_context():
             self.assertNotIn("CARGO_REGISTRY_TOKEN", os.environ)
             return CONTEXT
@@ -200,6 +184,8 @@ class PublishTests(unittest.TestCase):
         ):
             release.main()
         self.assertEqual(publish.call_args.args[2], "fixture-token")
+        self.assertIs(publish.call_args.args[3], COMMITTED)
+        committed.assert_called_once_with(CONTEXT["sourceSha"])
 
 
 if __name__ == "__main__":

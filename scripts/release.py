@@ -10,7 +10,7 @@ import subprocess
 import tarfile
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import tomllib
 
@@ -101,19 +101,168 @@ def check(context):
         validate_run(result["workflow_runs"], sha, workflow)
 
 
-def archive_digest(archive, context):
-    prefix = f"{CRATE}-{context['version']}"
-    with tarfile.open(archive) as source:
-        with source.extractfile(f"{prefix}/.cargo_vcs_info.json") as file:
-            vcs = json.load(file)
-        with source.extractfile(f"{prefix}/Cargo.toml") as file:
-            package = tomllib.loads(file.read().decode())["package"]
-    require(vcs["git"]["sha1"] == context["sourceSha"], "Archive commit mismatch")
-    require(not vcs["git"].get("dirty", False), "Archive contains uncommitted changes")
-    require(
-        package["name"] == CRATE and package["version"] == context["version"],
-        "Archive version mismatch",
+DEPENDENCY_KINDS = [
+    ("dependencies", "normal"),
+    ("dev-dependencies", "dev"),
+    ("build-dependencies", "build"),
+]
+TARGET_DIRECTORIES = {
+    "bin": "src/bin",
+    "example": "examples",
+    "test": "tests",
+    "bench": "benches",
+}
+
+
+def committed_files(sha):
+    listing = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", "--format=%(objectmode) %(path)", sha],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    entries = [entry.split(" ", 1) for entry in listing.split("\0") if entry]
+    files = [path for mode, path in entries if mode in {"100644", "100755"}]
+    manifest = tomllib.loads(
+        subprocess.check_output(
+            ["git", "show", f"{sha}:Cargo.toml"], cwd=ROOT, text=True, timeout=30
+        )
     )
+    patterns = manifest["package"]["include"]
+    require(
+        all(pattern.startswith("/") for pattern in patterns),
+        "Expected anchored package include patterns",
+    )
+    selected = [
+        path
+        for path in files
+        if any(PurePosixPath(path).full_match(pattern[1:]) for pattern in patterns)
+    ]
+    output = subprocess.run(
+        ["git", "cat-file", "--batch"],
+        cwd=ROOT,
+        input="".join(f"{sha}:{path}\n" for path in selected).encode(),
+        capture_output=True,
+        check=True,
+        timeout=60,
+    ).stdout
+    contents = {}
+    offset = 0
+    for path in selected:
+        header_end = output.index(b"\n", offset)
+        _, _, size = output[offset:header_end].split()
+        start = header_end + 1
+        contents[path] = output[start : start + int(size)]
+        offset = start + int(size) + 1
+    return contents
+
+
+def normalized_dependencies(table):
+    normalized = dict(table)
+    for section, _ in DEPENDENCY_KINDS:
+        if section in table:
+            normalized[section] = {
+                name: {"version": dependency}
+                if isinstance(dependency, str)
+                else dependency
+                for name, dependency in table[section].items()
+            }
+    return normalized
+
+
+def normalized_manifest(manifest, files):
+    package = manifest["package"]
+    expected = normalized_dependencies({
+        key: value
+        for key, value in manifest.items()
+        if key not in {"workspace", "lints", "lib", *TARGET_DIRECTORIES}
+    })
+    if "target" in expected:
+        expected["target"] = {
+            platform: normalized_dependencies(table)
+            for platform, table in expected["target"].items()
+        }
+    expected["package"] = {
+        "build": "build.rs" if "build.rs" in files else False,
+        **{
+            f"auto{kind}": False
+            for kind in ["lib", "bins", "examples", "tests", "benches"]
+        },
+        **package,
+    }
+    lints = manifest.get("lints")
+    if lints == {"workspace": True}:
+        lints = manifest["workspace"]["lints"]
+    if lints is not None:
+        expected["lints"] = lints
+    if "src/lib.rs" in files or "lib" in manifest:
+        expected["lib"] = {
+            "name": package["name"].replace("-", "_"),
+            "path": "src/lib.rs",
+            **manifest.get("lib", {}),
+        }
+    for kind, directory in TARGET_DIRECTORIES.items():
+        targets = {}
+        if kind == "bin" and "src/main.rs" in files:
+            targets[package["name"]] = {"name": package["name"], "path": "src/main.rs"}
+        for path in files:
+            if match := re.fullmatch(rf"{directory}/([^/]+)(?:\.rs|/main\.rs)", path):
+                targets[match[1]] = {"name": match[1], "path": path}
+        for target in manifest.get(kind, []):
+            targets[target["name"]] = {**targets.get(target["name"], {}), **target}
+        if targets:
+            expected[kind] = sorted(targets.values(), key=lambda target: target["name"])
+    return expected
+
+
+def verify_archive(archive, context, committed):
+    prefix = f"{CRATE}-{context['version']}/"
+    with tarfile.open(archive) as source:
+        members = source.getmembers()
+        names = [member.name for member in members]
+        require(len(set(names)) == len(names), "Archive repeats a member")
+        require(
+            all(member.isfile() for member in members),
+            "Archive members must be regular files",
+        )
+        require(
+            all(name.startswith(prefix) for name in names),
+            "Archive member outside the package directory",
+        )
+        packaged = {}
+        for member in members:
+            with source.extractfile(member) as file:
+                packaged[member.name.removeprefix(prefix)] = file.read()
+    require(
+        packaged.keys() == {*committed, ".cargo_vcs_info.json", "Cargo.toml.orig"},
+        "Archive files differ from the approved commit",
+    )
+    require(
+        json.loads(packaged.pop(".cargo_vcs_info.json"))
+        == {"git": {"sha1": context["sourceSha"]}, "path_in_vcs": ""},
+        "Archive commit mismatch",
+    )
+    require(
+        packaged.pop("Cargo.toml.orig") == committed["Cargo.toml"],
+        "Archive Cargo.toml.orig differs from the approved Cargo.toml",
+    )
+    require(
+        tomllib.loads(packaged.pop("Cargo.toml").decode())
+        == normalized_manifest(
+            tomllib.loads(committed["Cargo.toml"].decode()), set(committed)
+        ),
+        "Archive Cargo.toml differs from the approved Cargo.toml",
+    )
+    for name, data in packaged.items():
+        require(
+            data == committed[name], f"Archive {name} differs from the approved commit"
+        )
+
+
+def archive_digest(archive, context, committed):
+    verify_archive(archive, context, committed)
     with archive.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
 
@@ -155,11 +304,7 @@ def publication_metadata(archive, context):
             metadata[key.replace("-", "_")] = package.get(key)
     tables = [(None, manifest), *manifest.get("target", {}).items()]
     for target, table in tables:
-        for section, kind in [
-            ("dependencies", "normal"),
-            ("dev-dependencies", "dev"),
-            ("build-dependencies", "build"),
-        ]:
+        for section, kind in DEPENDENCY_KINDS:
             for name, dependency in table.get(section, {}).items():
                 require(
                     isinstance(dependency, dict) and "version" in dependency,
@@ -190,9 +335,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
-def publish_archive(archive, context, token):
+def publish_archive(archive, context, token, committed):
     require(token, "Crates.io token is missing")
-    archive_digest(archive, context)
+    verify_archive(archive, context, committed)
     metadata = json.dumps(publication_metadata(archive, context)).encode()
     crate = archive.read_bytes()
     # Cargo's registry protocol sends length-prefixed metadata and archive bytes.
@@ -310,9 +455,9 @@ def main():
     if command == "check":
         check(context)
     elif command == "publish":
-        publish_archive(archive, context, token)
+        publish_archive(archive, context, token, committed_files(context["sourceSha"]))
     elif command in ["candidate", "crate-report"]:
-        digest = archive_digest(archive, context)
+        digest = archive_digest(archive, context, committed_files(context["sourceSha"]))
         entry = registry_version(version)
         if entry is not None or command == "crate-report":
             validate_registry(entry, version, digest)
