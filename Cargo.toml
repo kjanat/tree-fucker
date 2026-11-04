@@ -32,7 +32,6 @@ all-features = true
 
 [workspace]
 [workspace.lints]
-cargo   = { implicit_features = "warn" }
 clippy  = {}
 rust    = {}
 rustdoc = { all = "deny" }

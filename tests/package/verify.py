@@ -12,6 +12,7 @@ from pathlib import Path
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_TOOLCHAIN = "nightly-2026-10-29"
 
 
 def cargo(toolchain, *args, cwd, capture=False):
@@ -32,15 +33,26 @@ def package(allow_dirty):
     output.mkdir(parents=True, exist_ok=True)
     dirty = ["--allow-dirty"] if allow_dirty else []
     metadata = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
-    toolchain = metadata["rust-version"]
     listing = cargo(
-        toolchain, "package", "--list", "--locked", *dirty, cwd=ROOT, capture=True
+        PACKAGE_TOOLCHAIN,
+        "package",
+        "--list",
+        "--locked",
+        *dirty,
+        cwd=ROOT,
+        capture=True,
     )
     (output / "files.txt").write_text(listing)
-    cargo(toolchain, "package", "--locked", *dirty, cwd=ROOT)
+    cargo(PACKAGE_TOOLCHAIN, "package", "--locked", *dirty, cwd=ROOT)
     for features in [[], ["--features", "tokio"]]:
         cargo(
-            toolchain, "publish", "--dry-run", "--locked", *features, *dirty, cwd=ROOT
+            PACKAGE_TOOLCHAIN,
+            "publish",
+            "--dry-run",
+            "--locked",
+            *features,
+            *dirty,
+            cwd=ROOT,
         )
     return output / f"{metadata['name']}-{metadata['version']}.crate"
 

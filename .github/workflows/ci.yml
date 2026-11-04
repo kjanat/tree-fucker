@@ -104,7 +104,7 @@ jobs:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
       - name: Install Rust toolchains
-        run: rustup toolchain install stable 1.99.1 --profile minimal --no-self-update
+        run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
       - name: Package, dry-run publication, and exercise stable consumers
         run: python3 tests/package/verify.py --toolchain stable
       - name: Check release publication gates
