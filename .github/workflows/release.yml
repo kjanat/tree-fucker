@@ -53,7 +53,7 @@ jobs:
           ref: ${{ fromJSON(needs.authorize.outputs.context).sourceSha }}
           persist-credentials: false
       - name: Install Rust toolchains
-        run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
+        run: rustup toolchain install stable 1.99.1 --profile minimal --no-self-update
       - name: Verify the release archive and stable consumers
         run: python3 tests/package/verify.py --toolchain stable
       - name: Verify release-baseline consumers

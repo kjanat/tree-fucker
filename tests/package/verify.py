@@ -31,16 +31,17 @@ def package(allow_dirty):
     output = ROOT / "target/package"
     output.mkdir(parents=True, exist_ok=True)
     dirty = ["--allow-dirty"] if allow_dirty else []
+    metadata = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
+    toolchain = metadata["rust-version"]
     listing = cargo(
-        "nightly", "package", "--list", "--locked", *dirty, cwd=ROOT, capture=True
+        toolchain, "package", "--list", "--locked", *dirty, cwd=ROOT, capture=True
     )
     (output / "files.txt").write_text(listing)
-    cargo("nightly", "package", "--locked", *dirty, cwd=ROOT)
+    cargo(toolchain, "package", "--locked", *dirty, cwd=ROOT)
     for features in [[], ["--features", "tokio"]]:
         cargo(
-            "nightly", "publish", "--dry-run", "--locked", *features, *dirty, cwd=ROOT
+            toolchain, "publish", "--dry-run", "--locked", *features, *dirty, cwd=ROOT
         )
-    metadata = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
     return output / f"{metadata['name']}-{metadata['version']}.crate"
 
 
