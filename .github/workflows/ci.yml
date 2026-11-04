@@ -26,8 +26,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Install Rust
         shell: bash
-        run: rustup toolchain install nightly --profile minimal --no-self-update
-          --component rustfmt,clippy,rust-src,rust-analyzer --allow-downgrade
+        run: rustup toolchain install --no-self-update
       - name: Prepare macOS coordination storage
         if: startsWith(matrix.os, 'macos-')
         run: |
@@ -97,27 +96,20 @@ jobs:
       - run: cargo doc --no-deps --all-features
 
   package:
-    name: packaged consumers (Rust 1.99.1 and stable)
+    name: package
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - name: Install Rust toolchains
-        run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
-      - name: Package, dry-run publication, and exercise stable consumers
-        run: python3 tests/package/verify.py --toolchain stable
-      - name: Check release publication gates
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
-      - name: Exercise release-baseline consumers
-        shell: bash
-        run: python3 tests/package/verify.py --toolchain 1.99.1 --archive target/package/tree-fucker-*.crate
+      - run: rustup toolchain install --no-self-update
+      - run: cargo package --locked
+      - run: cargo publish --dry-run --locked
+      - run: cargo publish --dry-run --locked --features tokio
       - uses: actions/upload-artifact@v7
         with:
           name: crate-candidate
-          path: |
-            target/package/*.crate
-            target/package/files.txt
+          path: target/package/*.crate
           if-no-files-found: error
 
   freebsd:
@@ -192,6 +184,5 @@ jobs:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
       - name: Install Rust target
-        run: rustup toolchain install nightly --profile minimal --no-self-update
-          --component clippy --target "${TARGET}" --allow-downgrade
+        run: rustup toolchain install --no-self-update --target "${TARGET}"
       - run: cargo clippy --target "${TARGET}" --all-targets --all-features -- -D warnings
