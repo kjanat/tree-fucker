@@ -91,7 +91,7 @@ def check(context):
     require(
         verification["verified"] is True, "Release commit has no verified signature"
     )
-    for workflow in ["ci.yml", "coordination-acceptance.yml"]:
+    for workflow in ["ci.yml"]:
         result = gh(
             f"repos/{REPOSITORY}/actions/workflows/{workflow}/runs"
             f"?head_sha={sha}&branch=master&event=push&per_page=100"

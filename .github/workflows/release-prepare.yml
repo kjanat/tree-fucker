@@ -1,12 +1,16 @@
 ---
 name: Prepare release
-run-name: Release operation ${{ inputs.beepboop_execution_id }}
+run-name: ${{ inputs.beepboop_title || github.workflow }}
 on:
   workflow_dispatch:
     inputs:
       beepboop_execution_id:
         description: Execution created by Beepboop
         required: true
+        type: string
+      beepboop_title:
+        description: Run title sent by Beepboop
+        required: false
         type: string
 permissions: { contents: read }
 env:
@@ -20,7 +24,7 @@ jobs:
     timeout-minutes: 20
     permissions: { contents: read, id-token: write }
     steps:
-      - uses: kjanat/beepboop/actions/begin@fb304b08fd2b622f70cac70a4ed428da143d10f2
+      - uses: kjanat/beepboop/actions/begin@v1
         id: release
         with:
           execution-id: ${{ inputs.beepboop_execution_id }}
@@ -31,13 +35,13 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install --no-self-update
-      - uses: kjanat/beepboop/actions/prepare@fb304b08fd2b622f70cac70a4ed428da143d10f2
+      - uses: kjanat/beepboop/actions/prepare@v1
         with:
           context: ${{ steps.release.outputs.context }}
           mode: apply
       - name: Refresh the package lockfile and check all targets
         run: cargo check --all-targets --all-features
-      - uses: kjanat/beepboop/actions/prepare@fb304b08fd2b622f70cac70a4ed428da143d10f2
+      - uses: kjanat/beepboop/actions/prepare@v1
         with:
           context: ${{ steps.release.outputs.context }}
           mode: submit
