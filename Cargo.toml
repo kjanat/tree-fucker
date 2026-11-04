@@ -3,7 +3,6 @@ name          = "tree-fucker"
 version       = "0.1.0"
 authors       = ["Kaj Kowalski"]
 edition       = "2024"
-rust-version  = "1.99.1"
 description   = "Resource-governed filesystem scans and immutable, reconciled tree snapshots"
 documentation = "https://docs.rs/tree-fucker"
 readme        = "README.md"

@@ -29,7 +29,7 @@ The normative behaviour is specified in [`rfc/tree-fucker.txt`](rfc/tree-fucker.
 
 ## Quick start
 
-Consumers require Rust 1.99.1 or newer. With Tokio integration:
+With Tokio integration:
 
 ```toml
 [dependencies]
@@ -165,7 +165,7 @@ Hard limits do not masquerade as eventual convergence. If configured limits make
 
 ## Compatibility and licensing
 
-Rust 1.99.1 is the supported compiler floor for the `0.1.x` series, including the optional `tokio` integration. CI builds and runs isolated consumers of the packaged crate on that compiler and current stable Rust. Raising the compiler floor, removing a supported platform, or making an incompatible public-API change requires a minor-version bump while the crate is below 1.0, with the change recorded in the release notes.
+Removing a supported platform or making an incompatible public-API change requires a minor-version bump while the crate is below 1.0, with the change recorded in the release notes.
 
 Shared coordination has an independent format contract: protocol 1, journal 1, and authority snapshots 2 (without clock binding) or 3 (with clock binding). See [coordination compatibility](rfc/coordination.md#release-compatibility) for joining and recovery rules. Crate versions do not appear in authority names. An incompatible or damaged authority is preserved and rejected, never replaced with a new budget. After joining, an authority failure never falls back to process-only governance.
 

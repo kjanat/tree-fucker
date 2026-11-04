@@ -7,9 +7,8 @@ traversal and persistent, reconciled `Tree` snapshots with optional Tokio
 integration. Process-only governance is the default; shared coordination is
 opt-in and adds cross-process safety with additional transaction overhead.
 
-- Consumers require Rust 1.99.1 or newer. Repository development tools use nightly.
-- Public APIs, the compiler floor, and supported platforms remain compatible
-  within `0.1.x`; incompatible changes require a minor-version bump.
+- Public APIs and supported platforms remain compatible within `0.1.x`;
+  incompatible changes require a minor-version bump.
 - Shared authorities use protocol 1, journal 1, and snapshot formats 2 or 3.
   Incompatible versions preserve retained accounting and refuse participation.
 - Unix initialization explicitly releases bookkeeping exclusion on success,
@@ -21,9 +20,7 @@ opt-in and adds cross-process safety with additional transaction overhead.
 - Licensed under MIT OR Apache-2.0.
 
 Before publication, require a successful main CI run on the exact candidate SHA,
-including the native macOS repetitions and the packaged-consumer job. That job
-retains the verified `.crate` archive and file list, performs both publication
-dry runs, and runs separate default-feature Scan and Tokio Tree consumers on
-Rust 1.99.1 and stable outside repository Cargo configuration. The existing release
-automation still requires maintainer approval; these changes do not publish a
-crate or create a release.
+including the native macOS repetitions and the package job. That job packages
+the crate, performs both publication dry runs, and retains the `.crate` archive.
+The release automation still requires maintainer approval; these changes do not
+publish a crate or create a release.
