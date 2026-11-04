@@ -140,6 +140,8 @@ fn physical_process_fixture() {
     fs::write(root.join(format!("joined-{index}")), []).unwrap();
     wait_for(root, "dispatch", 1);
     let deadline = Instant::now() + TIMEOUT;
+    // Settling held reads can exhaust the duty budget. A denied start keeps
+    // its preparation and must wait for refill as well as physical capacity.
     loop {
         match prepared.try_run(|admission| {
             assert_eq!(admission.operations, 1);
@@ -150,7 +152,9 @@ fn physical_process_fixture() {
             Err(
                 Error::Busy
                 | Error::Authority(
-                    authority::Error::Protocol(protocol::Error::PhysicalCapacity) | authority::Error::DomainPhysical,
+                    authority::Error::Protocol(protocol::Error::PhysicalCapacity)
+                    | authority::Error::DomainPhysical
+                    | authority::Error::Budget,
                 ),
             ) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
             Err(error) => panic!("physical admission failed: {error}"),
