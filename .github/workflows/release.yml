@@ -83,12 +83,9 @@ jobs:
         env:
           TAG: ${{ steps.candidate.outputs.tag }}
           SOURCE_SHA: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
-          PRERELEASE: ${{ steps.candidate.outputs.prerelease }}
-        run: |
-          flags=()
-          if [[ "${PRERELEASE}" == true ]]; then flags+=(--prerelease); fi
-          gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag \
-            --target "${SOURCE_SHA}" --title "${TAG}" --generate-notes "${flags[@]}"
+          PRERELEASE: "${{ case(steps.candidate.outputs.prerelease == 'true', '--prerelease', '') }}"
+        run: gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag
+          --target "${SOURCE_SHA}" --title "${TAG}" --generate-notes ${{ env.PRERELEASE }}
       - name: Verify the published release and tag
         id: github
         env:
