@@ -7,8 +7,6 @@ traversal and persistent, reconciled `Tree` snapshots with optional Tokio
 integration. Process-only governance is the default; shared coordination is
 opt-in and adds cross-process safety with additional transaction overhead.
 
-- Public APIs and supported platforms remain compatible within `0.1.x`;
-  incompatible changes require a minor-version bump.
 - Shared authorities use protocol 1, journal 1, and snapshot formats 2 or 3.
   Incompatible versions preserve retained accounting and refuse participation.
 - Unix initialization explicitly releases bookkeeping exclusion on success,
