@@ -4,7 +4,7 @@
 
 It combines direct directory reconciliation, optional watcher hints, explicit storage-domain semantics, and a process-wide resource governor behind one interface. The goal is simple: keep converging on reality without accidentally turning a slow, remote, gigantic, or broken filesystem into a six-hour RAM-and-I/O bonfire.
 
-> **Status:** 0.1, new. The RFC is normative and the test suite covers it natively on Linux, macOS, Windows, FreeBSD and illumos. The public API changes when the RFC changes.
+> **Status:** 0.1, new. The RFC is normative and the test suite covers it natively on Linux, macOS, Windows, FreeBSD and illumos. `0.1.x` releases preserve public-API compatibility; incompatible API changes move to `0.2.0`.
 
 ## What it does
 
@@ -29,22 +29,24 @@ The normative behaviour is specified in [`rfc/tree-fucker.txt`](rfc/tree-fucker.
 
 ## Quick start
 
-The crate currently uses Rust nightly. With Tokio integration:
+Consumers require Rust 1.99.1 or newer. With Tokio integration:
 
 ```toml
 [dependencies]
-tree-fucker = { git = "https://github.com/kjanat/tree-fucker", features = ["tokio"] }
-tokio       = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tree-fucker = { version = "0.1", features = ["tokio"] }
+tokio       = { version = "1", features = ["macros", "rt", "time"] }
 ```
 
-A minimal tree:
+A minimal tree (also compiled as [`examples/tree.rs`](examples/tree.rs)):
+
+<!-- example: tree -->
 
 ```rust
 use std::{path::PathBuf, sync::Arc};
 
 use tree_fucker::{Config, LoadAll, Tree, runtime::TokioRuntime, std_fs::StdFileSystem};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> tree_fucker::Result<()> {
     let filesystem = Arc::new(StdFileSystem::new());
     let runtime = Arc::new(TokioRuntime::current());
@@ -62,6 +64,8 @@ async fn main() -> tree_fucker::Result<()> {
     println!("health: {health:?}");
     println!("stats: {stats:?}");
 
+    // Stop reconciliation before draining the remaining updates.
+    tree.shutdown().await?;
     while let Some(event) = updates.next().await {
         println!("{event:?}");
     }
@@ -74,7 +78,9 @@ async fn main() -> tree_fucker::Result<()> {
 
 ### One-shot scans
 
-A consumer that walks a tree once, such as a query tool, opens a `Scan` instead of a `Tree`. It is a synchronous iterator with no runtime, snapshot, watcher, or reconciliation. Every operation still goes through the process-wide governor and draws on the foreground allowance.
+A consumer that walks a tree once, such as a query tool, opens a `Scan` instead of a `Tree`. It is a synchronous iterator with no runtime, snapshot, watcher, or reconciliation. Every operation still goes through the process-wide governor and draws on the foreground allowance. The following is compiled as [`examples/scan.rs`](examples/scan.rs).
+
+<!-- example: scan -->
 
 ```rust
 use std::{path::PathBuf, sync::Arc};
@@ -149,13 +155,21 @@ FreeBSD discovery requires an administrator-mounted tmpfs at `/var/run/tree-fuck
 
 illumos discovery uses an administrator-created sticky directory at `/var/run/tree-fucker` on tmpfs. Root identity and the zone incarnation qualify each authority; domains without cross-process identity still consume the shared aggregate allowance.
 
-The macOS adapter uses an administrator-mounted tmpfs at `/var/run/tree-fucker`; its native acceptance is tracked in [the platform contracts](rfc/coordination-platforms.md#macos).
+The macOS adapter uses an administrator-mounted tmpfs at `/var/run/tree-fucker`; its native acceptance is tracked in [the platform contracts](rfc/coordination-platforms.md#macos). Physical sleep/wake acceptance remains outstanding in [#20](https://github.com/kjanat/tree-fucker/issues/20); this configuration is not yet validated across physical power transitions. Solaris shared coordination remains unavailable ([#19](https://github.com/kjanat/tree-fucker/issues/19)); process-only operation is supported.
 
 The Windows adapter retains its journal under the effective user's OS-configured local application-data directory, verifies local NTFS/ReFS storage and protected permissions, and uses exclusive file handles for operation ownership. Native acceptance and retained accounting across reboot are tracked in [the Windows contract](rfc/coordination-platforms.md#windows).
 
 `ProcessOnly` remains the default. `Required` requires shared admission for every governed operation. `Auto` permits process-only fallback when the native backend is unavailable before joining and reports the reason in `coordination_status()`. Busy, full, incompatible, or damaged authorities return errors. Once joined, a failed authority stops new work while existing physical operations retain their ownership. `HostGovernor::configured` constructs the same policy for an explicit Scan or Tree governor. See the [coordination protocol](rfc/coordination.md) for scope lifetime, identity, and recovery.
 
 Hard limits do not masquerade as eventual convergence. If configured limits make required work impossible, the tree reports `ResourceLimited` rather than promising to finish someday.
+
+## Compatibility and licensing
+
+Rust 1.99.1 is the supported compiler floor for the `0.1.x` series, including the optional `tokio` integration. CI builds and runs isolated consumers of the packaged crate on that compiler and current stable Rust. Raising the compiler floor, removing a supported platform, or making an incompatible public-API change requires a minor-version bump while the crate is below 1.0, with the change recorded in the release notes.
+
+Shared coordination has an independent format contract: protocol 1, journal 1, and authority snapshots 2 (without clock binding) or 3 (with clock binding). See [coordination compatibility](rfc/coordination.md#release-compatibility) for joining and recovery rules. Crate versions do not appear in authority names. An incompatible or damaged authority is preserved and rejected, never replaced with a new budget. After joining, an authority failure never falls back to process-only governance.
+
+Copyright (c) 2026 Kaj Kowalski. Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
 ## Specification
 
@@ -166,31 +180,14 @@ The RFC is the contract:
 
 The implementation and tests are intended to follow the RFC rather than leave important consistency or resource-safety behaviour implicit in code.
 
-## Development
+## Contributing
 
-The repository pins Rust nightly and includes `rustfmt`, Clippy, and `rust-analyzer` components.
-
-Typical checks:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features
-cargo test --all-features
-cargo doc --no-deps --all-features
-```
-
-The RFC site tooling uses Bun.
-
-```sh
-bun install
-```
-
-See the workflows in [`.github/workflows`](.github/workflows) for the platform matrix and site build used by CI.
+See [CONTRIBUTING.md](https://github.com/kjanat/tree-fucker/blob/master/CONTRIBUTING.md) for development setup, checks, package verification, and benchmarks.
 
 ## Name
 
 Yes, the crate is called `tree-fucker`.
 
-## Performance probes
+## Performance
 
-The [benchmark guide](benchmarks/README.md) documents `cargo bench:layers` and `cargo bench:alloc` for raw Scan, anchor budgets, path materialization, allocation counts and profiling. Both probes run correctness smoke checks in CI.
+Shared coordination trades extra CPU, allocation, and filesystem transactions for cross-process resource safety. It is not an automatic traversal speedup. Historical Linux measurements show the largest relative overhead for cheap cached reads, much smaller relative overhead for slow filesystem calls, and zero authority access while idle. See the [recorded baseline and optimizations](https://github.com/kjanat/tree-fucker/blob/master/benchmarks/coordination-baseline.md); these are historical results, not measurements of every release. Process-only governance remains the default.

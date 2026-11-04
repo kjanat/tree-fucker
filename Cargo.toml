@@ -1,7 +1,31 @@
 [package]
-name    = "tree-fucker"
-version = "0.1.0"
-edition = "2024"
+name          = "tree-fucker"
+version       = "0.1.0"
+authors       = ["Kaj Kowalski"]
+edition       = "2024"
+rust-version  = "1.99.1"
+description   = "Resource-governed filesystem scans and immutable, reconciled tree snapshots"
+documentation = "https://docs.rs/tree-fucker"
+readme        = "README.md"
+homepage      = "https://tree-fucker.kjanat.dev/"
+repository    = "https://github.com/kjanat/tree-fucker"
+license       = "MIT OR Apache-2.0"
+keywords      = ["directory", "filesystem", "resource-limits", "snapshot", "traversal"]
+categories    = ["asynchronous", "concurrency", "filesystem"]
+include       = [
+  "/src/**",
+  "/tests/**",
+  "/examples/**",
+  "/benches/**",
+  "/benchmarks/baselines/fsql/*.rs",
+  "/rfc/*.md",
+  "/rfc/*.txt",
+  "/README.md",
+  "/LICENSE*",
+  "/CHANGELOG.md",
+  "/Cargo.toml",
+  "/Cargo.lock"
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -12,6 +36,10 @@ cargo   = { implicit_features = "warn" }
 clippy  = {}
 rust    = {}
 rustdoc = { all = "deny" }
+
+[[example]]
+name              = "tree"
+required-features = ["tokio"]
 
 [[bench]]
 harness = false
@@ -48,7 +76,7 @@ optional = true
 futures-executor = "0.3.34"
 stats_alloc      = "0.1.10"
 tempfile         = "3.27.0"
-tokio            = { version = "1.54.1", features = ["rt", "time"] }
+tokio            = { version = "1.54.1", features = ["macros", "rt", "time"] }
 
 [target."cfg(any(unix, windows))".dependencies]
 getrandom = { version = "0.4.3", features = ["std"] }

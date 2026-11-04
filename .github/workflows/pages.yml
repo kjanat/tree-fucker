@@ -9,6 +9,7 @@ permissions: { contents: read, pages: write, id-token: write }
 defaults: { run: { working-directory: rfc } }
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUSTDOCFLAGS: -D warnings
   SITE_REQUIRE_API: "1"
 
@@ -21,8 +22,8 @@ jobs:
           - uses: oven-sh/setup-bun@v2
           - uses: kjanat/dprint-check@v3
             with: { install-only: true }
-          - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+          - name: Install Rust
+            run: rustup toolchain install nightly --profile minimal --no-self-update
       - run: cargo doc --no-deps --all-features
         working-directory: .
       - run: bun install --frozen-lockfile

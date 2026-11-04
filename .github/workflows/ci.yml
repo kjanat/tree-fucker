@@ -11,6 +11,7 @@ permissions: { contents: read }
 concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: "${{ github.event_name == 'pull_request' }}" }
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUSTDOCFLAGS: -D warnings
 
 jobs:
@@ -23,10 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-        with: { components: "rustfmt, clippy, rust-src, rust-analyzer" }
-      - uses: Swatinem/rust-cache@v2
-        with: { save-if: "${{ github.event_name != 'pull_request' }}" }
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+          --component rustfmt,clippy,rust-src,rust-analyzer --allow-downgrade
       - name: Prepare macOS coordination storage
         if: startsWith(matrix.os, 'macos-')
         run: |
@@ -94,6 +95,28 @@ jobs:
           test_executable=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "coordination_macos") | .executable // empty' target/macos-coordination-build.jsonl)
           sudo "${test_executable}" privileged_ --ignored --nocapture
       - run: cargo doc --no-deps --all-features
+
+  package:
+    name: packaged consumers (Rust 1.99.1 and stable)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - name: Install Rust toolchains
+        run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
+      - name: Package, dry-run publication, and exercise stable consumers
+        run: python3 tests/package/verify.py --toolchain stable
+      - name: Exercise release-baseline consumers
+        shell: bash
+        run: python3 tests/package/verify.py --toolchain 1.99.1 --archive target/package/tree-fucker-*.crate
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crate-candidate
+          path: |
+            target/package/*.crate
+            target/package/files.txt
+          if-no-files-found: error
 
   freebsd:
     name: freebsd-15
@@ -166,8 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@nightly
-        with: { components: clippy, targets: "${{ matrix.target }}" }
-      - uses: Swatinem/rust-cache@v2
-        with: { key: "${{ matrix.target }}", save-if: "${{ github.event_name != 'pull_request' }}" }
+      - name: Install Rust target
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+          --component clippy --target "${TARGET}" --allow-downgrade
       - run: cargo clippy --target "${TARGET}" --all-targets --all-features -- -D warnings
