@@ -23,7 +23,7 @@ jobs:
           - uses: kjanat/dprint-check@v3
             with: { install-only: true }
           - name: Install Rust
-            run: rustup toolchain install nightly --profile minimal --no-self-update
+            run: rustup toolchain install --no-self-update
       - run: cargo doc --no-deps --all-features
         working-directory: .
       - run: bun install --frozen-lockfile

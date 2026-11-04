@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 20
     permissions: { contents: read, id-token: write }
     steps:
-      - uses: kjanat/beepboop/actions/begin@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
+      - uses: kjanat/beepboop/actions/begin@fb304b08fd2b622f70cac70a4ed428da143d10f2
         id: release
         with:
           execution-id: ${{ inputs.beepboop_execution_id }}
@@ -30,14 +30,14 @@ jobs:
           ref: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install nightly --profile minimal --no-self-update
-      - uses: kjanat/beepboop/actions/prepare@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
+        run: rustup toolchain install --no-self-update
+      - uses: kjanat/beepboop/actions/prepare@fb304b08fd2b622f70cac70a4ed428da143d10f2
         with:
           context: ${{ steps.release.outputs.context }}
           mode: apply
       - name: Refresh the package lockfile and check all targets
         run: cargo check --all-targets --all-features
-      - uses: kjanat/beepboop/actions/prepare@46b47ccaa2ab3d476fbf0ed0e2b8951600fb42ce
+      - uses: kjanat/beepboop/actions/prepare@fb304b08fd2b622f70cac70a4ed428da143d10f2
         with:
           context: ${{ steps.release.outputs.context }}
           mode: submit
