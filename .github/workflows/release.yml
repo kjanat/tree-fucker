@@ -9,6 +9,9 @@ on:
         required: true
         type: string
 permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 concurrency: { group: release-publish, cancel-in-progress: false }
 
 jobs:
@@ -32,10 +35,8 @@ jobs:
         env:
           RELEASE_CONTEXT: ${{ steps.release.outputs.context }}
         run: python3 scripts/release.py check
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust toolchains
+        run: rustup toolchain install nightly stable 1.99.1 --profile minimal --no-self-update
       - name: Verify the release archive and stable consumers
         run: python3 tests/package/verify.py --toolchain stable
       - name: Verify release-baseline consumers

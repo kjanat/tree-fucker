@@ -9,6 +9,9 @@ on:
         required: true
         type: string
 permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 concurrency: { group: release-prepare, cancel-in-progress: false }
 
 jobs:
@@ -26,8 +29,8 @@ jobs:
         with:
           ref: ${{ fromJSON(steps.release.outputs.context).sourceSha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal --no-self-update
       - uses: kjanat/beepboop/actions/prepare@dcfd2f7ff3525ec54582b32c737b44a5cc47147b
         with:
           context: ${{ steps.release.outputs.context }}
