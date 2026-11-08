@@ -138,8 +138,7 @@ jobs:
             "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET}"
       - uses: kjanat/beepboop/actions/publish-refs@v1
         env:
-          GIT_COMMITTER_NAME: ${{ steps.beepboop.outputs.bot-login }}
-          GIT_COMMITTER_EMAIL: ${{ steps.beepboop.outputs.bot-email }}
+          "${{ insert }}": ${{ fromJSON(steps.beepboop.outputs.gitId) }}
         with:
           token: ${{ steps.beepboop.outputs.token }}
       - uses: kjanat/beepboop/actions/publish-release@v1
