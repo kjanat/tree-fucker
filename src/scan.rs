@@ -52,7 +52,7 @@ pub trait Clock: Send + Sync {
 
     /// `sleep` blocks the calling thread for `duration`.
     ///
-    /// A simulated clock may advance its time instead.
+    /// A simulated clock may advance its time and return without blocking.
     fn sleep(&self, duration: Duration);
 
     /// `wait_for_change` blocks until the governor changes or `timeout` passes.
@@ -116,7 +116,8 @@ pub struct ScanOptions {
     ///
     /// Zero disables anchors.
     pub anchors: usize,
-    /// `anchor_policy` decides the fate of a listing without an anchor.
+    /// `anchor_policy` decides what the scan does with a listing that has no
+    /// anchor.
     pub anchor_policy: AnchorPolicy,
     /// `streaming` makes the scan yield bounded chunks before a listing ends.
     ///
@@ -418,8 +419,9 @@ struct Listing {
     session: Box<dyn ListingSession>,
     lease: u32,
     needs_operations: bool,
-    // Bytes already emitted are no longer live, but remain part of the
-    // whole-directory observation used to admit later full listings.
+    // Emitted bytes are no longer live. They still count toward the
+    // whole-directory observation that the scan uses to admit later full
+    // listings.
     emitted_bytes: u64,
 }
 
@@ -468,10 +470,10 @@ enum Admission {
 
 /// `Scan` walks a directory tree once, synchronously and governed (RFC §9.3).
 ///
-/// A scan iterates depth first, and it goes deep. It lists a directory,
-/// yields its children in enumeration order, and lists a child directory
-/// before the next sibling. The root is the first event. [`ScanPolicy`] selects
-/// the directories for listing. The scan never traverses symbolic links.
+/// A scan iterates depth first. It lists a directory, yields its children in
+/// enumeration order, and lists a child directory before the next sibling. The
+/// root is the first event. [`ScanPolicy`] selects the directories for listing.
+/// The scan never traverses symbolic links.
 ///
 /// By default each filesystem operation runs on the calling thread after
 /// the host governor grants it. [`Scan::with_listing_executor`] moves
@@ -530,8 +532,9 @@ impl Drop for ScanAccounting {
     }
 }
 
-// Kept separate from the scan's tree number: dropping the logical scan must not
-// forget the bounded buffer still owned by an uninterruptible listing.
+// `ListingResources` uses its own tree number, separate from the scan's.
+// Dropping the logical scan must not forget the bounded buffer that an
+// uninterruptible listing still owns.
 struct ListingResources {
     grant: Option<Granted>,
     governor: HostGovernor,
@@ -748,10 +751,10 @@ impl Scan {
     ///
     /// The executor is a bounded, reusable worker pool. Bootstrap, domain
     /// resolution, and enrichment stay inline. When a listing passes the
-    /// governor's stuck threshold, the scan reports it as unlisted. Its
-    /// worker, grant, and buffer allowance stay held until the physical call
-    /// completes. Healthy domains continue only while both pool and governor
-    /// capacity remain.
+    /// governor's stuck threshold, the scan reports it as unlisted. The
+    /// listing keeps its worker, grant, and buffer allowance until the
+    /// physical call completes. Healthy domains continue only while both pool
+    /// and governor capacity remain.
     pub fn with_listing_executor(mut self, executor: ListingExecutor) -> Self {
         self.accounting
             .get_or_insert_with(|| Arc::new(ScanAccounting { governor: self.governor.clone(), number: self.number }));
@@ -897,9 +900,10 @@ impl Scan {
             let now = self.now();
             self.governor.account_and_quarantine(now);
             if self.accounting.is_some() {
-                // This grant's reservation is already charged and may fill
-                // the ceiling exactly. Abort only if continuing physical
-                // work has pushed the command beyond its admitted budget.
+                // The governor already charged this grant's reservation, and
+                // the reservation may fill the ceiling exactly. Abort only if
+                // continuing physical work has pushed the command beyond its
+                // admitted budget.
                 if self.admitted_cost() > self.options.ceiling {
                     return Err(self.ceiling_reached());
                 }
@@ -1064,9 +1068,10 @@ impl Scan {
         if domain != parent.domain
             && let Some(discovery) = granted.take()
         {
-            // Discovery was authorized against the parent. Its permission
-            // cannot cover listing a newly resolved domain: settle it before
-            // resume_listing acquires a grant against the destination.
+            // The governor authorized discovery against the parent. That
+            // permission cannot cover listing a newly resolved domain. Settle
+            // it before resume_listing acquires a grant against the
+            // destination.
             self.settle(discovery, Some(Reported { blocking: None, operations: 1 }), Some(domain));
             self.record_success(Some(domain));
         }
@@ -1130,9 +1135,9 @@ impl Scan {
             );
             let overshoot = governor.overshoot_of(id);
             drop(memory.grant.take());
-            // On cancellation/timeout the receiver is gone: the returned
-            // session and its buffer are dropped here, after the
-            // physical call completes.
+            // After a cancellation or timeout, the receiver is gone. The
+            // returned session and its buffer drop here, after the physical
+            // call completes.
             let _ = sender.send((continuation, cost, overshoot, memory));
         })?;
         self.in_flight_bytes = 0;
@@ -1170,7 +1175,7 @@ impl Scan {
         let limits = self.governor.limits();
         let allowance = if self.listing_executor.is_some() {
             // A detached call can retain its whole allowance. Leave room for
-            // other physical slots instead of reserving the host's entire pool.
+            // other physical slots, and never reserve the host's entire pool.
             (limits.in_flight_listing_bytes / limits.maximum_in_flight as u64).max(1)
         } else {
             limits.in_flight_listing_bytes
@@ -1189,7 +1194,7 @@ impl Scan {
         };
         let domain = located.domain;
         // Domain resolution remains inline. Do not hold its physical grant
-        // while waiting for an executor slot, or charge worker queue
+        // while waiting for an executor slot, and do not charge worker queue
         // time as filesystem work.
         if (self.listing_executor.is_some() || !listing_allowed)
             && let Some(granted) = carried.take()

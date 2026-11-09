@@ -63,9 +63,10 @@ pub(crate) fn open(
     };
     let mut completion = IO_STATUS_BLOCK::default();
     let mut handle = null_mut();
-    // SAFETY: the parent and all descriptor/name buffers remain live for this
-    // synchronous call. The name is a single relative component; neither an
-    // alternate stream nor an object-manager/drive namespace can be supplied.
+    // SAFETY: the parent and every descriptor and name buffer remain live for
+    // this synchronous call. The name is a single relative component, so it
+    // cannot name an alternate stream, an object-manager namespace, or a
+    // drive namespace.
     let status = unsafe {
         NtCreateFile(
             &mut handle,
@@ -101,7 +102,7 @@ pub(crate) fn open(
 }
 
 /// `Directory` pins a directory and keeps its ancestors open without delete
-/// sharing until the directory is dropped.
+/// sharing until the `Directory` drops.
 ///
 /// Child operations use the final handle and never reconstruct an absolute
 /// path.
@@ -121,7 +122,7 @@ impl Directory {
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "coordination requires an absolute drive path"));
         }
-        // Resolve the drive root once. Every remaining component is resolved
+        // Resolve the drive root once. Resolve every remaining component
         // against its pinned parent, including when a DOS device map changes.
         let mut root = prefix.as_os_str().to_os_string();
         root.push("\\");

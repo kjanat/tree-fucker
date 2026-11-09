@@ -263,7 +263,7 @@ pub enum ThrottleCause {
     },
     /// `StuckWorker` means a stuck worker quarantines the domain.
     ///
-    /// The domain admits nothing new until the worker pulls out.
+    /// The domain admits nothing new until the stuck worker returns.
     StuckWorker,
     /// `Coordination` means the shared cross-process authority denied the work.
     Coordination,

@@ -7,7 +7,7 @@ use super::{authority, protocol};
 /// The application chooses a mode before any filesystem work and passes it to
 /// [`HostGovernor::configured`](crate::HostGovernor::configured) or
 /// [`HostGovernor::install_with_coordination`](crate::HostGovernor::install_with_coordination).
-/// The policy is specified in coordination.md, "Failure modes and API policy".
+/// coordination.md specifies the policy in "Failure modes and API policy".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     /// The governor admits work under process-local policy alone and performs
@@ -22,8 +22,6 @@ pub enum Mode {
     Auto(Options),
     /// The governor requires shared protection, and every discovery or join
     /// failure is an error.
-    ///
-    /// Protection is required every single time.
     Required(Options),
 }
 
@@ -221,7 +219,7 @@ pub enum ScopeIdentity {
     },
 }
 
-/// `State` reports the coordination policy a governor actually applies.
+/// `State` reports the coordination policy that a governor applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     /// The governor admits work under process-local policy alone.
@@ -239,7 +237,7 @@ pub enum State {
         scope: Box<ScopeInfo>,
         /// `failure` describes the failure that fenced shared admission.
         ///
-        /// The governor admits no new shared work while it is present.
+        /// The governor admits no new shared work while `failure` is `Some`.
         failure: Option<String>,
         /// `pending_settlements` counts the settlements and cancellations that
         /// wait for the bookkeeping lock.

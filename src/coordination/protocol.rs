@@ -128,7 +128,7 @@ pub enum Phase {
     /// The operation occupies physical capacity, and peers treat it as
     /// possibly running.
     StartAuthorized,
-    /// The owner acknowledged dispatch, and this phase serves diagnostics
+    /// The owner acknowledged dispatch, and this phase exists for diagnostics
     /// only.
     Running,
 }
@@ -212,7 +212,7 @@ pub enum Error {
     InvalidLimits,
     /// The caller supplied the zero generation.
     InvalidGeneration,
-    /// The caller speaks a protocol version other than [`VERSION`].
+    /// The caller uses a protocol version other than [`VERSION`].
     IncompatibleVersion,
     /// The requested participant slot is occupied or out of range, or the
     /// table is full.
@@ -406,8 +406,8 @@ impl Ledger {
 
     /// `leave` removes a participant that owns no live operations.
     ///
-    /// Orderly departure cannot forget outstanding ownership, and a
-    /// participant with live records receives [`Error::ParticipantBusy`].
+    /// `leave` never discards outstanding ownership, and a participant with
+    /// live records receives [`Error::ParticipantBusy`].
     pub fn leave(&mut self, participant: Participant) -> Result<(), Error> {
         self.member(participant)?;
         if self.records().any(|record| record.id.participant == participant) {
@@ -459,8 +459,8 @@ impl Ledger {
     /// `prepare` records a reservation for `id` exactly once.
     ///
     /// A repeated request with the same reservation succeeds without effect,
-    /// and a different one fails with [`Error::ConflictingRetry`]. The
-    /// identity of a reclaimed terminal record can never prepare again.
+    /// and a different one fails with [`Error::ConflictingRetry`]. `prepare`
+    /// never accepts the identity of a reclaimed terminal record again.
     pub fn prepare(&mut self, id: OperationId, reservation: Reservation) -> Result<(), Error> {
         let member = self.member(id.participant)?;
         if id.sequence < member.next_sequence {
@@ -645,8 +645,9 @@ impl Ledger {
         if record.phase == Phase::Prepared {
             return self.cancel(id);
         }
-        // Recovery needs no fresh report revision: it is a distinct terminal
-        // transaction, including when a report counter has reached u64::MAX.
+        // Recovery needs no fresh report revision. It is a distinct terminal
+        // transaction and works even when a report counter has reached
+        // u64::MAX.
         let elapsed = now.saturating_sub(record.authorized_at.expect("physical authorization has a clock"));
         let charged_ns = elapsed.saturating_sub(record.progress.elapsed_ns.max(record.reservation.estimated_ns));
         let failed = !record.progress.failed;

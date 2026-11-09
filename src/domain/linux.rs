@@ -21,8 +21,9 @@ use super::{
 use crate::path::CaseSensitivity;
 
 const STATX_MNT_ID_UNIQUE: StatxFlags = StatxFlags::from_bits_retain(0x4000);
-// `AT_STATX_DONT_SYNC`, which rustix's libc backend doesn't define on every
-// target (ex. loongarch64 musl). The kernel uses the same value on all of them.
+// This is `AT_STATX_DONT_SYNC`. The libc backend of rustix lacks it on some
+// targets, such as loongarch64 musl. The kernel uses the same value on every
+// target.
 const STATX_DONT_SYNC: AtFlags = AtFlags::from_bits_retain(0x4000);
 const FS_CASEFOLD_FL: IFlags = IFlags::from_bits_retain(0x4000_0000);
 const MOUNTINFO: &str = "/proc/self/mountinfo";

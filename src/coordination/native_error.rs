@@ -16,15 +16,15 @@ pub enum Error {
     Busy,
     /// An operating-system call on the scope's files failed.
     Io(io::Error),
-    /// The retained journal could not be read, recovered, or published.
+    /// The connection could not read, recover, or publish the retained journal.
     Journal(journal::Error),
     /// The shared authority rejected the requested transition.
     Authority(authority::Error),
     /// The scope location or one of its files fails the platform's storage,
     /// ownership, or permission requirements.
     InvalidScope,
-    /// Someone removed or replaced the scope directory, anchor, state file, or
-    /// an owner file after the connection pinned it.
+    /// The scope directory, anchor, state file, or an owner file was removed
+    /// or replaced after the connection pinned it.
     Replaced,
     /// The retained authority records a different configuration, generation,
     /// or scope identity, or the caller's security context changed.

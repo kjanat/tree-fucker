@@ -156,8 +156,8 @@ fn history(journal: bool) {
         let state_id = identity(&File::open(path.join(STATE)).unwrap()).unwrap();
         writer.0.kill().unwrap();
         assert!(!writer.0.wait().unwrap().success());
-        // Process termination may be observed before Windows releases its
-        // byte-range locks. Wait for that kernel lifetime evidence explicitly.
+        // The test can observe process termination before Windows releases
+        // the writer's byte-range locks. Wait until the lock is free.
         let anchor = File::options().read(true).write(true).open(&anchor_path).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {

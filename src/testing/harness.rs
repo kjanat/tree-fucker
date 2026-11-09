@@ -994,7 +994,8 @@ impl Harness {
         self.drive(target, |_| {});
     }
 
-    /// `flood_hints_until` drives the harness under a watcher hint storm.
+    /// `flood_hints_until` drives the harness and sends watcher hints at every
+    /// step.
     ///
     /// It drives like [`Harness::run_jobs_until`]. Before each step it sends
     /// one hint of `kind` for all of `paths`. It returns the number of sent

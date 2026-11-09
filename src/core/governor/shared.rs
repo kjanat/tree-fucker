@@ -73,9 +73,9 @@ impl State {
         let cause = match error {
             native::Error::Busy
             | native::Error::Authority(authority::Error::Protocol(protocol::Error::PhysicalCapacity)) => {
-                // Short lock/occupancy conflicts can resolve within one lease.
-                // Back off only after actual denials, never when reading a
-                // hint.
+                // A short lock or occupancy conflict can clear within one
+                // lease. Only a denial starts a backoff. Reading a hint leaves
+                // the backoff unchanged.
                 let delay = self.retry.map_or(FIRST_RETRY, |retry| retry.delay.saturating_mul(2).min(MAX_RETRY));
                 self.retry = Some(Retry { at: now + delay, delay });
                 ThrottleCause::Coordination
@@ -180,13 +180,15 @@ impl Binding {
         let id = reservation.id;
         let mut local_reservation = reservation.clone();
         if let Some(ceiling) = local_ceiling {
-            // The local hold caps only local repricing. The shared authority
-            // must see the caller's allowance, not our cost estimate.
+            // The local ceiling caps only local repricing. The shared
+            // authority receives the caller's allowance from the unmodified
+            // reservation.
             local_reservation.ceiling = Some(reservation.ceiling.unwrap_or(Duration::MAX).min(ceiling));
         }
         let local = guard(&host.inner).try_prepare(local_reservation, now)?;
-        // Local budget stays provisional throughout the native transaction.
-        // No local governor mutex is held while acquiring the shared lock.
+        // The local budget stays provisional for the whole native
+        // transaction. `admit` holds no local governor mutex while it acquires
+        // the shared lock.
         let result = (|| {
             let domain = match reservation.domain {
                 None => None,
@@ -289,8 +291,9 @@ impl Binding {
                 return Err(ThrottleCause::Memory);
             }
             // Running work can consume the remaining duty budget while
-            // this preparation waits for shared capacity. Its own hold is
-            // already reserved, but other preparations must remain charged.
+            // this preparation waits for shared capacity. The check excludes
+            // the hold of this preparation, which the governor already
+            // reserved. It still counts the holds of other preparations.
             if id.release().is_none()
                 && nanos(local.admitted.cost)
                     > governor.affordable(domain, local.reservation.origin, local.reservation.ceiling, Some(id))
@@ -329,9 +332,10 @@ impl Binding {
     }
 
     pub(super) fn release(&self, host: &HostGovernor, id: GrantId, now: MonotonicTime) -> bool {
-        // Failed authority state still permits releasing completed local
-        // ownership. check_context checks process/security identity before
-        // returning Failed, so inherited or incompatible contexts stay fenced.
+        // A failed authority still permits the release of completed local
+        // ownership. `check_context` checks process and security identity
+        // before it returns `Failed`. An inherited or incompatible context
+        // therefore stays fenced.
         if !matches!(self.scope.check_context(), Ok(()) | Err(native::Error::Failed)) {
             return false;
         }
@@ -376,9 +380,10 @@ impl Binding {
     pub(super) fn retry_at(&self, host: &HostGovernor, now: MonotonicTime) -> Option<MonotonicTime> {
         match self.lock() {
             Ok(state) if state.failure.is_none() => {
-                // If local constraints prevented a retry at the old deadline,
-                // retain the backoff instead of scheduling an expired hint in
-                // a tight loop. Reading a future deadline never postpones it.
+                // When local constraints prevented a retry at the old
+                // deadline, the hint adds the old backoff delay to `now`. An
+                // expired hint would make callers retry in a tight loop.
+                // Reading a future deadline never postpones it.
                 let unblocked = state.retry.is_none() && {
                     let governor = guard(&host.inner);
                     governor.prepared.values().any(|prepared| {

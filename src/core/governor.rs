@@ -153,15 +153,16 @@ pub struct Grant {
     ///
     /// Any watch registration precedes this point.
     pub dispatched: Option<MonotonicTime>,
-    /// `stuck` is set once the worker exceeds [`HostConfig::stuck_threshold`].
+    /// `stuck` becomes true once the worker exceeds
+    /// [`HostConfig::stuck_threshold`].
     pub stuck: bool,
-    /// `failed` is set when this physical lease observes a failure.
+    /// `failed` becomes true when this physical lease fails.
     ///
     /// A rejected result also counts as a failure.
     pub failed: bool,
-    /// `listing` is set when the grant covers a listing lease.
+    /// `listing` is true when the grant covers a listing lease.
     pub listing: bool,
-    /// `registration` is set when the grant includes a watch registration.
+    /// `registration` is true when the grant includes a watch registration.
     pub registration: bool,
     /// The watch registration took this long.
     ///
@@ -177,7 +178,7 @@ pub struct DomainAccount {
     pub granted: Duration,
     /// The governor charged this worker time.
     ///
-    /// Overshoot and surcharges are included.
+    /// The total includes overshoot and surcharges.
     pub charged: Duration,
     /// The governor admitted this many grants against the account.
     pub grants: u64,
@@ -209,7 +210,7 @@ pub struct DomainView {
     pub granted: Duration,
     /// The governor charged this worker time on the domain.
     ///
-    /// Overshoot and surcharges are included.
+    /// The total includes overshoot and surcharges.
     pub charged: Duration,
     /// The governor admitted this many grants on the domain.
     pub grants: u64,
@@ -308,7 +309,7 @@ pub struct Reservation {
     pub domain: Option<StorageDomainId>,
     /// The step draws on the allowance of this origin.
     pub origin: WorkOrigin,
-    /// `listing` is set when the step is a listing lease.
+    /// `listing` is true when the step is a listing lease.
     ///
     /// The estimated result size of a listing counts against
     /// [`HostConfig::in_flight_listing_bytes`].
@@ -334,7 +335,7 @@ pub struct Admitted {
     pub cost: Duration,
     /// The grant permits this many per-child operations.
     ///
-    /// The work must perform no more.
+    /// The work must stay within this count.
     pub operations: u32,
 }
 
@@ -487,7 +488,7 @@ pub struct GovernorView {
     pub preparations: usize,
     /// The governor charged this much worker time in total.
     ///
-    /// Overshoot is included.
+    /// The total includes overshoot.
     pub charged: Duration,
     /// The governor charged this much in failure surcharges.
     pub surcharged: Duration,
@@ -1270,8 +1271,9 @@ impl Governor {
     }
 
     fn try_prepare(&mut self, mut reservation: Reservation, now: MonotonicTime) -> Result<Admitted, ThrottleCause> {
-        // A preparation is short-lived and may not occupy a worker. Bound
-        // the bookkeeping independently of callers holding onto the guards.
+        // A preparation is short-lived and may not occupy a worker. The count
+        // of open preparations stays bounded even when callers keep their
+        // guards.
         if self.prepared.len() >= self.config.maximum_in_flight {
             self.deny(ThrottleCause::Concurrency, reservation.domain, Duration::ZERO, now);
             return Err(ThrottleCause::Concurrency);
@@ -1606,8 +1608,10 @@ impl Governor {
         self.budget_wait(domain, WorkOrigin::Background, cost, now).flatten()
     }
 
-    // None means affordable; Some(None) waits for ownership to change rather
-    // than refill. A full bucket cannot refill past a provisional hold.
+    // `None` means affordable. `Some(None)` means the cost plus the provisional
+    // holds exceeds a bucket's capacity, and only a change of hold ownership
+    // can make it affordable. A full bucket cannot refill past a provisional
+    // hold.
     fn budget_wait(
         &self,
         domain: Option<StorageDomainId>,
@@ -1806,13 +1810,14 @@ impl Governor {
 ///
 /// Clones share one governor. Every operation of a tree or scan goes through
 /// admission, start, report and release (RFC §15.1). A governor from neither
-/// [`host_governor`] nor [`HostGovernor::install`] opts out of the process-wide
-/// bound of RFC §15.9.
+/// [`host_governor`] nor [`HostGovernor::install`] is outside the
+/// process-wide bound of RFC §15.9.
 ///
 /// One grant moves through [`HostGovernor::try_admit`],
 /// [`HostGovernor::try_start`], one [`HostGovernor::report`] per completed
 /// step, and [`HostGovernor::release`]. Every method takes the caller's
-/// [`MonotonicTime`]. The governor clamps a time before an earlier call.
+/// [`MonotonicTime`]. The governor clamps a time that is earlier than the
+/// time of a previous call.
 #[derive(Clone)]
 pub struct HostGovernor {
     inner: Arc<Mutex<Governor>>,
@@ -2037,11 +2042,11 @@ impl HostGovernor {
         guard_changes(&self.changes.0).generation
     }
 
-    /// `wait_for_change` blocks the calling thread until the generation leaves
-    /// `seen`.
+    /// `wait_for_change` blocks the calling thread until the generation
+    /// differs from `seen`.
     ///
-    /// `wait_for_change` returns the current generation, also after `timeout`
-    /// elapses.
+    /// `wait_for_change` returns the current generation when the generation
+    /// differs from `seen` or `timeout` elapses.
     pub fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
         let (lock, signal) = &*self.changes;
         let mut held = guard_changes(lock);
@@ -2430,8 +2435,9 @@ impl HostGovernor {
 
     /// `release` ends grant `id` and returns its slot.
     ///
-    /// A started grant adds a latency sample per performed operation and adapts
-    /// its domain window (RFC §15.5). `release` ignores an unknown grant.
+    /// For a started grant, `release` adds a latency sample per performed
+    /// operation and adapts the domain window (RFC §15.5). `release` ignores
+    /// an unknown grant.
     pub fn release(&self, id: GrantId, now: MonotonicTime) {
         self.release_was_stuck(id, now);
     }
@@ -2457,8 +2463,11 @@ impl HostGovernor {
         guard(&self.inner).record_outcome(domain, error, now)
     }
 
-    /// `account_and_quarantine` supervises live calls cooperatively, also after
-    /// their original waiter left.
+    /// `account_and_quarantine` charges running grants their occupancy and
+    /// marks newly stuck grants.
+    ///
+    /// Callers invoke it during their own work. It also covers calls whose
+    /// original waiter left.
     pub(crate) fn account_and_quarantine(&self, now: MonotonicTime) {
         let mut governor = guard(&self.inner);
         governor.account(now);
@@ -2558,7 +2567,7 @@ impl HostGovernor {
     /// The resume time is `None` when it is not computable. Coordination
     /// failure and shared retry rank first. Memory ranks second. Exhausted
     /// budgets with an outstanding denial rank third, and stuck workers rank
-    /// last. `None` means admission is nominal.
+    /// last. `None` means no throttle applies.
     pub fn throttle(&self, now: MonotonicTime) -> Option<(ThrottleCause, Option<MonotonicTime>)> {
         if self.coordination_error().is_some() {
             return Some((ThrottleCause::CoordinationFailed, None));
@@ -2686,8 +2695,9 @@ mod scan_memory_tests {
         let other_reservation = governor.next_tree();
         governor.try_reserve_scan_memory(scan, reservation, 800).unwrap();
         governor.try_return_scan_memory(reservation, scan, 400).unwrap();
-        // The returned resource owner is still alive. Another scan must be
-        // able to reserve all genuinely free capacity before it is dropped.
+        // The owner of the returned bytes is still alive. Another scan must be
+        // able to reserve all free capacity, the returned bytes included,
+        // before the test drops the owner.
         governor.try_reserve_scan_memory(other, other_reservation, 600).unwrap();
         assert_eq!(governor.view(MonotonicTime(Duration::ZERO)).accounted_memory, 1000);
         governor.forget_tree(reservation);
@@ -2732,7 +2742,7 @@ mod failure_tests {
             governor.start(id, now);
             governor.mark_stuck(id, now);
             governor.mark_stuck(id, now);
-            governor.record_grant_failure(id, now); // e.g. a late panic
+            governor.record_grant_failure(id, now); // This call simulates a late panic.
             assert_eq!(governor.view(now).surcharged, config.failure_surcharge * (lease + 1));
             assert_eq!(governor.domains[&domain].errors.len(), (lease + 1) as usize);
             assert!(governor.domains[&domain].errors.iter().all(|error| *error));

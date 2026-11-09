@@ -192,9 +192,10 @@ impl Coordinator {
             let Err(ThrottleCause::CommandCeiling { required }) = result else { return result };
             self.finish_commands_below_cost(barriers, required, reservation.domain);
             let Some(remaining) = self.command_ceiling(barriers) else { return result };
-            // A coalesced command with more budget can still fund this work.
-            // Retry only after removing a stricter command actually raised
-            // the ceiling, so an unchanged denial cannot spin.
+            // A coalesced command with more remaining budget can still cover
+            // this work. The loop retries only when the removal of a stricter
+            // command raised the ceiling. An unchanged denial would otherwise
+            // repeat forever.
             if Some(remaining) <= reservation.ceiling {
                 return result;
             }

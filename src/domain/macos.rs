@@ -28,8 +28,8 @@ const MNT_REMOVABLE: u32 = 0x200;
 /// object ids from the volume capability bits, and it trusts a bit only
 /// when the matching valid bit is set. A built-in table per filesystem
 /// type supplies timestamp granularity. The same table supplies identity
-/// reliability when the capability bits are silent. The probe opens each
-/// directory without following a symbolic link.
+/// reliability when the persistent object id bit is unknown. The probe
+/// opens each directory without following a symbolic link.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MacOsProbe;
 

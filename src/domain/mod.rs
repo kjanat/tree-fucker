@@ -110,7 +110,7 @@ impl fmt::Display for StorageDomainId {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DomainCrossing {
     /// The tree traverses the child domain under its own capabilities, budgets
-    /// and concurrency window. The tree goes all the way in.
+    /// and concurrency window.
     Follow,
     /// The tree represents the mount point as an Excluded directory and never
     /// reads its descendants.
@@ -445,7 +445,7 @@ pub enum AccessTopology {
     Remote,
     /// A userspace process serves the filesystem.
     Userspace,
-    /// The domain is a kernel pseudo filesystem or sits on a virtual device.
+    /// The domain is a kernel pseudo filesystem or uses a virtual device.
     Virtual,
     /// The adapter implements the protocol client itself.
     ProtocolNative,
@@ -460,21 +460,21 @@ pub enum AccessTopology {
 /// The hint carries no performance claim.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TransportHint {
-    /// The storage sits on NVMe.
+    /// The host reaches the storage over NVMe.
     Nvme,
-    /// The storage sits on SATA.
+    /// The host reaches the storage over SATA.
     Sata,
-    /// The storage sits on SAS.
+    /// The host reaches the storage over SAS.
     Sas,
-    /// The storage sits on USB.
+    /// The host reaches the storage over USB.
     Usb,
-    /// The storage sits on an SD or MMC card.
+    /// The storage is an SD or MMC card.
     Sd,
-    /// The storage sits behind iSCSI.
+    /// The host reaches the storage over iSCSI.
     Iscsi,
-    /// The storage sits behind Fibre Channel.
+    /// The host reaches the storage over Fibre Channel.
     FibreChannel,
-    /// The storage sits behind a network filesystem protocol.
+    /// The host reaches the storage over a network filesystem protocol.
     Network,
     /// The storage is a virtual device or a pseudo filesystem.
     Virtual,
@@ -594,8 +594,8 @@ impl IdentityReliability {
 pub enum KindSource {
     /// The enumeration reports every child's kind.
     Always,
-    /// Some kinds arrive unknown, and the session resolves them with metadata
-    /// reads.
+    /// The enumeration leaves some kinds unknown, and the session resolves
+    /// them with metadata reads.
     Sometimes,
     /// Every kind needs a metadata read.
     Never,
@@ -733,8 +733,8 @@ pub enum WatcherScope {
 /// `WatcherCapabilities` describes the declared watcher behaviour of one
 /// storage domain (RFC §10.4).
 ///
-/// These answers shape latency strategy only. Reconciliation stays required
-/// for correctness whatever they say.
+/// These answers affect only the latency strategy. Correctness requires
+/// reconciliation regardless of the answers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WatcherCapabilities {
     /// `availability` states whether a watcher exists.
@@ -744,8 +744,8 @@ pub struct WatcherCapabilities {
     /// `observes_external_writers` states whether the watcher reports changes
     /// by writers outside this host.
     ///
-    /// A watcher with the answer [`Answer::No`] serves only as latency
-    /// assistance for local writes.
+    /// A watcher with the answer [`Answer::No`] lowers latency for local
+    /// writes only.
     pub observes_external_writers: Answer,
     /// `can_lose_events` states whether the watcher can lose events.
     pub can_lose_events: Answer,
@@ -937,9 +937,9 @@ pub enum Crossing {
 impl Crossing {
     /// `stronger` combines two verdicts on the same directory.
     ///
-    /// [`Crossing::Proven`] wins over any verdict. Two [`Crossing::NotCrossed`]
-    /// verdicts stay NotCrossed. Every other pair gives
-    /// [`Crossing::Inconclusive`].
+    /// Any pair with [`Crossing::Proven`] gives Proven. Two
+    /// [`Crossing::NotCrossed`] verdicts give NotCrossed. Every other pair
+    /// gives [`Crossing::Inconclusive`].
     pub fn stronger(self, other: Crossing) -> Crossing {
         match (self, other) {
             (Crossing::Proven, _) | (_, Crossing::Proven) => Crossing::Proven,
@@ -995,9 +995,9 @@ impl ProbeResult {
     ///
     /// A uniform domain rule applies as declared. Under
     /// [`DomainCaseSensitivity::PerDirectory`] the directory's own attribute
-    /// wins, and the domain default serves as fallback. Under an Unknown domain
-    /// rule only the directory's attribute counts, and `None` means that no
-    /// rule is known.
+    /// takes precedence, and the domain default applies when the attribute is
+    /// absent. Under an Unknown domain rule only the directory's attribute
+    /// counts, and `None` means that no rule is known.
     pub fn case(&self) -> Option<CaseSensitivity> {
         match self.capabilities.case {
             DomainCaseSensitivity::Sensitive => Some(CaseSensitivity::Sensitive),

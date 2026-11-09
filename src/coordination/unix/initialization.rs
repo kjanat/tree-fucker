@@ -204,9 +204,10 @@ fn kill_writer(root: &Path, index: usize, journal: bool) {
     assert!(matches!(Scope::open(root.join("scope"), config()), Err(Error::Busy)));
     writer.0.kill().unwrap();
     assert!(!writer.0.wait().unwrap().success());
-    // Reaping the writer is not the fixture's bookkeeping-release barrier.
-    // Observe native exclusion becoming available before testing the retained
-    // header; a transient Busy result must not be mistaken for header recovery.
+    // The writer's bookkeeping lock can stay held after the test reaps the
+    // writer. Wait until native exclusion becomes available before testing
+    // the retained header.
+    // A transient Busy result must not count as header recovery.
     let parent = File::open(root).unwrap();
     let anchor =
         open_file(&parent, OsStr::new("scope.authority.lock"), false, Context::current().unwrap().uid).unwrap();

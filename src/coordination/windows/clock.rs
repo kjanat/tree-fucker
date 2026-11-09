@@ -23,8 +23,9 @@ struct BootEnvironment {
 const _: () = assert!(size_of::<BootEnvironment>() == 32);
 const _: () = assert!(std::mem::offset_of!(KUSER_SHARED_DATA, BootId) == 0x2c4);
 
-/// The entry GUID is not a per-boot nonce. The loader's boot sequence is also
-/// required. Neither value selects a new rendezvous or resets retained debt.
+/// The entry GUID can repeat across boots, so `Epoch` also requires the
+/// loader's boot sequence. Neither value selects a new rendezvous or resets
+/// retained debt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Epoch {
     pub entry: [u8; 16],
@@ -86,9 +87,10 @@ impl Clock {
     pub(crate) fn current() -> io::Result<Self> {
         let mut information = BootEnvironment::default();
         let mut length = 0;
-        // SAFETY: exact Windows 8+ SYSTEM_BOOT_ENVIRONMENT_INFORMATION layout,
-        // aligned live output and a checked returned size. This query is never
-        // replaced with a random ID or a wall-clock approximation on failure.
+        // SAFETY: the output has the exact Windows 8+
+        // SYSTEM_BOOT_ENVIRONMENT_INFORMATION layout and is aligned and live,
+        // and the code checks the returned size. On failure, the code never
+        // substitutes a random ID or a wall-clock approximation for this query.
         let status = unsafe {
             NtQuerySystemInformation(
                 BOOT_ENVIRONMENT,
@@ -107,12 +109,14 @@ impl Clock {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected Windows boot environment layout"));
         }
         // SAFETY: Windows maps the read-only shared-user page at this fixed
-        // user-mode address. Read only the aligned BootId field, whose offset
-        // is checked against the SDK type above; do not borrow the whole page.
+        // user-mode address. Read only the aligned BootId field. The assertion
+        // above checks its offset against the SDK type. Do not borrow the
+        // whole page.
         let sequence =
             unsafe { std::ptr::addr_of!((*(0x7ffe_0000usize as *const KUSER_SHARED_DATA)).BootId).read_volatile() };
         let mut frequency = 0;
-        // SAFETY: live correctly sized output for the boot-constant frequency.
+        // SAFETY: the output for the boot-constant frequency is live and
+        // correctly sized.
         if unsafe { QueryPerformanceFrequency(&mut frequency) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -124,8 +128,8 @@ impl Clock {
 
     fn raw_now(&self) -> io::Result<u64> {
         let mut ticks = 0;
-        // SAFETY: live correctly sized output; no process-relative origin or
-        // floating-point conversion is introduced into shared timestamps.
+        // SAFETY: the output is live and correctly sized. Shared timestamps
+        // carry no process-relative origin and no floating-point conversion.
         if unsafe { QueryPerformanceCounter(&mut ticks) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -162,7 +166,7 @@ impl Clock {
         }
     }
 
-    /// `bind` installs `binding` before the connection is shared.
+    /// `bind` installs `binding` before the caller shares the connection.
     ///
     /// Transactions never move the binding's origin.
     pub(crate) fn bind(&mut self, binding: ClockBinding) -> io::Result<()> {

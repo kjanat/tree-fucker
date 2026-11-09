@@ -4,9 +4,9 @@
 //!
 //! A [`Tree`] keeps one filesystem subtree as a sequence of immutable
 //! [`Snapshot`]s. Reconciliation lists loaded directories directly from the
-//! filesystem; watcher events only shorten the wait. Every filesystem call is
-//! admitted by a per-host [`HostGovernor`], so one slow or broken mount stays
-//! inside its own budget.
+//! filesystem, and watcher events only reduce latency. A per-host
+//! [`HostGovernor`] admits every filesystem call and gives each storage domain
+//! its own budget.
 //!
 //! # Start here
 //!
@@ -22,29 +22,31 @@
 //! 4. Call [`Tree::open`]. It returns a [`TreeHandle`] for commands and queries
 //!    and an [`UpdateStream`] of [`UpdateEvent`]s.
 //! 5. Read [`TreeHandle::snapshot`], [`TreeHandle::health`] and
-//!    [`TreeHandle::stats`] at any time; await
-//!    [`TreeHandle::initial_scan_complete`] when the first full listing
-//!    matters.
+//!    [`TreeHandle::stats`] at any time. Await
+//!    [`TreeHandle::initial_scan_complete`] to wait for the first full listing.
 //! 6. Call [`TreeHandle::shutdown`] to stop. The tree keeps running after every
 //!    handle is dropped. A slow consumer receives [`UpdateEvent::Reset`] under
 //!    the default [`LagMode::Reset`].
 //!
-//! [`Scan`] is the one-shot form: a governed walk that yields [`ScanEvent`]s
-//! and retains no tree.
+//! [`Scan`] is the one-shot form. It walks a tree under the governor, yields
+//! [`ScanEvent`]s and retains no tree.
 //!
 //! # Modules
 //!
-//! - [`tree`]: the live tree, its handle and update stream.
-//! - [`update`]: events, [`Health`] and the error vocabulary the stream emits.
-//! - [`snapshot`], [`entry`], [`path`], [`ids`]: the immutable data model.
-//! - [`fs`], [`std_fs`]: the filesystem boundary and its std adapter.
-//! - [`policy`]: which directories a tree loads and how deep.
-//! - [`config`], [`core`]: tuning and the deterministic coordinator.
-//! - [`domain`]: storage-domain identity and capabilities.
-//! - [`coordination`]: shared admission across processes on one host.
-//! - [`scan`]: the one-shot governed walk.
-//! - [`runtime`]: the async runtime abstraction.
-//! - [`testing`]: fakes and a harness for consumers' tests.
+//! - [`tree`] holds the live tree, its handle and its update stream.
+//! - [`update`] holds the events, [`Health`] and the errors the stream emits.
+//! - [`snapshot`], [`entry`], [`path`] and [`ids`] hold the immutable data
+//!   model.
+//! - [`fs`] defines the filesystem boundary, and [`std_fs`] adapts `std::fs` to
+//!   it.
+//! - [`policy`] decides which directories a tree loads and how deep.
+//! - [`config`] holds the tuning values, and [`core`] holds the deterministic
+//!   coordinator.
+//! - [`domain`] holds storage-domain identity and capabilities.
+//! - [`coordination`] shares admission across the processes of one host.
+//! - [`scan`] holds the one-shot governed walk.
+//! - [`runtime`] abstracts the async runtime.
+//! - [`testing`] holds fakes and a harness for consumers' tests.
 //!
 //! [RFC]: https://tree-fucker.kjanat.dev/
 //! [RFC-TXT]: https://tree-fucker.kjanat.dev/tree-fucker.txt

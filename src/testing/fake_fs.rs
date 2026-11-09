@@ -25,7 +25,7 @@ use crate::path::{CaseSensitivity, RelativePath};
 
 /// `FakeOp` names a [`FakeFileSystem`] operation.
 ///
-/// Tests can fail, cost, or count each operation.
+/// Tests can make each operation fail, give it a cost, or count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FakeOp {
     /// `Metadata` names a metadata read of one path.

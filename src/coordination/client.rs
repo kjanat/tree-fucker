@@ -13,15 +13,16 @@ use super::protocol::{self, OperationId, Participant, Progress};
 struct Member {
     scope: Arc<Scope>,
     participant: Participant,
-    // Close only: explicit LOCK_UN would also release inherited descriptions.
+    // Only a close may release this lock. LOCK_UN would also release it for
+    // inherited descriptions.
     _owner: File,
 }
 
 /// `Client` holds one participant's membership in a shared authority.
 ///
 /// [`Scope::join`] returns it. Clones share the membership, and every
-/// outstanding operation retains it. The participant's lifetime evidence
-/// stays held until the last clone and operation drop.
+/// outstanding operation retains it. The membership holds the participant's
+/// lifetime evidence until the last clone and the last operation drop.
 #[derive(Clone)]
 pub struct Client(Arc<Member>);
 
@@ -46,15 +47,15 @@ impl Client {
     /// `register_private_domain` returns this participant's private account
     /// for the local domain number `local`.
     ///
-    /// Private accounts draw on the same aggregate envelope as shared ones.
+    /// Private accounts count against the same global limits as shared ones.
     pub fn register_private_domain(&self, local: u64) -> Result<DomainId, Error> {
         self.0.scope.transaction(|state, _| state.register_private_domain(self.0.participant, local))
     }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn register_mount_domain(&self, mount: u64) -> Result<DomainId, Error> {
-        // STATX_MNT_ID_UNIQUE is never recycled during the boot. The tmpfs
-        // authority generation bounds that lifetime; user namespace evidence
+        // Linux never recycles a STATX_MNT_ID_UNIQUE during a boot. The tmpfs
+        // authority generation bounds that lifetime. User namespace evidence
         // qualifies the identity independently of process-local interning.
         let mut filesystem = [0; 16];
         filesystem[..8].copy_from_slice(b"linuxmnt");
@@ -82,8 +83,9 @@ impl Client {
 
 /// `Prepared` owns a reversible shared budget hold.
 ///
-/// Dropping it before a successful start aborts the hold. A busy abort moves
-/// to the connection's bounded bookkeeping queue.
+/// Dropping it before a successful start aborts the hold. If the abort
+/// returns [`Error::Busy`], the drop queues it on the connection's bounded
+/// bookkeeping queue.
 pub struct Prepared {
     member: Arc<Member>,
     id: OperationId,
@@ -124,10 +126,10 @@ impl Prepared {
     /// `try_run` runs `work` after shared start permission commits.
     ///
     /// A denied start retains this preparation for retry or drop. The callback
-    /// must not return before its filesystem work actually returns. The
-    /// method settles the reported completion, and an unwinding callback
-    /// settles as failed. A busy settlement moves to the connection's bounded
-    /// bookkeeping queue.
+    /// must not return before its filesystem work returns. The method settles
+    /// the reported completion, and an unwinding callback settles as failed.
+    /// If the settlement returns [`Error::Busy`], the method queues it on the
+    /// connection's bounded bookkeeping queue.
     pub fn try_run<T>(&mut self, work: impl FnOnce(Admission) -> Completion<T>) -> Result<T, Error> {
         let physical = self.authorize()?;
         let result = work(self.admission);

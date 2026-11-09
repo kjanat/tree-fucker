@@ -86,8 +86,7 @@ counter_type!(
     ///
     /// It advances on every transition among Loading, Loaded, Unloaded and
     /// Excluded. It guards directory jobs and keys round obligations
-    /// (RFC §2). A directory can get loaded many times in one life, and
-    /// the tree counts every one.
+    /// (RFC §2). The tree counts every load of a directory.
     LoadGeneration
 );
 counter_type!(
@@ -127,7 +126,7 @@ counter_type!(
     ///
     /// It versions the mapping from immediate-child names to [`EntryId`]s.
     /// It advances when the directory gains, loses, replaces or renames an
-    /// immediate child. A busy directory goes through a lot of them.
+    /// immediate child.
     ChildStateGeneration
 );
 counter_type!(
@@ -152,8 +151,7 @@ counter_type!(
     /// `RootIncarnation` holds the root-incarnation generation (RFC §2, §7.4).
     ///
     /// It advances each time the coordinator confirms that a missing root
-    /// has reappeared. The root can come back as often as it likes, and
-    /// every return gets its own number.
+    /// has reappeared. Every reappearance gets its own number.
     RootIncarnation
 );
 counter_type!(
@@ -177,8 +175,6 @@ counter_type!(
 );
 counter_type!(
     /// `WatchReleaseId` identifies one pending watch removal.
-    ///
-    /// Every watch gets released in the end.
     WatchReleaseId
 );
 counter_type!(

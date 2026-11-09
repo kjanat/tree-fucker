@@ -19,6 +19,6 @@ pub(super) fn namespaces() -> Result<[[u8; 16]; 3], Error> {
 }
 
 pub(super) fn is_tmpfs(file: &File) -> Result<bool, Error> {
-    // statfs uses different signedness on Linux architectures/ABIs.
+    // statfs field signedness differs across Linux architectures and ABIs.
     Ok(i128::from(rustix::fs::fstatfs(file)?.f_type) == i128::from(libc::TMPFS_MAGIC))
 }

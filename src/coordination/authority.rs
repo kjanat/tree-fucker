@@ -339,8 +339,8 @@ struct Account {
 
 /// `View` reports the shared accounting of an authority.
 ///
-/// `View` describes the same operations as the local governor totals a second
-/// time. The caller must not add the two views together.
+/// `View` counts the same operations that the local governor totals count.
+/// The caller must not add the two together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct View {
     /// `participants` counts the registered participants.
@@ -375,7 +375,7 @@ pub struct View {
 /// backends persist.
 ///
 /// Joiners cannot replace the configuration. Domain accounts survive
-/// participant departure, and the authority never evicts one to manufacture a
+/// participant departure, and the authority never evicts one to create a
 /// fresh allowance. Every method that takes `now` first refills buckets and
 /// charges running occupancy up to that authority time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,9 +480,10 @@ impl Authority {
     /// `register_private_domain` returns a participant-private account for a
     /// local domain number.
     ///
-    /// Inconclusive identities receive private accounts under the same
-    /// aggregate envelope. Matching local numbers in two participants never
-    /// establish cross-process filesystem identity.
+    /// A domain with an inconclusive identity receives a private account, and
+    /// that account counts against the same global limits as shared accounts.
+    /// Matching local numbers in two participants never establish
+    /// cross-process filesystem identity.
     pub fn register_private_domain(&mut self, participant: Participant, local: u64) -> Result<DomainId, Error> {
         self.ledger.next_operation(participant)?;
         self.register_domain(DomainKey::Private(participant, local))
@@ -756,8 +757,9 @@ impl Authority {
     /// stuck operations up to `now`.
     ///
     /// Every access performs this accounting, and no background ticker
-    /// supervises work. A stuck operation moves its global overshoot to
-    /// withheld debt and receives the failure surcharge once.
+    /// supervises work. When an operation becomes stuck, the method moves its
+    /// global overshoot to withheld debt and charges the failure surcharge
+    /// once.
     pub fn advance(&mut self, now: u64) -> Result<(), Error> {
         let elapsed = now.checked_sub(self.now).ok_or(protocol::Error::ClockRegression)?;
         self.background.refill(elapsed);

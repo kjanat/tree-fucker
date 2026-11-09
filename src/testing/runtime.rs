@@ -217,7 +217,8 @@ impl DeterministicRuntime {
 
     /// `block_on` drives `future` to completion on simulated time.
     ///
-    /// When everything stalls, time jumps to the next timer.
+    /// When no task or blocking job can run, the runtime advances time to the
+    /// next timer.
     ///
     /// # Panics
     ///
@@ -269,8 +270,8 @@ impl Drop for InertHandle {
 ///
 /// It wraps a [`DeterministicRuntime`] and implements [`Runtime`]. Held work
 /// runs only on [`HoldingRuntime::release`]. Its task handle counts
-/// cancellations and drops and never stops the work (RFC §13.5). Every other
-/// call goes to the inner runtime.
+/// cancellations and drops and never stops the work (RFC §13.5). The runtime
+/// forwards every other call to the inner runtime.
 pub struct HoldingRuntime {
     inner: Arc<DeterministicRuntime>,
     hold: AtomicBool,

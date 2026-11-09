@@ -26,7 +26,7 @@ use crate::update::PathChange;
 /// traversal and child traversal. It keys entries by [`PathKey`] and folds
 /// each component under the case rule of its containing directory. A
 /// directory can declare its own rule, and other directories inherit the
-/// rule of their parent. Clones are cheap and share structure.
+/// rule of their parent. A clone copies one `Arc` and shares the structure.
 #[derive(Clone)]
 pub struct Snapshot {
     inner: Arc<Inner>,

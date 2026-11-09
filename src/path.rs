@@ -3,8 +3,8 @@
 //!
 //! A [`RelativePath`] keeps the display casing of every component. A
 //! [`PathKey`] folds those components under a [`CaseSensitivity`] rule
-//! and serves as the comparison key (RFC §14.1). Snapshots index entries
-//! by [`PathKey`] and report paths as [`RelativePath`].
+//! and is the comparison key (RFC §14.1). Snapshots index entries by
+//! [`PathKey`] and report paths as [`RelativePath`].
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -55,8 +55,8 @@ impl std::error::Error for PathError {}
 ///
 /// The empty path names the root and displays as `.`. The ordering
 /// compares components in turn and places every directory directly before
-/// its descendants. Each component keeps its original bytes, and names
-/// that are not valid Unicode survive unchanged (RFC §20). Clones share
+/// its descendants. Each component keeps its original bytes, including the
+/// bytes of a name that is not valid Unicode (RFC §20). Clones share
 /// storage.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelativePath {
@@ -208,7 +208,7 @@ fn fold_component(name: &OsStr) -> OsString {
     }
 }
 
-/// `validate_name` checks that `name` can serve as one path component.
+/// `validate_name` checks that `name` is a valid path component.
 ///
 /// # Errors
 ///

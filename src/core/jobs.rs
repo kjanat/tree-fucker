@@ -41,8 +41,9 @@ impl Coordinator {
             self.record_session_cost(id, &cost);
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.session_open = suspended;
-                // Keep requesting operations when the session has demonstrated
-                // per-child work, even before its domain probe is published.
+                // A suspended session keeps requesting operations after it has
+                // performed per-child work, even before the tree publishes its
+                // domain probe.
                 job.needs_operations = suspended && (cost.entries_enumerated == 0 || cost.per_child_operations() > 0);
             }
         }
