@@ -32,8 +32,9 @@ use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken};
 
 fn invalid(reason: &'static str) -> io::Error {
-    // Unsafe existing state is not simple unavailability: Auto selection must
-    // not turn a malformed/broadened authority into an independent budget.
+    // Unsafe existing state returns InvalidData and never permits the
+    // fallback for unavailability. Auto selection must not turn a malformed or
+    // broadened authority into an independent budget.
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
@@ -64,7 +65,7 @@ impl Drop for Local {
     }
 }
 
-// The SID pointers passed here come from validated Windows output structures.
+// Callers pass SID pointers from validated Windows output structures.
 unsafe fn sid_text(sid: PSID) -> io::Result<String> {
     if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
         return Err(invalid("coordination security descriptor contains an invalid SID"));
@@ -84,9 +85,10 @@ unsafe fn sid_text(sid: PSID) -> io::Result<String> {
 
 fn effective_token(access: u32) -> io::Result<OwnedHandle> {
     let mut token = null_mut();
-    // SAFETY: pseudo-handles refer to this process/thread. The successful call
-    // transfers a real token handle to OwnedHandle. OpenAsSelf controls access
-    // to the token, not which effective token is queried.
+    // SAFETY: the pseudo-handles refer to this process and this thread. The
+    // successful call transfers a real token handle to OwnedHandle. OpenAsSelf
+    // controls only the access check on the token and leaves the queried
+    // effective token unchanged.
     unsafe {
         if OpenThreadToken(GetCurrentThread(), access, 1, &mut token) == 0 {
             let error = io::Error::last_os_error();
@@ -121,8 +123,8 @@ fn token_value<T: Default>(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io:
 /// authentication.
 ///
 /// Scope discovery must use the user identity. The authentication ID never
-/// selects a scope, and another login must reopen retained accounting instead
-/// of creating a fresh budget.
+/// selects a scope. Another login must reopen retained accounting and must
+/// never create a fresh budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Principal {
     pub sid: String,
@@ -185,7 +187,8 @@ impl Principal {
         // covers its header plus SECURITY_MAX_SID_SIZE on both architectures.
         let mut user = [0usize; 32];
         let mut length = 0;
-        // SAFETY: aligned live output buffer; Windows returns a SID within it.
+        // SAFETY: the output buffer is aligned and live, and Windows returns a
+        // SID within it.
         let (sid, sid_bytes) = unsafe {
             if GetTokenInformation(handle, TokenUser, user.as_mut_ptr().cast(), size_of_val(&user) as u32, &mut length)
                 == 0
@@ -226,8 +229,9 @@ impl Principal {
     pub(crate) fn validate(&self, file: &File, directory: bool) -> io::Result<()> {
         super::storage::validate(file)?;
         let mut descriptor = null_mut();
-        // SAFETY: live handle and owned output allocation. Components remain
-        // inside the allocation until Descriptor is dropped.
+        // SAFETY: the handle is live, and a Descriptor takes ownership of the
+        // output allocation. Components remain inside the allocation until the
+        // Descriptor drops.
         let result = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle(),
@@ -293,8 +297,8 @@ impl Descriptor {
     fn parse(text: &str) -> io::Result<Self> {
         let text: Vec<_> = text.encode_utf16().chain([0]).collect();
         let mut descriptor = null_mut();
-        // SAFETY: a live NUL-terminated string and an owned LocalFree
-        // allocation.
+        // SAFETY: the string is live and NUL-terminated, and Local takes
+        // ownership of the returned LocalFree allocation.
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 text.as_ptr(),
@@ -329,10 +333,10 @@ impl Descriptor {
         let mut defaulted = 0;
         let mut present = 0;
         let mut acl: *mut ACL = null_mut();
-        // SAFETY: descriptor is a valid Windows-produced allocation. Component
-        // pointers are borrowed only while it remains alive. Validate the ACL
-        // with the Windows APIs, obtain its checked size/count, then copy ACE
-        // headers into aligned local values before inspecting them.
+        // SAFETY: the descriptor is a valid allocation from Windows. The code
+        // borrows component pointers only while it remains alive. Validate the
+        // ACL with the Windows APIs, obtain its checked size and count, then
+        // copy ACE headers into aligned local values before inspecting them.
         unsafe {
             if GetSecurityDescriptorControl(self.0.0, &mut control, &mut revision) == 0
                 || GetSecurityDescriptorOwner(self.0.0, &mut owner, &mut defaulted) == 0
@@ -455,8 +459,9 @@ mod tests {
             let principal = Principal::current().unwrap();
             let mut source = null_mut();
             let mut duplicate = null_mut();
-            // SAFETY: current process pseudo-handle, live output slots, and
-            // individually owned token handles closed by OwnedHandle.
+            // SAFETY: the process handle is the current process pseudo-handle,
+            // the output slots are live, and OwnedHandle closes each owned
+            // token handle.
             unsafe {
                 assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut source), 0);
                 let source = OwnedHandle::from_raw_handle(source);
@@ -538,7 +543,8 @@ mod tests {
         principal.directory(&path, false).unwrap();
 
         // Widen the ACL through an explicitly opened WRITE_DAC handle. The
-        // coordination path must reject it, not silently repair shared state.
+        // coordination path must reject the widened ACL and must never repair
+        // shared state silently.
         let writable = OpenOptions::new()
             .access_mode(windows_sys::Win32::Storage::FileSystem::WRITE_DAC | READ_CONTROL)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -549,8 +555,8 @@ mod tests {
         let mut acl = null_mut();
         let mut present = 0;
         let mut defaulted = 0;
-        // SAFETY: live validated descriptor, output pointers, and WRITE_DAC
-        // handle.
+        // SAFETY: the descriptor is live and validated, and the output pointers
+        // and the WRITE_DAC handle are live.
         unsafe {
             assert_ne!(GetSecurityDescriptorDacl(broad.0.0, &mut present, &mut acl, &mut defaulted), 0);
             assert_eq!(

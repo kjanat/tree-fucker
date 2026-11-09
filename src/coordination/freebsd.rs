@@ -25,7 +25,7 @@ pub(super) fn namespaces() -> Result<[[u8; 16]; 3], Error> {
     }
     // Jails with the same filesystem root and effective user share the same
     // retained files and kernel monotonic clock. Their separate jail IDs must
-    // not manufacture independent allowances. A different root is incompatible
+    // not give them independent allowances. A different root is incompatible
     // even when it exposes the original retained files through another path.
     Ok([super::unix::identity(&fs::metadata("/")?), *b"freebsd-root-ns\0", *b"freebsd-monotime"])
 }
@@ -33,7 +33,7 @@ pub(super) fn namespaces() -> Result<[[u8; 16]; 3], Error> {
 pub(super) fn is_tmpfs(file: &File) -> Result<bool, Error> {
     let stat = rustix::fs::fstatfs(file)?;
     // `c_char` is signed on x86 FreeBSD and unsigned on the aarch64 target.
-    // Compare the fixed kernel byte field through its representation instead.
+    // Compare the fixed kernel byte field through its byte representation.
     let name = unsafe { std::slice::from_raw_parts(stat.f_fstypename.as_ptr().cast::<u8>(), stat.f_fstypename.len()) };
     Ok(name.starts_with(b"tmpfs\0"))
 }

@@ -27,8 +27,9 @@ pub(super) fn namespaces() -> Result<[[u8; 16]; 3], Error> {
     if id < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    // sys/zone.h: unlike zoneid_t, ZONE_ATTR_UNIQID identifies the zone's
-    // incarnation and is not reused when a zone is shut down and recreated.
+    // A zone that shuts down and is recreated can reuse its zoneid_t. Per
+    // sys/zone.h, ZONE_ATTR_UNIQID identifies the zone's incarnation and the
+    // kernel never reuses it.
     const ZONE_ATTR_UNIQID: libc::c_int = 5;
     let mut incarnation = 0_u64;
     // SAFETY: the native attribute is uint64_t; its output buffer remains

@@ -16,8 +16,8 @@ pub(crate) const HEADER: u64 = 64;
 const SLOT_HEADER: u64 = 32;
 const MAGIC: &[u8; 8] = b"TFJOURN1";
 const FORMAT: u32 = 1;
-// A single byte cannot be partially written. The distinct bit patterns also
-// make any single-bit damage an invalid marker rather than another decision.
+// A single byte cannot be partially written. The two markers differ in every
+// bit, so single-bit damage to either one yields an invalid marker.
 const PREPARING: u8 = 0x5a;
 const COMMITTED: u8 = 0xa5;
 
@@ -92,8 +92,8 @@ pub struct Journal<S> {
     capacity: u32,
     generation: Generation,
     validated: Option<Validated>,
-    // Reuse bounded per-slot read buffers. The selected payload is decoded
-    // afresh below so another process's accounting is never cached.
+    // Reuse bounded per-slot read buffers. `latest` decodes the selected
+    // payload afresh and never caches another process's accounting.
     payloads: [Vec<u8>; 2],
 }
 
@@ -102,8 +102,9 @@ struct Snapshot {
     authority: Authority,
 }
 
-// Retain only the last validated payload, never an authority used for mutation.
-// An exact byte match can reuse structural validation, not current accounting.
+// Retain only the last validated payload. Never retain an authority used for
+// mutation. An exact byte match may reuse the structural validation result,
+// and current accounting always comes from a fresh decode.
 struct Validated {
     sequence: u64,
     payload: Vec<u8>,
@@ -241,8 +242,9 @@ impl<S: Read + Write + Seek> Journal<S> {
         if digest(self.generation, sequence, payload) != sum {
             return invalid();
         }
-        // A complete but incompatible/malformed state is not an interrupted
-        // write. Never fall back to an older compatible budget.
+        // A payload that matches its checksum is complete. An incompatible or
+        // malformed state in it is an error, even in a prepared slot. Never
+        // fall back to an older compatible budget.
         let cached = self.validated.as_ref().filter(|cached| cached.sequence == sequence && cached.payload == *payload);
         let (config, authority) = if let Some(cached) = cached {
             (cached.config, None)
@@ -271,7 +273,7 @@ impl<S: Read + Write + Seek> Journal<S> {
         };
         if latest.prepared {
             // The payload is complete. Conservatively adopt its accounting
-            // even if its writer died before acknowledging the commit.
+            // even if its writer exited before it wrote the commit byte.
             self.write_at(self.offset(latest.slot), &[COMMITTED])?;
             self.storage.flush()?;
         }
@@ -294,8 +296,8 @@ impl<S: Read + Write + Seek> Journal<S> {
     /// `load` recovers the latest complete snapshot under the backend's
     /// exclusive lock.
     ///
-    /// A complete snapshot without its commit byte is adopted and marked
-    /// committed. A damaged committed snapshot fails with
+    /// The method adopts a complete snapshot that lacks its commit byte and
+    /// marks it committed. A damaged committed snapshot fails with
     /// [`Error::Malformed`], and the journal never falls back to the older
     /// slot.
     pub fn load(&mut self) -> Result<Authority, Error> {
@@ -308,7 +310,7 @@ impl<S: Read + Write + Seek> Journal<S> {
     /// The closure must not run target-filesystem work. A callback error
     /// publishes nothing. An error after writing begins leaves an uncertain
     /// outcome. The caller must then reconnect and recover, and it must not
-    /// mint fallback capacity or dispatch the requested operation.
+    /// create fallback capacity or dispatch the requested operation.
     pub fn transaction<T>(
         &mut self,
         operation: impl FnOnce(&mut Authority) -> Result<T, AuthorityError>,
@@ -358,7 +360,7 @@ impl<S: Read + Write + Seek> Journal<S> {
         self.write_at(offset + 1, &header.0[1..])?;
         self.write_at(offset + SLOT_HEADER, &payload)?;
         self.storage.flush()?;
-        // Only this final one-byte decision permits publication/dispatch.
+        // Only this final one-byte decision permits publication and dispatch.
         self.write_at(offset, &[COMMITTED])?;
         self.storage.flush()?;
         Ok(())
@@ -376,7 +378,7 @@ impl<S: Read + Write + Seek> Journal<S> {
 }
 
 fn digest(generation: Generation, sequence: u64, bytes: &[u8]) -> u64 {
-    // Length and authority/transaction identity are bound to the payload.
+    // The digest binds the generation, sequence, and length to the payload.
     let prefix = generation.0.into_iter().chain(sequence.to_le_bytes()).chain((bytes.len() as u64).to_le_bytes());
     prefix
         .chain(bytes.iter().copied())
@@ -476,7 +478,8 @@ mod tests {
                 }
                 _ => panic!("unexpected occupancy"),
             }
-            // Retry after recovery: never charge or occupy a second time.
+            // A retry after recovery must not charge or occupy capacity a
+            // second time.
             recovered.transaction(|authority| authority.authorize(id, 0)).unwrap();
             let state = recovered.load().unwrap();
             assert_eq!(state.view().physical, 1);
@@ -510,7 +513,7 @@ mod tests {
             let length = journal.validated.as_ref().unwrap().payload.len();
             let payload_start = (offset + SLOT_HEADER) as usize;
             // Change a cached state's protocol version and repair both
-            // checksums. Even a well-framed payload must be decoded
+            // checksums. The journal must decode even a well-framed payload
             // when any byte changes.
             let bytes = journal.storage.get_mut();
             let payload = &mut bytes[payload_start..payload_start + length];
@@ -595,8 +598,9 @@ mod tests {
         seed.transaction(|authority| authority.authorize(id, 0)).unwrap();
         let first = ClockBinding::from_origin([1; 32], 50_000, 0).unwrap();
         let second = ClockBinding::from_origin([2; 32], 925, 0).unwrap();
-        // First publication upgrades a counter-only snapshot. The second
-        // changes boot epoch while reusing a previously committed journal slot.
+        // The first publication upgrades a counter-only snapshot. The second
+        // changes the boot epoch and reuses a previously committed journal
+        // slot.
         for binding in [first, second] {
             let before = seed.load().unwrap();
             let mut after = before.clone();

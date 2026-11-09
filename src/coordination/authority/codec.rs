@@ -176,7 +176,7 @@ impl Authority {
     /// `decode` reads a complete snapshot and validates bounds and cross-record
     /// ownership before the result can admit work.
     ///
-    /// Trailing or truncated data fails.
+    /// `decode` rejects trailing or truncated data.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < 24 || bytes.len() > MAX_STATE_BYTES {
             return Err(malformed());
@@ -392,8 +392,8 @@ mod tests {
                 8 => authority.domains[0].samples[31] = 1,
                 _ => authority.config.ownership.operations = protocol::MAX_OPERATIONS + 1,
             }
-            // Encoding regenerates the checksum, so this exercises structural
-            // and cross-record validation instead of checksum rejection.
+            // Encoding regenerates the checksum, so this case reaches the
+            // structural and cross-record validation.
             let bytes = authority.encode().unwrap();
             assert!(Authority::decode(&bytes).is_err(), "fault {fault}");
         }

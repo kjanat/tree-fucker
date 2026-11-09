@@ -1,6 +1,6 @@
 //! This module encodes shared state as explicit little-endian fields.
 //!
-//! No native Rust layout enters shared state.
+//! Shared state never contains a native Rust layout.
 
 use super::protocol::Error;
 

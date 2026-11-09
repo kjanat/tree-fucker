@@ -1,6 +1,6 @@
 # Shared coordination baseline
 
-Measured on Linux x86-64 with an AMD Ryzen 9 3900X, Rust `1.101.0-nightly (5d8fec066 2026-10-16)`, and Cargo's optimized bench profile. This baseline measures the full-snapshot Linux authority with 64 participant slots, 128 operation slots, 128 domain slots, and a shared physical ceiling of two. The initial results below precede the duplicate-ledger allocation fix described in the final section.
+The measurements ran on Linux x86-64 with an AMD Ryzen 9 3900X, Rust `1.101.0-nightly (5d8fec066 2026-10-16)`, and Cargo's optimized bench profile. This baseline measures the full-snapshot Linux authority with 64 participant slots, 128 operation slots, 128 domain slots, and a shared physical ceiling of two. The results through the syscall table predate the changes in the later sections.
 
 The timing executable is `target/release/build/tree-fucker/01444fa73ab74f54/out/coordination_processes-01444fa73ab74f54`; the counting-allocator executable is `target/release/build/tree-fucker/030b3cda7bf652bf/out/coordination_processes_alloc-030b3cda7bf652bf`. Obtain rebuilt executable paths from Cargo's JSON output as shown in [the benchmark instructions](README.md#cpu-memory-descriptors-and-syscalls).
 
@@ -25,7 +25,7 @@ cargo bench --bench coordination_processes -- \
 | Slow       | 4 held FIFO reads     |          100.445 ms |           104.216 ms |
 | Idle       | 4 joined processes    |          100.536 ms |           100.776 ms |
 
-The cohort interval starts when ready workers are released and ends when all report completion. Churn sums those intervals across waves. Joining and process startup are recorded separately in the TSV; their median total wall interval for churn was 21.167 ms local and 141.320 ms shared. Raw rounds are in `target/benchmarks/coordination-timing.tsv`.
+The cohort interval starts when the controller releases ready workers and ends when all report completion. Churn sums those intervals across waves. The TSV records joining and process startup separately. The median total wall interval for churn was 21.167 ms local and 141.320 ms shared. Raw rounds are in `target/benchmarks/coordination-timing.tsv`.
 
 ## Allocations and lock access
 
@@ -75,13 +75,13 @@ Separate `strace -f -c` runs used four workers and 20 reads each, one round, and
 
 Reports are `target/benchmarks/coordination-syscalls-{local,shared}.txt`. The shared trace recorded 195 unsuccessful `flock` calls, including busy lifetime probes and bookkeeping contention.
 
-The initial active-work results identified two concrete costs to reduce. Each successful journal transaction read, validated, and decoded both snapshots, allocated bounded authority tables, and published another complete snapshot. Composed admission also used a fixed 10 ms retry delay after shared denial. The changes below retain corruption detection, ambiguous-dispatch ownership, replacement fencing, and accounting across participant exit, checked by the same benchmarks and interruption tests.
+The initial active-work results show two costs. Each successful journal transaction read, validated, and decoded both snapshots, allocated bounded authority tables, and published another complete snapshot. Composed admission also used a fixed 10 ms retry delay after shared denial. The changes below keep corruption detection, ambiguous-dispatch ownership, replacement fencing, and accounting across participant exit. The same benchmarks and the interruption tests check them.
 
 ## First allocation fix
 
-`Authority::decode` previously decoded the ownership ledger, constructed an authority with a second empty ledger, and immediately discarded that empty ledger. It now constructs the authority around the decoded ledger. Configuration, record, checksum, and accounting validation remain in place.
+`Authority::decode` decoded the ownership ledger, constructed an authority with a second empty ledger, and discarded that empty ledger. The fix constructs the authority around the decoded ledger. Validation of configuration, records, checksums, and accounting is unchanged.
 
-Both Cargo executables were rebuilt and rerun with the same options. Median allocation totals for shared work changed as follows:
+After the fix, both rebuilt Cargo executables ran again with the same options. The median allocation totals for shared work changed as follows:
 
 | Scenario   | Allocations before | Allocations after | Bytes before | Bytes after |
 | ---------- | -----------------: | ----------------: | -----------: | ----------: |
@@ -94,7 +94,7 @@ The tiny case allocates 15% fewer bytes while retaining 61 successful authority 
 
 ## Reusing snapshot validation
 
-The journal now retains the last structurally validated payload. Each access still reads both slots and checks their framing, sequence, checksums, and configuration agreement. A payload with the same sequence and identical bytes can reuse that validation. The selected state is decoded into an independent authority before use; neither a mutable authority nor its accounting is cached. The retained payload is bounded by the journal's configured slot capacity.
+The journal retains the last structurally validated payload. Each access reads both slots and checks their framing, sequence, checksums, and configuration agreement. A payload with the same sequence and identical bytes can reuse that validation. The journal decodes the selected state into an independent authority before use and caches neither a mutable authority nor its accounting. The journal's configured slot capacity bounds the retained payload.
 
 The allocation executable ran before and after this change with one worker, 100 verified reads per round, one warmup, and three measured rounds:
 
@@ -109,13 +109,13 @@ cargo bench --bench coordination_processes_alloc -- \
 | Allocated bytes          | 53,970,136 | 27,492,000 |
 | Authority acquisitions   |        301 |        301 |
 
-Allocated bytes fell 49.1% and allocation count fell 37.0%. Reports are `target/benchmarks/coordination-journal-cache-{before,after}.tsv`, produced by the counting-allocator executable identified above. The existing byte-interruption and native writer-kill tests pass with this change. New cache tests modify both older and newest cached payloads while repairing their checksums, verify rejection, and check that another writer's committed accounting replaces the previously loaded state.
+Allocated bytes fell 49.1% and allocation count fell 37.0%. Reports are `target/benchmarks/coordination-journal-cache-{before,after}.tsv`. The counting-allocator executable identified above produced them. The existing byte-interruption and native writer-kill tests pass with this change. New cache tests modify both older and newest cached payloads while repairing their checksums, verify rejection, and check that another writer's committed accounting replaces the previously loaded state.
 
 ## Reusing journal read buffers
 
-Each journal handle now retains one bounded read buffer per slot. Reads still check both slot headers, sequence numbers, checksums, and configuration agreement. The buffer contents are never used as mutable authority state: the selected payload is decoded into a fresh authority for every load or transaction. The exact validated payload cache remains separate so validation reuse still requires byte-for-byte equality.
+Each journal handle retains one bounded read buffer per slot. Reads check both slot headers, sequence numbers, checksums, and configuration agreement. Every load or transaction decodes the selected payload into a fresh authority, and no code uses the buffer contents as mutable authority state. The exact validated payload cache stays separate, so validation reuse still requires byte-for-byte equality.
 
-The counting-allocator executable used the same tiny shared workload and options as above, with two warmups and seven measured rounds. The prior median is the three-round “After” result in the previous section; the current median is computed from the seven raw rounds:
+The counting-allocator executable used the same tiny shared workload and options as above, with two warmups and seven measured rounds. The prior median is the three-round "After" result in the previous section. The current median comes from the seven raw rounds:
 
 | Metric, median per round | Before buffer reuse | After buffer reuse | Change |
 | ------------------------ | ------------------: | -----------------: | -----: |
@@ -123,18 +123,18 @@ The counting-allocator executable used the same tiny shared workload and options
 | Allocated bytes          |          27,492,000 |         27,259,602 |  -0.8% |
 | Authority acquisitions   |                 301 |                301 |     0% |
 
-Reproduce with:
+Reproduce the run with this command:
 
 ```sh
 cargo bench --bench coordination_processes_alloc -- \
   --scenario tiny --mode shared --workers 1 --iterations 100 --runs 7 --warmups 2
 ```
 
-This change reduces allocation count without changing lock acquisitions. The byte reduction is small because fresh authority decoding and snapshot publication still dominate allocated volume. The journal corruption and interruption tests remain the safety check for the reused buffers.
+This change reduces allocation count without changing lock acquisitions. The byte reduction is small because fresh authority decoding and snapshot publication still dominate allocated volume. The journal corruption and interruption tests check the reused buffers.
 
 ## Sparse domain storage
 
-Authority snapshots now reserve domain storage for the records present in the payload. Registering another domain grows that table with an explicit fallible reservation bounded by the configured domain limit. Empty and sparsely populated authorities no longer reserve the maximum table on every decode. Domain identities, retained debt, capacity errors, and snapshot fields are unchanged.
+Authority snapshots reserve domain storage for the records in the payload. Registering another domain grows that table with an explicit fallible reservation bounded by the configured domain limit. Empty and sparsely populated authorities do not reserve the maximum table on decode. Domain identities, retained debt, capacity errors, and snapshot fields are unchanged.
 
 The counting-allocator executable ran before the change at `9120068` and after it with one worker, 100 verified reads, two warmups, and seven measured rounds:
 
@@ -149,11 +149,11 @@ cargo bench --bench coordination_processes_alloc -- \
 | Allocated bytes          |            27,256,786 |           10,743,746 |
 | Authority acquisitions   |                   301 |                  301 |
 
-Allocated byte volume falls 60.6%; allocation count and authority acquisitions stay at the same scale. Reports are `target/benchmarks/coordination-domains-{before,after}.tsv`. The sparse-snapshot growth regression retains live accounting while restoring snapshots with zero, one, or five domains, registers up to a non-power-of-two limit of nine, checks stable domain IDs and explicit capacity exhaustion, and settles the retained operation idempotently. Journal byte-interruption and corruption tests pass with this representation.
+Allocated byte volume falls 60.6%. Allocation count and authority acquisitions stay at the same scale. Reports are `target/benchmarks/coordination-domains-{before,after}.tsv`. The sparse-snapshot growth regression test retains live accounting while restoring snapshots with zero, one, or five domains, registers up to a non-power-of-two limit of nine, checks stable domain IDs and explicit capacity exhaustion, and settles the retained operation idempotently. Journal byte-interruption and corruption tests pass with this representation.
 
 ## Contention retry intervals
 
-With snapshot validation reuse already enabled, the timing executable compared the fixed 10 ms retry with a 3 ms initial delay for lock and physical-capacity conflicts, doubling repeated denials up to 10 ms. Successful preparation or authorization resets the delay. Budget, bootstrap, and quarantined-domain denials retain 10 ms.
+With snapshot validation reuse already enabled, the timing executable compared the fixed 10 ms retry with a 3 ms initial delay for lock and physical-capacity conflicts. The delay doubles on repeated denials up to 10 ms. Successful preparation or authorization resets the delay. Budget, bootstrap, and quarantined-domain denials retain 10 ms.
 
 ```sh
 cargo bench --bench coordination_processes -- \
@@ -170,6 +170,6 @@ cargo bench --bench coordination_processes -- \
 | Slow            |         112.138 ms |     110.843 ms |
 | Idle            |         100.438 ms |     100.271 ms |
 
-Reports are `target/benchmarks/coordination-retry-{before,after}.tsv`. Both runs use the normal timing executable identified above. Local/shared order alternates by round. Idle workers make zero authority accesses in both runs. Disjoint median busy-lock attempts increased from 25 to 45; contention increased from 6 to 11. Trials starting at 100 microseconds or 1 ms caused more collisions and slower disjoint scans; their raw reports are `coordination-retry-100us.tsv` and `coordination-retry-1ms.tsv` in the same directory.
+Reports are `target/benchmarks/coordination-retry-{before,after}.tsv`. Both runs use the normal timing executable identified above. Local and shared order alternates by round. Idle workers make zero authority accesses in both runs. Disjoint median busy-lock attempts increased from 25 to 45; contention increased from 6 to 11. Trials that started at 100 microseconds or 1 ms caused more collisions and slower disjoint scans. Their raw reports are `coordination-retry-100us.tsv` and `coordination-retry-1ms.tsv` in the same directory.
 
-Separate resource samples used four workers with 2,000 contended reads each, one measured round, and no warmup. Aggregate user plus system CPU increased from 1.761 s to 1.928 s (9.5%), while total wall time decreased from 2.181 s to 2.103 s. Both samples observed five processes and a peak of 44 descriptors. Reports are `target/benchmarks/coordination-retry-resources-{before,after}.json`. Further contention work should reduce repeated authority access while retaining the shorter completion latency.
+Separate resource samples used four workers with 2,000 contended reads each, one measured round, and no warmup. Aggregate user plus system CPU increased from 1.761 s to 1.928 s (9.5%), while total wall time decreased from 2.181 s to 2.103 s. Both samples observed five processes and a peak of 44 descriptors. Reports are `target/benchmarks/coordination-retry-resources-{before,after}.json`. Further contention work should reduce repeated authority access and keep the shorter completion latency.

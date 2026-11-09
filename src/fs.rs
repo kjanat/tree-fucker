@@ -1,4 +1,4 @@
-//! The core drives every filesystem operation through this boundary.
+//! The core performs every filesystem operation through this boundary.
 //!
 //! A [`FileSystem`] adapter supplies root canonicalization, metadata reads,
 //! listing sessions, enrichment, storage-domain resolution, and watcher
@@ -310,7 +310,7 @@ pub struct Lease {
 impl Lease {
     /// `UNBOUNDED` sets both bounds to their maximum value.
     ///
-    /// The session goes as deep as it likes for as long as it likes.
+    /// The session runs without an entry bound or an operation bound.
     pub const UNBOUNDED: Lease = Lease { entries: usize::MAX, operations: usize::MAX };
 }
 
@@ -486,7 +486,7 @@ pub trait ListingSession: Send {
     /// `take_chunk` hands a suspended lease's buffered entries to a one-shot
     /// consumer.
     ///
-    /// The default keeps the complete-listing contract. Implementations which
+    /// The default keeps the complete-listing contract. Implementations that
     /// support draining must preserve their total entry ceiling and return the
     /// same anchor across chunks. A returned chunk drains the buffered
     /// entries. Later values of `SessionCost::bytes` must exclude their bytes.
@@ -635,7 +635,7 @@ pub enum WatcherEvent {
     Overflow,
     /// The backend requires recursive reconciliation below this path.
     ///
-    /// The core conservatively invalidates coverage for every loaded directory.
+    /// The core invalidates coverage for every loaded directory.
     /// A normal path hint refreshes only its target and is insufficient here.
     Rescan {
         /// `path` holds the backend's root-relative path.
@@ -675,8 +675,8 @@ impl<F: Fn(WatcherEvent) + Send + Sync> WatcherSink for F {
 /// [`ProbeResult`], and unavailable metadata remains `None`. Network calls are
 /// blocking work, and the same admission, lease, and cancellation rules apply
 /// to them. Native access-control payloads remain adapter-owned.
-/// [`Metadata::permissions`] is not a portable ACL or an authorization
-/// decision.
+/// [`Metadata::permissions`] carries permission bits and holds no portable
+/// ACL and no authorization decision.
 pub trait FileSystem: Send + Sync {
     /// `capabilities` declares tree-wide capabilities, and the core reads them
     /// once at open.
@@ -767,6 +767,6 @@ pub trait FileSystem: Send + Sync {
         sink: Arc<dyn WatcherSink>,
     ) -> Result<WatchId, FsError>;
 
-    /// `unwatch` releases the registration `watch`.
+    /// `unwatch` releases the registration with the ID `watch`.
     fn unwatch(&self, watch: WatchId);
 }

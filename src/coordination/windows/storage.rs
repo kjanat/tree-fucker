@@ -24,8 +24,8 @@ fn require(device: &FILE_FS_DEVICE_INFORMATION, flags: u32, filesystem: &[u16]) 
     };
     let name = String::from_utf16(&filesystem[..end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Windows filesystem name"))?;
-    // A file object's device can be the disk filesystem rather than the
-    // underlying disk. Both still require the explicit remote-device check.
+    // A file object's device can be the disk filesystem or the underlying
+    // disk. Both still require the explicit remote-device check.
     let failure = if !matches!(device.DeviceType, FILE_DEVICE_DISK | FILE_DEVICE_DISK_FILE_SYSTEM) {
         Some("coordination storage is not a disk device")
     } else if device.Characteristics & FILE_REMOTE_DEVICE != 0 {
@@ -57,8 +57,9 @@ pub(crate) fn validate(file: &File) -> io::Result<()> {
     }
     let mut completion = IO_STATUS_BLOCK::default();
     let mut device = FILE_FS_DEVICE_INFORMATION::default();
-    // SAFETY: synchronous handle, correctly aligned live output buffers, and
-    // the SDK information class matching the supplied device structure.
+    // SAFETY: the handle is synchronous, the output buffers are live and
+    // correctly aligned, and the SDK information class matches the supplied
+    // device structure.
     let status = unsafe {
         NtQueryVolumeInformationFile(
             handle,
@@ -79,8 +80,9 @@ pub(crate) fn validate(file: &File) -> io::Result<()> {
     }
     let mut flags = 0;
     let mut name = [0u16; 32];
-    // SAFETY: all requested outputs are live, correctly sized buffers. Other
-    // outputs are explicitly omitted, and the handle is the same pinned object.
+    // SAFETY: all requested outputs are live, correctly sized buffers. The
+    // call passes null for every other output, and the handle is the same
+    // pinned object.
     if unsafe {
         GetVolumeInformationByHandleW(
             handle,

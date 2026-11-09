@@ -1,4 +1,4 @@
-//! The core reaches its async runtime through this abstraction.
+//! The core uses its async runtime through this abstraction.
 //!
 //! The core is runtime-neutral (RFC §9). A [`Runtime`] adapter supplies task
 //! spawning, a blocking-work pool, timers, and a monotonic clock.

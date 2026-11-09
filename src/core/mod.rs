@@ -124,7 +124,7 @@ pub struct DomainStat {
     pub granted: Duration,
     /// The governor charged this worker time on the domain.
     ///
-    /// Overshoot and surcharges are included.
+    /// The total includes overshoot and surcharges.
     pub charged: Duration,
     /// `capacity` holds the capacity of the domain background bucket.
     pub capacity: Duration,
@@ -685,7 +685,8 @@ pub struct Stats {
     pub coalesced_hints: u64,
     /// The tree received this many complete listings.
     pub listings: u64,
-    /// This many listings failed, met rejection or reached a resource limit.
+    /// This many listings failed or reached a resource limit, or the tree
+    /// rejected them at commit.
     pub listing_failures: u64,
     /// The tree discarded this many results for a stale publication guard.
     pub stale_results: u64,
@@ -712,7 +713,7 @@ pub struct Stats {
     pub listing_operations: u64,
     /// Sessions enumerated this many directory entries.
     ///
-    /// Filtered entries are included.
+    /// The count includes filtered entries.
     pub entries_enumerated: u64,
     /// Finished listing results held this many bytes in total.
     pub listing_bytes: u64,
@@ -1243,12 +1244,13 @@ impl Coordinator {
     /// The driver executes the returned outputs in order. The coordinator
     /// ignores a `now` before its current time. After the coordinator stops,
     /// commands fail with [`Error::Shutdown`] or [`Error::TreeTerminated`].
-    /// Late results then only release their grants.
+    /// A late result then only releases its grant.
     pub fn handle(&mut self, input: Input, now: MonotonicTime) -> Vec<Output> {
         self.now = self.now.max(now);
         self.finish_stuck_jobs();
-        // Keep the completion record until the result has been classified.
-        // Validation failures and lost workers must reach shared settlement.
+        // The coordinator keeps the completion record until it classifies the
+        // result. Validation failures and lost workers must also settle with
+        // the shared authority.
         let completed = match &input {
             Input::JobCompleted { job, .. } | Input::WorkerLost(WorkerLoss::Job(job)) => Some(self.job_grant(*job)),
             _ => None,
@@ -1858,8 +1860,8 @@ impl Coordinator {
                 if !command.draws_on_foreground() || command.admitted < ceiling {
                     return None;
                 }
-                // Preparations reduce the available ceiling for other work,
-                // but only committed charges can exhaust the command.
+                // Preparations reduce the available ceiling for other work.
+                // Only committed charges can exhaust the command.
                 let prepared: Duration = self
                     .jobs
                     .values()
@@ -2258,10 +2260,11 @@ impl Coordinator {
         }
         self.pending_releases = deferred;
         if self.is_stopped() && self.governor.coordination_error().is_some() {
-            // A release attempt may discover permanent authority failure.
-            // It forbids dispatching even cleanup I/O. Abandon undispatched
-            // watch IDs so they cannot retain the terminal actor. Dispatched
-            // workers keep their grants and drain before the actor exits.
+            // A release attempt may discover a permanent authority failure.
+            // That failure forbids the dispatch of any I/O, cleanup included.
+            // Undispatched watch IDs would retain the terminal actor, and this
+            // branch drops them. Dispatched workers keep their grants and
+            // drain before the actor exits.
             self.pending_releases.clear();
         }
     }

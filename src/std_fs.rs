@@ -421,8 +421,8 @@ fn open_platform(
 #[cfg(unix)]
 fn directory_error(errno: rustix::io::Errno) -> FsError {
     match errno {
-        // opening a symbolic link with `O_NOFOLLOW` fails with `ELOOP`, or
-        // `EMLINK` on FreeBSD
+        // Opening a symbolic link with `O_NOFOLLOW` fails with `ELOOP`, or
+        // with `EMLINK` on FreeBSD.
         rustix::io::Errno::LOOP | rustix::io::Errno::MLINK | rustix::io::Errno::NOTDIR => FsError::NotDirectory,
         other => std::io::Error::from(other).into(),
     }

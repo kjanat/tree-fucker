@@ -141,8 +141,8 @@ impl Scope {
     }
 
     fn now_at(&self, state: &Authority) -> Result<u64, Error> {
-        // Cross-thread QPC readings can differ by a tick. Clamp this reading,
-        // keeping every connection on the same persisted counter mapping.
+        // Cross-thread QPC readings can differ by a tick. Clamp this reading
+        // so every connection stays on the same persisted counter mapping.
         Ok(self.clock.now()?.max(state.now()))
     }
 
@@ -273,7 +273,8 @@ impl Scope {
     ) -> Result<T, Error> {
         self.access(|store| {
             let Store { journal, recovery_slot } = store;
-            // Final-close evidence stays exclusively held through publication.
+            // `recovered` holds the final-close evidence exclusively until
+            // publication.
             let mut recovered = Vec::new();
             journal
                 .transaction_with(|state| {

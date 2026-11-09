@@ -525,8 +525,8 @@ impl Tree {
     /// Every tree and scan in one process shares that governor (RFC §9,
     /// §15.9).
     ///
-    /// `filesystem` performs every read. `policy` decides the loading of
-    /// directories. `config` sets per-tree limits. `runtime` supplies task
+    /// `filesystem` performs every read. `policy` decides which directories
+    /// load. `config` sets per-tree limits. `runtime` supplies task
     /// spawning, blocking workers, timers, and the monotonic clock. The
     /// caller must poll the returned future on that runtime.
     ///
@@ -866,7 +866,8 @@ impl TreeHandle {
     /// The command follows RFC §9.1.
     ///
     /// A Loaded or Loading target becomes Unloaded. Its represented
-    /// descendants leave the snapshot and its pending work is cancelled. An
+    /// descendants leave the snapshot, and the coordinator cancels its pending
+    /// work. An
     /// Unloaded, Excluded, or unrepresented target succeeds unchanged. A
     /// non-directory fails with [`Error::NotDirectory`].
     pub async fn unload(&self, path: RelativePath) -> Result<()> {
@@ -891,7 +892,7 @@ impl TreeHandle {
     /// `set_priority` replaces the priority set with `paths` (RFC §9.1, §11.3).
     ///
     /// Loaded directories in the set get lower-latency reconciliation.
-    /// Other paths stay dormant until they match a Loaded directory. The
+    /// Other paths have no effect until they match a Loaded directory. The
     /// command succeeds after the coordinator replaces the set. A set over
     /// the priority-set limit fails with [`Error::PathLimit`], and the
     /// existing set stays.

@@ -2,7 +2,7 @@
 
 The normative contract is [`rfc/tree-fucker.txt`](rfc/tree-fucker.txt). Changes to observable behavior should keep the implementation, regression tests, and RFC consistent. The [README](README.md) describes the consumer API and compatibility policy.
 
-The [release process](RELEASING.md) publishes each signed `master` push that carries a new crate version to crates.io and GitHub through Beepboop. Its credential setup and retry behavior are documented separately from development checks.
+The [release process](RELEASING.md) publishes each signed `master` push that carries a new crate version to crates.io and GitHub through Beepboop. RELEASING.md also covers credential setup and retries.
 
 ## Development setup
 
@@ -16,7 +16,7 @@ bun install
 
 ## Checks
 
-Run the Rust checks used by CI:
+Run the Rust checks that CI runs:
 
 ```sh
 cargo fmt --check
@@ -25,7 +25,7 @@ cargo test --all-features --no-fail-fast
 cargo doc --no-deps --all-features
 ```
 
-Use `dprint check` for the repository's other formatted files. The workflows in [`.github/workflows`](.github/workflows) define the native and cross-platform matrix, privileged coordination acceptance, and site build. A local Linux pass does not replace native verification on the other supported operating systems.
+Use `dprint check` for the repository's other formatted files. The workflows in [`.github/workflows`](.github/workflows) define the native and cross-platform matrix, privileged coordination acceptance, and site build. A local Linux pass verifies Linux only. The other supported operating systems need native verification.
 
 ## Package verification
 
@@ -37,7 +37,7 @@ cargo publish --dry-run --locked
 cargo publish --dry-run --locked --features tokio
 ```
 
-Nothing is published. For local iteration with uncommitted changes, add `--allow-dirty`; CI verifies committed source.
+These commands publish nothing. For local iteration with uncommitted changes, add `--allow-dirty`. CI verifies committed source.
 
 ## Benchmarks
 

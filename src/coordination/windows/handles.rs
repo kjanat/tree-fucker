@@ -1,8 +1,8 @@
-//! This module provides Windows file ownership and nonblocking bookkeeping
-//! primitives.
+//! This module provides Windows file ownership and the nonblocking bookkeeping
+//! lock.
 //!
 //! The enclosing authority must pin and validate the parent directory, storage,
-//! and security descriptor. These primitives never unlink or truncate a slot.
+//! and security descriptor. These functions never unlink or truncate a slot.
 //! Recovery must hold the bookkeeping lock through the journal commit and keep
 //! the returned owner handle until that commit completes.
 
@@ -24,7 +24,7 @@ use super::security::Principal;
 
 /// `Identity` preserves the complete volume serial and 128-bit file identity.
 ///
-/// Code must never truncate a ReFS identity to the older 64-bit index.
+/// Callers must never truncate a ReFS identity to the older 64-bit index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub volume: u64,
@@ -44,7 +44,7 @@ fn object_identity(file: &File, directory: bool) -> io::Result<Identity> {
     let mut attributes = BY_HANDLE_FILE_INFORMATION::default();
     let mut id = FILE_ID_INFO::default();
     // SAFETY: the file owns a live handle and both output buffers have the
-    // exact layout and size requested by their respective Windows APIs.
+    // exact layout and size that their Windows APIs request.
     unsafe {
         if GetFileType(handle) != FILE_TYPE_DISK {
             return Err(io::Error::other("coordination object is not a disk file"));
@@ -126,8 +126,9 @@ impl<'a> Bookkeeping<'a> {
     /// the same process. The owner of the journal also holds a local mutex.
     pub(crate) fn try_lock(file: &'a File) -> io::Result<Self> {
         let mut range = Self::range();
-        // SAFETY: synchronous live file handle and initialized OVERLAPPED;
-        // FAIL_IMMEDIATELY ensures the OS cannot retain the stack buffer.
+        // SAFETY: the file handle is synchronous and live, and OVERLAPPED is
+        // initialized. FAIL_IMMEDIATELY ensures that the OS cannot retain the
+        // stack buffer.
         if unsafe {
             LockFileEx(file.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &mut range)
         } == 0

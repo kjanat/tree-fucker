@@ -60,7 +60,7 @@ impl Context {
     }
 
     fn check(self) -> Result<(), Error> {
-        // Do not touch inherited mutexes before checking PID.
+        // Do not touch inherited mutexes before checking the PID.
         if rustix::process::getpid().as_raw_nonzero().get() as u32 != self.pid {
             return Err(Error::Forked);
         }
@@ -116,7 +116,8 @@ impl Drop for Unlock<'_> {
 
 fn bookkeeping<T>(anchor: &File, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     exclusive(anchor)?;
-    // A concurrent fork can retain this open description after we close it.
+    // A concurrent fork can retain this open description after this process
+    // closes it.
     // Bookkeeping exclusion ends here even when initialization fails or
     // unwinds.
     let unlock = Unlock(Some(anchor));
@@ -292,7 +293,7 @@ impl Scope {
         }
         // Keep the persistent rendezvous outside the replaceable state
         // directory. Its header pins that directory's inode, so recreating
-        // the directory cannot mint another budget while old work survives.
+        // the directory cannot create another budget while old work runs.
         let parent = path.parent().ok_or(Error::InvalidScope)?;
         let anchor_root = OpenOptions::new()
             .read(true)
@@ -490,7 +491,7 @@ impl Scope {
                         return Ok(Some(Client::new(self.clone(), participant, owner)));
                     }
                     // Retain successful recovery even if no participant slot is
-                    // available yet; a retry must not repeat discarded
+                    // available yet. A retry must not repeat discarded
                     // recovery.
                     Ok::<_, Error>(None)
                 })
@@ -599,7 +600,7 @@ fn initialize_storage(
     let generation = Generation(bytes[16..32].try_into().expect("generation"));
     if bytes[12] == PREPARING {
         // Reuse a fully published journal even if the anchor's final READY
-        // byte was not written. Never reset known accounting just because
+        // byte was not written. Never reset known accounting only because
         // the anchor is preparing.
         let recovered = if state.metadata()?.len() > journal::HEADER {
             let mut journal = Journal::open(state.try_clone()?)?;

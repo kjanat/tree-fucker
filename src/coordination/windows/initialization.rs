@@ -137,9 +137,10 @@ fn initialize_storage(
     }
     let binding = clock.retained_binding(authority.clock_binding(), retained, authority.now())?;
     if authority.clock_binding() != Some(binding) {
-        // Publish the boot transition with the accounting it qualifies. A
-        // partial write recovers the whole previous or next mapping, never a
-        // new clock paired with old debt. Reopeners reuse this exact origin.
+        // Publish the boot transition with the accounting it qualifies. After
+        // a partial write, recovery restores the whole previous mapping or the
+        // whole next mapping, and it never pairs a new clock with old debt. A
+        // connection that reopens the scope reuses this exact origin.
         journal.transaction(|state| {
             state.bind_clock(binding);
             Ok(())
@@ -239,8 +240,8 @@ mod tests {
             drop(reopened);
             assert_eq!(std::fs::read(directory.path().join("coordination.authority.lock")).unwrap()[12], READY);
 
-            // Once READY was published, a short journal is corruption rather
-            // than permission to initialize a fresh account.
+            // Once the anchor holds READY, a short journal is corruption and
+            // never permits a fresh account.
             File::options().write(true).open(path.join(STATE)).unwrap().set_len(35).unwrap();
             let retained = std::fs::read(path.join(STATE)).unwrap();
             assert!(matches!(Scope::open(&path, config), Err(Error::Journal(_))));
@@ -335,8 +336,8 @@ mod tests {
             let previous_epoch = prior_boot(epoch);
             change_creation_epoch(directory.path(), previous_epoch);
 
-            // The prior logical timeline is deliberately below this boot's
-            // raw QPC. An upward-only rebase would grant the elapsed uptime.
+            // The test places the prior logical timeline below this boot's raw
+            // QPC. An upward-only rebase would grant the elapsed uptime.
             let mut retained = Authority::new(generation, config, 12_000).unwrap();
             let participant = retained.join(VERSION).unwrap();
             let id = retained.ledger().next_operation(participant).unwrap();
@@ -378,7 +379,7 @@ mod tests {
             let mut journal = retained_journal(&path);
             let persisted = journal.load().unwrap();
             assert_eq!(persisted.clock_binding(), Some(binding));
-            // Opening publishes a mapping, without advancing/refilling debt.
+            // Opening publishes a mapping without advancing or refilling debt.
             assert_eq!(persisted.now(), 12_000);
             assert_eq!(persisted.view(), retained.view());
             drop(journal);

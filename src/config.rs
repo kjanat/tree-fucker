@@ -304,7 +304,7 @@ pub struct Config {
     ///
     /// The default is 256 MiB, and `snapshot_bytes` must be greater than zero.
     /// The snapshot also counts toward
-    /// [`HostConfig::accounted_memory_ceiling`], and the tighter limit binds.
+    /// [`HostConfig::accounted_memory_ceiling`], and the tighter limit applies.
     pub snapshot_bytes: u64,
     /// The governor admits at most this much worker time for one `refresh` or
     /// `load`.

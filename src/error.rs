@@ -1,7 +1,7 @@
-//! This module defines the crate error of opening, commands, and scans.
+//! This module defines the crate error for opens, commands, and scans.
 //!
 //! An [`Error`] fails a call. The update stream reports recoverable failures
-//! as [`crate::update::RecoverableError`] values instead.
+//! as [`crate::update::RecoverableError`] values.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -37,7 +37,8 @@ pub enum Error {
     Capacity,
     /// `RootUnavailable` means the root is unavailable (RFC §13.2).
     RootUnavailable,
-    /// `Shutdown` means the tree shut down or a scan read followed exhaustion.
+    /// `Shutdown` means the tree shut down or a scan read came after the scan
+    /// finished.
     Shutdown,
     /// `TreeTerminated` means a Fatal failure terminated the tree (RFC §13.1).
     TreeTerminated,
